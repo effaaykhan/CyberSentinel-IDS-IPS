@@ -22,30 +22,66 @@ The design document it implements:
 
 ---
 
-## Status: Phase 0 complete
+## Status: Phase 1 complete
 
-Foundations, scaffolding, and the packaging pipeline. **The sensor does not yet
-detect anything** — packet capture lands in Phase 1 and the detection engine in
-Phase 3. What works today:
+Capture and decode. The sensor now sees traffic, decodes it, tracks flows, and
+reports what it could not parse — but **it does not detect anything yet**:
+stream reassembly lands in Phase 2 and the rule engine in Phase 3.
 
-* the Cargo workspace and every crate in the layout, as compiling stubs where a
-  phase has not reached them;
-* the `config.yaml` loader;
-* the `.rules` parser — headers and metadata in full, match conditions
-  recognised but not yet evaluated — with graceful skip-and-log;
-* the CyberSentinel event JSON schema and emitter;
+What works today:
+
+* **Packet capture** — live via libpcap (Linux, macOS), or replaying a `.pcap`
+  file with no privileges and no system library at all;
+* **L2–L4 decoding** — Ethernet, VLAN and QinQ, IPv4, IPv6 with extension
+  headers, TCP, UDP, ICMP — to a 5-tuple and a zero-copy payload range;
+* **decoder anomalies** as first-class events: malformed packets are detection
+  signal, not parse failures to swallow;
+* **flow tracking** with a hard cap and idle timeout, emitting `flow` events
+  with per-direction packet and byte counts;
+* **real counters** — kernel and interface drops, decode classification, flow
+  evictions — in every `stats` event;
+* the `config.yaml` loader and the `.rules` parser (headers and metadata in
+  full; match conditions recognised but not yet evaluated);
 * the decoupled event pipeline, with a test proving a blocked sink cannot stall
   event production;
-* `cybersentinel run`, emitting periodic `stats` events to stdout and a file;
-* matrix CI on Linux, Windows, and macOS that also builds, installs, and runs an
-  installable Linux `.deb`.
+* matrix CI on Linux, Windows, and macOS that replays the fixtures, fuzzes every
+  parser, and builds, installs, and runs a Linux `.deb`.
 
 ---
 
 ## Try it
 
+Analyse a capture file — no privileges, no libpcap, any OS:
+
 ```sh
 cargo build --workspace
+cargo run -p cybersentinel -- run --config config/config.yaml \
+    --replay tests/fixtures/pcap/normal.pcap
+```
+
+```
+{"timestamp":"2024-01-01T00:00:00.600000Z","event_type":"flow","flow_id":17613525333215950991,
+ "src_ip":"192.0.2.10","src_port":51000,"dest_ip":"198.51.100.20","dest_port":80,"proto":"TCP",
+ "flow":{"reason":"closed","duration_ms":600,"packets_to_server":4,"bytes_to_server":267,
+         "packets_to_client":3,"bytes_to_client":202,"tcp_flags":"FSPA"}}
+```
+
+Malformed traffic is reported rather than silently dropped:
+
+```sh
+cargo run -p cybersentinel -- run --config config/config.yaml \
+    --replay tests/fixtures/pcap/malformed.pcap
+```
+
+```
+{"event_type":"anomaly","src_ip":"192.0.2.10","dest_ip":"198.51.100.20",
+ "anomaly":{"anomalies":[{"layer":"ipv4","kind":"length_mismatch"}],
+            "interface":"…/malformed.pcap","captured_len":61,"packet_len":61}}
+```
+
+Or start it as a sensor:
+
+```sh
 cargo run -p cybersentinel -- run --config config/config.yaml --once
 ```
 
@@ -72,6 +108,19 @@ widen the signature instead of narrowing it.
 
 Drop `--once` to run until Ctrl-C.
 
+## Live capture
+
+Live capture links against **libpcap** (present by default on Linux and macOS;
+Npcap on Windows from Phase 5) and needs `CAP_NET_RAW` to open the handle —
+which the sensor drops immediately afterwards. Replaying a `.pcap` file needs
+neither. See [`crates/capture/README.md`](crates/capture/README.md).
+
+```sh
+sudo apt-get install libpcap-dev     # to build
+```
+
+Then set `capture.enabled: true` in `config.yaml`.
+
 ## Install (Linux)
 
 ```sh
@@ -94,13 +143,18 @@ first. See [`packaging/linux/README.md`](packaging/linux/README.md).
 | Path | What |
 |---|---|
 | `crates/common` | event schema, config loader, event pipeline, sensor identity |
+| `crates/capture` | `PacketSource`: libpcap live capture and in-tree pcap replay |
+| `crates/decode` | L2–L4 decoding and decoder anomalies |
+| `crates/reassembly` | bounded flow table; stream reassembly in Phase 2 |
 | `crates/rules` | `.rules` parser, rule model, loader |
+| `crates/storage` | stdout and file event sinks |
 | `crates/cli` | the `cybersentinel` binary |
-| `crates/{capture,decode,reassembly,applayer,engine,hids,correlation,storage,alerting}` | one crate per pipeline stage |
+| `crates/{applayer,engine,hids,correlation,alerting}` | later pipeline stages, as compiling stubs |
 | `rules/` | the default ruleset |
 | `config/` | `config.yaml` for running from the repo |
 | `packaging/` | per-OS installers |
 | `fuzz/` | `cargo-fuzz` targets |
+| `tests/fixtures/` | rule and pcap fixtures, with the generator that builds them |
 
 ---
 

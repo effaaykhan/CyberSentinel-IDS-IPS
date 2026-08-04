@@ -55,9 +55,9 @@ detecting.
 ```
 crates/
   common/        event schema, config.yaml loader, decoupled event pipeline, sensor identity
-  capture/       Capture trait + per-OS backends            (Phase 1)
-  decode/        etherparse L2–L4 decode, decoder anomalies (Phase 1)
-  reassembly/    IP defrag, TCP reassembly, normalization   (Phase 2)
+  capture/       PacketSource: pcap replay (live) + libpcap live capture
+  decode/        L2–L4 decode, decoder anomalies            (live)
+  reassembly/    flow table (live) · IP defrag + TCP reassembly (Phase 2)
   applayer/      HTTP → DNS → TLS parsers, sticky buffers   (Phase 3, 8)
   rules/         .rules parser + rule model + loader        (parser stub live)
   engine/        rule grouping, aho-corasick MPM, evaluation(Phase 3)
@@ -70,7 +70,7 @@ rules/           the default ruleset we author
 config/          config.yaml for running from the repo
 packaging/       linux (live) · windows · macos · third_party
 fuzz/            cargo-fuzz targets
-tests/fixtures/  shared fixtures (rule files now; pcaps from Phase 1)
+tests/fixtures/  shared fixtures: rule files, and pcaps with their generator
 ```
 
 Crates that a phase has not reached yet are **compiling stubs**: they carry the
@@ -91,9 +91,27 @@ plus host sensors (FIM, logs, process) emitting into the *same* event pipeline,
 which is what makes host and network alerts correlate natively rather than by
 post-hoc log joining.
 
-**Phase 0 built the ends, not the middle**: config and rule loading at the front,
-the event schema and output path at the back. Every later phase drops a stage
-into a pipeline that already exists and is already observable.
+**Phase 0 built the ends**: config and rule loading at the front, the event
+schema and output path at the back. **Phase 1 filled in capture, decode, and
+flow tracking**, so packets now flow all the way through to `flow` and `anomaly`
+events. Reassembly (Phase 2) and detection (Phase 3) drop into a pipeline that
+already exists and is already observable.
+
+### Capture sources
+
+`PacketSource` has two implementations and answers three ways — `Frame`, `Idle`,
+`End`. `Idle` matters: a live source that has seen no traffic for a moment is not
+a finished one, and the run loop needs the difference to notice a shutdown
+signal on a quiet link.
+
+* **`PcapReplay`** reads `.pcap` savefiles, in-tree, in pure Rust. No
+  privileges, no libpcap, works on every OS. This is what the tests and CI run.
+* **`LiveCapture`** uses the `pcap` crate (libpcap), target-gated to Linux and
+  macOS. Windows gets Npcap in Phase 5.
+
+**Live capture needs libpcap at runtime** — present by default on Linux and
+macOS, bundled as Npcap on Windows from Phase 5. Replay needs nothing. See
+`crates/capture/README.md`.
 
 ---
 
@@ -128,7 +146,23 @@ invariants, not just absence of panics.
 ### Bound all state
 Reassembly and flow tracking get per-flow and global caps plus timeouts
 (`cybersentinel-reassembly::Limits`). An attacker must not be able to exhaust
-memory by opening flows or sending fragments that never complete.
+memory by opening flows or sending fragments that never complete. The flow table
+enforces this today: past `flow.max-flows` it sweeps timeouts, then evicts
+least-recently-seen, and **counts the evictions** — an eviction means the sensor
+stopped following a live conversation, which is a coverage hole, not a memory
+statistic.
+
+### Bound the events one packet can cause
+A packet produces at most one `anomaly` event however many things are wrong with
+it. An attacker chooses what to send; they must not thereby choose how many
+events the sensor emits per packet.
+
+### Report coverage holes as coverage holes
+Kernel drops, flow evictions, snapped frames, and a torn capture file are all
+places where traffic existed and the sensor did not see it. Each has a counter
+in `stats` and a log line that says what it means. Silence here is the failure
+mode that matters most: a sensor that sees nothing looks identical to a quiet
+network.
 
 ### Normalize before matching, with a target-based overlap policy
 The evasion-resistance core. If the sensor and the destination host disagree
@@ -139,6 +173,10 @@ about what a byte stream contains, an attacker walks past every rule silently.
 microsecond resolution, so an event written and read back compares equal. Clock
 accuracy is assumed to come from NTP; detecting and reporting skew is not
 implemented (see §9).
+
+**Packet-derived events carry the capture timestamp, not the processing time.**
+Replaying a capture from last week must produce events dated last week, or
+nothing downstream can correlate them with anything else.
 
 ### Always record the action taken
 Every alert carries `action`. In v1 it is always `alerted`, and that is worth
@@ -182,13 +220,25 @@ One schema for host and network. Newline-delimited JSON, one object per line.
   `paths.data-dir`, so events stay correlatable across restarts, renames, and
   address changes.
 
-Bodies defined so far: **`stats`** (live) and **`alert`** (defined, filled in
-from Phase 3). `flow`, `http`, `dns`, `tls`, `fim`, `auth`, and `process` arrive
-with the phases that produce them.
+Bodies defined so far:
 
-`stats` reports `capture.enabled` and `engine.enabled` as `false` with zeroed
-counters rather than omitting the sections — an operator reading `"enabled":
-false` learns something, whereas a missing section reads like a bug.
+| Body | Status | What it says |
+|---|---|---|
+| `stats` | live | periodic sensor health: event queue, rules, capture, decode, flows, engine |
+| `flow` | live | a conversation ended — per-direction packets and bytes, TCP flags, and why it ended (`closed`, `timed_out`, `evicted`, `sensor_stopped`) |
+| `anomaly` | live | a packet was malformed at the wire level — every problem with it, in one event |
+| `alert` | defined | a rule matched. Filled in from Phase 3 |
+
+`http`, `dns`, `tls`, `fim`, `auth`, and `process` arrive with the phases that
+produce them.
+
+`stats` reports `engine.enabled` as `false` with zeroed counters rather than
+omitting the section — an operator reading `"enabled": false` learns something,
+whereas a missing section reads like a bug.
+
+A `flow` event's 5-tuple is **oriented from the initiator**, so `src_*` is
+whoever sent the first packet and "to server" means "in the direction the
+conversation was opened in".
 
 ---
 
@@ -261,6 +311,17 @@ Two shipped configs: `config/config.yaml` (repo-relative, for development) and
 `packaging/linux/config.yaml` (absolute system paths, installed to
 `/etc/cybersentinel/`).
 
+The sections that matter operationally:
+
+| Key | Why it matters |
+|---|---|
+| `capture.enabled` | off by default — live capture needs privileges, and a sensor should start capturing because someone chose to |
+| `capture.bpf-filter` | applied in the kernel: **traffic it excludes is invisible to detection** |
+| `capture.snaplen` | content past the snap length cannot be matched |
+| `capture.buffer-size-bytes` | the first thing to raise when `stats.capture.drops` goes non-zero |
+| `flow.max-flows` | the hard bound on flow state; past it, live flows are evicted and counted |
+| `flow.emit-events` / `decode.emit-anomaly-events` | event volume. Turning either off keeps the counters in `stats` |
+
 ---
 
 ## 8. Packaging
@@ -296,6 +357,13 @@ Recorded so they can be revisited deliberately.
 | `deny_unknown_fields` on the whole config | A misspelled key silently disabling a sensor is worse than a startup failure | Never |
 | systemd `DynamicUser=yes` | No `useradd` in a maintainer script, no orphaned account after removal | Something needs a stable uid |
 | First-party GitHub Actions only | A third-party action runs with access to a security tool's build | Never, without a good reason |
+| **Live capture via the `pcap` crate** | Keeps all `unsafe` inside the dependency so first-party crates stay `forbid(unsafe_code)`; one API across three OSes | Profiling shows the FFI cost matters — then add an AF_PACKET backend behind `PacketSource`, in an isolated audited-`unsafe` module |
+| **Reading `.pcap` *files* in-tree, not through libpcap** | Makes the whole decode path testable with no libpcap anywhere, including on the Windows runner; and a savefile is attacker-supplied input, which belongs under our own bounds-checking and fuzzing rather than behind an FFI boundary the fuzzer cannot see into | Never — this is the cheaper half of the format |
+| Snap-length truncation is not a decoder anomaly | A clipped frame is expected; a header that overruns a *complete* frame is not. Conflating them buries real anomalies under noise | Never |
+| An unsupported EtherType is not an anomaly | ARP and LLDP are ordinary traffic; they are counted, not alerted on | Never |
+| A non-initial IP fragment gets no transport header | Its bytes are payload; reading ports out of them attributes the packet to a port nobody used | Never |
+| Flow ids from FNV-1a, not `DefaultHasher` | `DefaultHasher` is randomly seeded per process, so replaying one capture twice would produce incomparable events | Never |
+| One `anomaly` event per packet, not per anomaly | Bounds the events an attacker can cause per packet | Never |
 | `tracing` + `tracing-subscriber` for diagnostics | Ecosystem standard, structured fields, level filtering | — |
 | `ctrlc` with `termination` | SIGTERM from systemd/launchd must shut down as cleanly as Ctrl-C | — |
 | **`serde_yaml` (0.9)** | The guide names it | **Open — see below** |
@@ -308,16 +376,26 @@ Recorded so they can be revisited deliberately.
    security tool deserves a deliberate answer. Options: keep it, move to a
    maintained fork (`serde_yaml_ng`), or move to `saphyr`. **Not changed
    unilaterally — the guide names `serde_yaml`.**
-2. **`regex` vs `pcre2`** for `pcre:` (guide §2 flags the tradeoff). `regex` has
-   linear-time guarantees, which matters when rule content may come from
-   elsewhere; `pcre2` has the features some rules assume. Needs deciding before
-   Phase 3, not during it.
+2. **`regex` vs `pcre2`** — **decided: `regex`**, for its linear-time guarantees.
+   The rule model must therefore not be designed around PCRE-only features.
+   Unused until Phase 3.
 3. **WiX vs Inno** for the Windows installer — see
    `packaging/windows/README.md`.
 4. **Clock skew.** Guide §6 says "UTC + NTP". Timestamps are UTC; nothing checks
    whether the host clock is actually synchronized. A sensor with a wrong clock
    produces evidence that will not correlate. Worth a `stats` field.
 5. **Npcap licensing** must be resolved before Phase 5 ships.
+6. **Multi-interface capture.** One interface per sensor today; further entries
+   in `capture.interfaces` are ignored with a warning. A thread per interface is
+   the obvious shape, but flow-table sharing across them needs thought.
+7. **Link types.** Only Ethernet is decoded. `LINUX_SLL` (113) — what capturing
+   on the `any` device produces — is the likely next one.
+8. **Privilege dropping is per-thread on Linux.** The sensor opens the capture
+   handle and drops capabilities while still single-threaded, so every thread
+   spawned afterwards inherits the dropped set. That ordering is load-bearing:
+   `run()` opens capture *before* building the event pipeline for exactly this
+   reason. Dropping capabilities is still not the same as dropping root — real
+   separation comes from the systemd unit's `DynamicUser`.
 
 ---
 
@@ -335,10 +413,12 @@ runs on all three · config and rules load, skipping and logging what they canno
 parse · well-formed `stats` events reach stdout and a file · a blocked sink
 provably does not stall production · CI outputs an installable `.deb`.
 
-### Phase 1 — Capture + decode (Linux)
-`Capture` trait + AF_PACKET backend · `etherparse` decoder for Eth/IP/TCP/UDP/ICMP
-· 5-tuple extraction · decoder-anomaly events · packet and drop counters into
-`stats`.
+### Phase 1 — Capture + decode ✅
+`PacketSource` with a libpcap live backend and an in-tree pcap replay source ·
+`etherparse`-driven decoder for Eth/VLAN/IPv4/IPv6/TCP/UDP/ICMP · 5-tuple and
+payload range · decoder-anomaly events · bounded flow table and `flow` events ·
+real capture, decode, and flow counters including kernel drops · capability
+dropping after the handle is open · decoder and pcap-reader fuzz targets.
 
 **Done when:** replaying a pcap yields correct flow metadata and anomaly events
 for malformed packets, and the decoder fuzz target runs clean.
@@ -346,6 +426,7 @@ for malformed packets, and the decoder fuzz target runs clean.
 ### Phase 2 — Reassembly + normalization
 IP defragmentation · TCP stream reassembly with bounded state, timeouts, and a
 target-based overlap policy · HTTP normalization. The evasion-resistance core.
+Builds on the Phase 1 flow table, which already keys and bounds the state.
 
 **Done when:** an attack string split across segments or fragments reassembles
 correctly · overlapping-segment and encoded-URI cases resolve correctly · the
@@ -402,6 +483,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 # Run from the repo root; state lands in ./data and ./logs.
 cargo run -p cybersentinel -- run --config config/config.yaml
 cargo run -p cybersentinel -- run --config config/config.yaml --once   # one event, then exit
+
+# Analyse a capture file. No privileges, no libpcap, works on any OS.
+cargo run -p cybersentinel -- run --config config/config.yaml \
+    --replay tests/fixtures/pcap/normal.pcap
+
+# Live capture needs libpcap headers to build and CAP_NET_RAW to run.
+sudo apt-get install libpcap-dev
+python3 tests/fixtures/pcap/generate.py       # regenerate the pcap fixtures
 
 # Fuzzing — from inside fuzz/, whose rust-toolchain.toml selects nightly
 cd fuzz && cargo fuzz run rule_parser -- -max_total_time=60
