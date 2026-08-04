@@ -29,7 +29,16 @@ cybersentinel-alerting = { path = "crates/alerting", version = "0.1.0" }
 
 # External
 anyhow = "1"
+# Linux capability dropping after the capture handle is open (guide §6).
+caps = "0.5"
 clap = { version = "4", features = ["derive"] }
+# Safe L2-L4 header parsing. We drive it header by header rather than through
+# the all-in-one slicer so every length check, and every anomaly it implies, is
+# ours and explicit.
+etherparse = "0.21"
+# Live capture only. Reading .pcap *files* is implemented in-tree so the test and
+# CI path needs no libpcap at all — see crates/capture/README.md.
+pcap = "2"
 # "termination" so a systemd/launchd `stop` (SIGTERM) shuts the sensor down as
 # cleanly as an interactive Ctrl-C does.
 ctrlc = { version = "3", features = ["termination"] }

@@ -5,10 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "CyberSentinel decode stage"
+description = "CyberSentinel L2-L4 packet decoder and decoder-anomaly detection"
 
 [lints]
 workspace = true
 
 [dependencies]
 cybersentinel-common.workspace = true
+etherparse.workspace = true
