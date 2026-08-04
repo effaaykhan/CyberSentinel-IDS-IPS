@@ -33,8 +33,12 @@ pub struct Config {
     pub paths: PathsConfig,
     /// Address and port variables referenced by rules (`$HOME_NET`, ...).
     pub vars: VarsConfig,
-    /// Packet capture. Inert until Phase 1.
+    /// Packet capture.
     pub capture: CaptureConfig,
+    /// Packet decoding.
+    pub decode: DecodeConfig,
+    /// Flow tracking.
+    pub flow: FlowConfig,
     /// Which `.rules` files to load.
     pub rules: RulesConfig,
     /// Where events go.
@@ -92,20 +96,33 @@ pub struct VarsConfig {
     pub port_groups: BTreeMap<String, String>,
 }
 
-/// Packet capture settings. Read but unused until Phase 1.
+/// Packet capture settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct CaptureConfig {
-    /// Enable network capture. Off by default: Phase 0 has no capture backend.
+    /// Enable live network capture.
+    ///
+    /// Off by default: a sensor should start capturing because someone chose
+    /// to, and live capture needs privileges that a first run may not have.
+    /// `cybersentinel run --replay <file>` needs neither.
     pub enabled: bool,
-    /// Interfaces to capture from. Empty means "pick the default route's".
+    /// Interfaces to capture from. Empty means "ask libpcap for the default".
+    ///
+    /// Phase 1 captures from one interface; further entries are ignored with a
+    /// warning until multi-interface capture lands.
     pub interfaces: Vec<String>,
-    /// Bytes captured per packet.
+    /// Bytes captured per packet. 65535 keeps whole packets, which is what
+    /// content matching needs.
     pub snaplen: u32,
     /// Put the interface in promiscuous mode.
     pub promiscuous: bool,
-    /// Optional BPF filter applied at the capture socket.
+    /// Optional BPF filter applied in the kernel, before the sensor sees
+    /// anything. **Traffic excluded here is invisible to detection.**
     pub bpf_filter: Option<String>,
+    /// Kernel capture buffer size in bytes. `null` uses libpcap's default.
+    ///
+    /// The first thing to raise when `stats.capture.drops` is non-zero.
+    pub buffer_size_bytes: Option<i32>,
 }
 
 impl Default for CaptureConfig {
@@ -116,6 +133,60 @@ impl Default for CaptureConfig {
             snaplen: 65_535,
             promiscuous: true,
             bpf_filter: None,
+            buffer_size_bytes: None,
+        }
+    }
+}
+
+/// Packet decoding settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct DecodeConfig {
+    /// Emit an `anomaly` event for each malformed packet.
+    ///
+    /// Malformed packets are detection signal, so this defaults on. On a link
+    /// with a chatty broken device it can be loud; turning it off keeps the
+    /// counters in `stats.decode` either way.
+    pub emit_anomaly_events: bool,
+}
+
+impl Default for DecodeConfig {
+    fn default() -> Self {
+        Self {
+            emit_anomaly_events: true,
+        }
+    }
+}
+
+/// Flow-tracking settings.
+///
+/// These are the bounds on flow state (guide §6). They are configuration rather
+/// than constants because the right ceiling depends on the link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct FlowConfig {
+    /// Maximum concurrently tracked flows.
+    ///
+    /// A hard cap: past it, live flows are evicted and counted in
+    /// `stats.flows.evicted`. Sized so an attacker opening flows cannot grow
+    /// sensor memory without limit.
+    pub max_flows: usize,
+    /// Seconds of idleness after which a flow is considered over.
+    pub timeout_secs: u64,
+    /// Emit a `flow` event when a flow ends.
+    ///
+    /// One event per conversation is a lot of volume on a busy link. It
+    /// defaults on because flow records are Phase 1's primary output; turn it
+    /// off to keep only alerts and stats.
+    pub emit_events: bool,
+}
+
+impl Default for FlowConfig {
+    fn default() -> Self {
+        Self {
+            max_flows: 65_536,
+            timeout_secs: 300,
+            emit_events: true,
         }
     }
 }
@@ -326,6 +397,16 @@ impl Config {
                 "capture.snaplen must be at least 1".into(),
             ));
         }
+        if self.flow.max_flows == 0 {
+            return Err(Error::ConfigInvalid(
+                "flow.max-flows must be at least 1".into(),
+            ));
+        }
+        if self.flow.timeout_secs == 0 {
+            return Err(Error::ConfigInvalid(
+                "flow.timeout-secs must be at least 1".into(),
+            ));
+        }
         match self.logging.level.to_ascii_lowercase().as_str() {
             "error" | "warn" | "info" | "debug" | "trace" => {}
             other => {
@@ -366,8 +447,23 @@ impl Config {
         if self.outputs.webhook.enabled {
             warnings.push("outputs.webhook is enabled but not implemented until Phase 7".into());
         }
-        if self.capture.enabled {
-            warnings.push("capture.enabled is true but packet capture lands in Phase 1".into());
+        if self.capture.snaplen < 1_518 {
+            warnings.push(format!(
+                "capture.snaplen is {}: packets will be clipped, and content past the \
+                 snap length cannot be matched",
+                self.capture.snaplen
+            ));
+        }
+        if self.capture.bpf_filter.is_some() {
+            warnings.push(
+                "capture.bpf-filter is set: traffic it excludes is invisible to detection".into(),
+            );
+        }
+        if self.capture.interfaces.len() > 1 {
+            warnings.push(format!(
+                "capture.interfaces lists {} interfaces; this build captures from the first only",
+                self.capture.interfaces.len()
+            ));
         }
         warnings
     }

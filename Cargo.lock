@@ -195,7 +195,10 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "cybersentinel-capture",
  "cybersentinel-common",
+ "cybersentinel-decode",
+ "cybersentinel-reassembly",
  "cybersentinel-rules",
  "cybersentinel-storage",
  "serde_json",
@@ -275,6 +278,7 @@ name = "cybersentinel-reassembly"
 version = "0.1.0"
 dependencies = [
  "cybersentinel-common",
+ "tracing",
 ]
 
 [[package]]

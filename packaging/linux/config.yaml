@@ -21,12 +21,26 @@ vars:
     DNS_PORTS: "53"
     SSH_PORTS: "22"
 
+# Set enabled: true and name an interface to start monitoring. The shipped
+# systemd unit already grants CAP_NET_RAW and CAP_NET_ADMIN; the sensor drops
+# them once the capture handle is open.
 capture:
   enabled: false
   interfaces: []
   snaplen: 65535
   promiscuous: true
+  # Traffic this excludes is invisible to detection.
   bpf-filter: null
+  # Raise this first if stats.capture.drops goes non-zero.
+  buffer-size-bytes: null
+
+decode:
+  emit-anomaly-events: true
+
+flow:
+  max-flows: 65536
+  timeout-secs: 300
+  emit-events: true
 
 rules:
   directory: /etc/cybersentinel/rules

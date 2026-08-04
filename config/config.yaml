@@ -30,14 +30,37 @@ vars:
     DNS_PORTS: "53"
     SSH_PORTS: "22"
 
-# Packet capture lands in Phase 1; leaving this enabled today only produces a
-# startup warning.
+# Live packet capture. Off by default: it needs privileges, and a sensor should
+# start capturing because someone chose to. `--replay <file>` needs neither
+# privileges nor libpcap.
 capture:
   enabled: false
+  # Empty asks libpcap for the default interface. This build captures from one.
   interfaces: []
+  # 65535 keeps whole packets, which is what content matching needs.
   snaplen: 65535
   promiscuous: true
+  # Applied in the kernel. Traffic excluded here is invisible to detection.
   bpf-filter: null
+  # Kernel capture buffer. The first thing to raise when stats.capture.drops
+  # goes non-zero — drops are traffic that arrived and was never examined.
+  buffer-size-bytes: null
+
+decode:
+  # Malformed packets are detection signal, not noise to swallow. Turning this
+  # off keeps the counters in stats.decode either way.
+  emit-anomaly-events: true
+
+# Flow tracking. These are the bounds on flow state: an attacker chooses how
+# many flows exist, so the sensor must not.
+flow:
+  # Hard cap. Past it, live flows are evicted and counted in
+  # stats.flows.evicted — an eviction means the sensor stopped following a
+  # conversation that was still going.
+  max-flows: 65536
+  timeout-secs: 300
+  # One event per conversation is a lot of volume on a busy link.
+  emit-events: true
 
 rules:
   directory: rules

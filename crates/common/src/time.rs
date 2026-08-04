@@ -54,6 +54,30 @@ impl Timestamp {
     pub fn unix_timestamp(&self) -> i64 {
         self.0.unix_timestamp()
     }
+
+    /// Convert a [`std::time::SystemTime`], as capture backends report it.
+    ///
+    /// Events carry the time the **packet** was captured, not the time the
+    /// sensor got round to processing it: replaying last week's capture must
+    /// produce events dated last week, or nothing downstream can correlate
+    /// them.
+    ///
+    /// A pre-epoch or otherwise unrepresentable instant falls back to the
+    /// epoch rather than panicking — a corrupt timestamp in a capture file
+    /// must not take a sensor down.
+    #[must_use]
+    pub fn from_system_time(time: std::time::SystemTime) -> Self {
+        let since_epoch = time
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        let seconds = i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX);
+        match OffsetDateTime::from_unix_timestamp(seconds) {
+            Ok(base) => Self::from_offset_date_time(
+                base + std::time::Duration::from_nanos(u64::from(since_epoch.subsec_nanos())),
+            ),
+            Err(_) => Self(OffsetDateTime::UNIX_EPOCH),
+        }
+    }
 }
 
 impl fmt::Display for Timestamp {

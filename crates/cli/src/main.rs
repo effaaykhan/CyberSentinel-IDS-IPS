@@ -5,6 +5,7 @@
 //! later phase plugs a stage into a pipeline that already exists and is already
 //! observable.
 
+mod pipeline;
 mod run;
 
 use clap::{Parser, Subcommand};

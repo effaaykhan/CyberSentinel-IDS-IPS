@@ -314,7 +314,16 @@ impl EventEmitter {
     /// for callers that need to attach a flow id or 5-tuple before emitting.
     #[must_use]
     pub fn build(&self, payload: Payload) -> Event {
-        Event::new(Timestamp::now(), self.sensor.clone(), payload)
+        self.build_at(Timestamp::now(), payload)
+    }
+
+    /// Build an event stamped with a specific time.
+    ///
+    /// Packet-derived events use the **capture** timestamp, not the moment the
+    /// sensor processed the packet.
+    #[must_use]
+    pub fn build_at(&self, timestamp: Timestamp, payload: Payload) -> Event {
+        Event::new(timestamp, self.sensor.clone(), payload)
     }
 }
 
