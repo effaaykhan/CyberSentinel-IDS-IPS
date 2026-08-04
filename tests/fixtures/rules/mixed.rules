@@ -1,0 +1,24 @@
+# Fixture: every load outcome in one file, so the loader's reporting is tested
+# against something an operator could plausibly write.
+#
+# Expected: 4 loaded (2 evaluable, 2 awaiting engine support), 5 skipped.
+
+# --- loads, fully evaluable by Phase 0 (header + metadata only) -------------
+alert tcp $EXTERNAL_NET any -> $HOME_NET 22 (msg:"FIXTURE header only"; sid:900001; rev:2;)
+pass ip 127.0.0.0/8 any <> 127.0.0.0/8 any (msg:"FIXTURE loopback exempt"; sid:900002;)
+
+# --- loads, but uses conditions the engine cannot evaluate yet --------------
+alert http any any -> any any (msg:"FIXTURE content"; http.uri; content:"/etc/passwd"; nocase; sid:900010;)
+alert tcp any any -> any any ( \
+    msg:"FIXTURE continuation joined across lines"; \
+    flow:established,to_server; content:"x"; \
+    sid:900011; rev:3;)
+
+# --- skipped: unparseable ---------------------------------------------------
+this is not a rule
+alert tcp any any -> any any (msg:"FIXTURE no sid";)
+alert tcp any any -> any any (msg:"FIXTURE typo"; contnet:"evil"; sid:900020;)
+drop tcp any any -> any any (msg:"FIXTURE prevention action"; sid:900021;)
+
+# --- skipped: duplicate of sid 900001 ---------------------------------------
+alert udp any any -> any any (msg:"FIXTURE duplicate sid"; sid:900001;)

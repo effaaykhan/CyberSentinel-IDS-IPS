@@ -1,0 +1,15 @@
+[package]
+name = "cybersentinel-rules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Parser and model for the CyberSentinel .rules format"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
