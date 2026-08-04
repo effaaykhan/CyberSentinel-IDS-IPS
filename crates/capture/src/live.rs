@@ -33,10 +33,11 @@ pub struct LiveOptions {
     pub promiscuous: bool,
     /// Optional BPF filter, applied in the kernel.
     pub bpf_filter: Option<String>,
-    /// How long a poll waits before reporting [`Captured::Idle`].
+    /// libpcap's packet-buffer timeout, in milliseconds.
     ///
-    /// This is what bounds shutdown latency on a quiet link: the run loop can
-    /// only notice a stop signal between polls.
+    /// Largely vestigial here: the handle is put in non-blocking mode, so polls
+    /// return immediately whether or not a packet is waiting. Kept because
+    /// libpcap still requires a value and some backends honour it.
     pub poll_timeout_ms: i32,
     /// Kernel capture buffer size. Larger absorbs longer bursts and is the
     /// first thing to raise when drops appear.
@@ -104,12 +105,30 @@ impl LiveCapture {
             builder = builder.buffer_size(bytes);
         }
 
-        let mut handle = builder.open().map_err(|error| {
-            CaptureError::Backend(format!(
-                "opening {name}: {error} \
-                 (live capture needs CAP_NET_RAW; try running under the shipped systemd unit)"
-            ))
-        })?;
+        let mut handle = builder
+            .open()
+            .map_err(|error| {
+                CaptureError::Backend(format!(
+                    "opening {name}: {error} \
+                     (live capture needs CAP_NET_RAW; try running under the shipped systemd unit)"
+                ))
+            })?
+            // Non-blocking, and this is not optional.
+            //
+            // In immediate mode on Linux, libpcap waits on the capture socket
+            // with no timeout — there is no buffering left to wait for — so a
+            // blocking read parks forever on a quiet link. The sensor would
+            // then stop updating its counters and stop noticing SIGTERM, which
+            // is the exact failure this project treats as unacceptable: a
+            // sensor that has silently stopped looks identical to a quiet
+            // network.
+            //
+            // Non-blocking turns "nothing yet" into `Captured::Idle`, which the
+            // run loop uses to publish counters and check for shutdown.
+            .setnonblock()
+            .map_err(|error| {
+                CaptureError::Backend(format!("setting {name} non-blocking: {error}"))
+            })?;
 
         if let Some(filter) = &options.bpf_filter {
             handle.filter(filter, true).map_err(|error| {

@@ -26,6 +26,14 @@ const PUBLISH_EVERY_PACKETS: u64 = 1_024;
 /// a shutdown signal and the sensor acting on it.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
+/// How long the packet loop waits after an empty poll.
+///
+/// Live capture handles are non-blocking, so an idle link would otherwise spin
+/// a core. One millisecond costs at most 1ms of extra detection latency on the
+/// next packet — and only when the link was idle, which is when latency matters
+/// least — while keeping shutdown responsive and counters fresh.
+const IDLE_POLL: Duration = Duration::from_millis(1);
+
 /// Arguments to `cybersentinel run`.
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
@@ -295,11 +303,13 @@ fn run_packet_loop(
                 }
             }
             // A quiet link, not a finished one: republish counters (drops
-            // accumulate whether or not we are being handed packets) and go
-            // round again so the shutdown check runs.
+            // accumulate whether or not we are being handed packets), then wait
+            // a moment so an idle link does not spin a core, and go round again
+            // so the shutdown check runs.
             Ok(Captured::Idle) => {
                 let counters = packets.counters();
                 pipeline.publish(snapshot, counters);
+                std::thread::sleep(IDLE_POLL);
             }
             Ok(Captured::End) => break,
             Err(source_error) => {
