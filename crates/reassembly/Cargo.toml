@@ -5,10 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "CyberSentinel reassembly stage"
+description = "CyberSentinel flow tracking, IP defragmentation, and TCP reassembly"
 
 [lints]
 workspace = true
 
 [dependencies]
 cybersentinel-common.workspace = true
+tracing.workspace = true

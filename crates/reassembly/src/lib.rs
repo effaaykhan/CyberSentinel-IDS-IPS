@@ -10,8 +10,14 @@
 //!   cannot exhaust memory by opening flows or sending fragments that never
 //!   complete (guide §6).
 //!
-//! Phase 0 fixes the limit vocabulary so the caps are a first-class, reviewable
-//! part of the design rather than constants discovered later.
+//! Phase 0 fixed the limit vocabulary so the caps are a first-class, reviewable
+//! part of the design rather than constants discovered later. Phase 1 adds
+//! [`flow`], the bounded flow table those limits first apply to and the state
+//! Phase 2's stream reassembly is keyed on.
+
+pub mod flow;
+
+pub use flow::{EndReason, EndedFlow, Endpoint, Flow, FlowCounters, FlowId, FlowKey, FlowTable};
 
 use std::time::Duration;
 

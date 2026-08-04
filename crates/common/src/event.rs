@@ -74,6 +74,10 @@ pub struct NetTuple {
 pub enum EventKind {
     /// A rule matched.
     Alert,
+    /// A structural problem was found while decoding a packet.
+    Anomaly,
+    /// A flow ended.
+    Flow,
     /// Periodic sensor health and counters.
     Stats,
 }
@@ -84,6 +88,8 @@ impl EventKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Alert => "alert",
+            Self::Anomaly => "anomaly",
+            Self::Flow => "flow",
             Self::Stats => "stats",
         }
     }
@@ -98,6 +104,10 @@ impl EventKind {
 pub enum Payload {
     /// A rule matched. See [`AlertEvent`].
     Alert(Box<AlertEvent>),
+    /// A malformed packet. See [`AnomalyEvent`].
+    Anomaly(Box<AnomalyEvent>),
+    /// A flow ended. See [`FlowEvent`].
+    Flow(Box<FlowEvent>),
     /// Periodic counters. See [`StatsEvent`].
     Stats(Box<StatsEvent>),
 }
@@ -108,6 +118,8 @@ impl Payload {
     pub fn kind(&self) -> EventKind {
         match self {
             Self::Alert(_) => EventKind::Alert,
+            Self::Anomaly(_) => EventKind::Anomaly,
+            Self::Flow(_) => EventKind::Flow,
             Self::Stats(_) => EventKind::Stats,
         }
     }
@@ -122,6 +134,18 @@ impl Payload {
     #[must_use]
     pub fn alert(alert: AlertEvent) -> Self {
         Self::Alert(Box::new(alert))
+    }
+
+    /// Wrap an [`AnomalyEvent`].
+    #[must_use]
+    pub fn anomaly(anomaly: AnomalyEvent) -> Self {
+        Self::Anomaly(Box::new(anomaly))
+    }
+
+    /// Wrap a [`FlowEvent`].
+    #[must_use]
+    pub fn flow(flow: FlowEvent) -> Self {
+        Self::Flow(Box::new(flow))
     }
 }
 
@@ -261,11 +285,100 @@ pub struct AlertEvent {
 }
 
 // ---------------------------------------------------------------------------
+// anomaly
+// ---------------------------------------------------------------------------
+
+/// One structural problem found in a packet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnomalyRecord {
+    /// Layer being decoded, e.g. `ipv4`.
+    pub layer: String,
+    /// What was wrong, e.g. `length_mismatch`.
+    pub kind: String,
+}
+
+/// Body of an `anomaly` event: a packet that is malformed at the wire level.
+///
+/// **One event per packet, not per anomaly.** A single crafted frame can be
+/// wrong in several ways at once, and emitting an event for each would let one
+/// packet multiply into an event flood — the pipeline's cost per packet has to
+/// stay bounded.
+///
+/// Whatever the decoder did manage to read is still in the envelope, so an
+/// anomalous packet remains attributable to a host and a flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnomalyEvent {
+    /// Everything wrong with this packet.
+    pub anomalies: Vec<AnomalyRecord>,
+    /// Interface or capture file the packet came from.
+    pub interface: String,
+    /// Bytes actually captured.
+    pub captured_len: u32,
+    /// Length on the wire before snap-length clipping.
+    pub packet_len: u32,
+    /// Whether more anomalies were found than the per-packet cap allows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anomalies_truncated: bool,
+}
+
+// ---------------------------------------------------------------------------
+// flow
+// ---------------------------------------------------------------------------
+
+/// Why a flow ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowEndReason {
+    /// TCP teardown was observed: FIN in both directions, or a RST.
+    Closed,
+    /// The flow went idle past the configured timeout.
+    TimedOut,
+    /// The flow table hit its cap and this flow was evicted to make room.
+    ///
+    /// **Evictions are a coverage signal**: the sensor stopped tracking a
+    /// conversation that was still live.
+    Evicted,
+    /// The sensor shut down, or a capture file ended, while the flow was open.
+    SensorStopped,
+}
+
+/// Body of a `flow` event, emitted when a flow ends.
+///
+/// The envelope carries the `flow_id` and the 5-tuple, oriented so that `src_*`
+/// is whichever endpoint sent the first packet. "To server" therefore means
+/// "in the direction the flow was opened in".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowEvent {
+    /// Why the flow ended.
+    pub reason: FlowEndReason,
+    /// First packet seen.
+    pub start: Timestamp,
+    /// Last packet seen.
+    pub end: Timestamp,
+    /// Milliseconds between the first and last packet.
+    pub duration_ms: u64,
+    /// Packets from the initiator.
+    pub packets_to_server: u64,
+    /// Bytes from the initiator.
+    pub bytes_to_server: u64,
+    /// Packets towards the initiator.
+    pub packets_to_client: u64,
+    /// Bytes towards the initiator.
+    pub bytes_to_client: u64,
+    /// Union of the TCP flags seen on the flow, e.g. `SAPF`. Absent for
+    /// protocols without them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_flags: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // stats
 // ---------------------------------------------------------------------------
 
 /// Body of a `stats` event: periodic sensor health.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`: `capture.drop_rate` is a float.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatsEvent {
     /// Seconds since the sensor started.
     pub uptime_secs: u64,
@@ -275,6 +388,10 @@ pub struct StatsEvent {
     pub rules: RuleStats,
     /// Packet-capture counters.
     pub capture: CaptureStats,
+    /// Packet-decoding counters.
+    pub decode: DecodeStats,
+    /// Flow-table counters.
+    pub flows: FlowStats,
     /// Detection-engine counters.
     pub engine: EngineStats,
 }
@@ -309,18 +426,75 @@ pub struct RuleStats {
 }
 
 /// Counters for packet capture.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CaptureStats {
-    /// Whether capture is running. `false` until Phase 1 lands, which is why
-    /// the counters below read zero.
+    /// Whether capture is running.
     pub enabled: bool,
+    /// The interface or capture file frames are coming from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Packets received.
     pub packets: u64,
     /// Bytes received.
     pub bytes: u64,
-    /// Packets dropped by the kernel or capture library. **Drops are silent
-    /// coverage holes** (guide §9).
+    /// Packets the kernel dropped because our buffer was full. **Drops are
+    /// silent coverage holes** (guide §9): traffic arrived and was never
+    /// examined. Raise the capture buffer size when this is non-zero.
     pub drops: u64,
+    /// Packets the interface or its driver dropped before the kernel saw them.
+    pub interface_drops: u64,
+    /// Dropped packets as a fraction of everything offered to the sensor.
+    pub drop_rate: f64,
+}
+
+/// Counters for packet decoding.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodeStats {
+    /// Whether decoding is running.
+    pub enabled: bool,
+    /// Frames decoded.
+    pub packets: u64,
+    /// Frames carrying IPv4.
+    pub ipv4: u64,
+    /// Frames carrying IPv6.
+    pub ipv6: u64,
+    /// TCP segments.
+    pub tcp: u64,
+    /// UDP datagrams.
+    pub udp: u64,
+    /// ICMP and ICMPv6 messages.
+    pub icmp: u64,
+    /// Frames with no IP layer — ARP and friends. Ordinary traffic.
+    pub non_ip: u64,
+    /// IP fragments seen. Reassembled from Phase 2.
+    pub fragments: u64,
+    /// Frames clipped by the capture snap length.
+    pub snapped: u64,
+    /// Frames with at least one anomaly.
+    pub anomalous: u64,
+    /// Anomalies recorded across all frames.
+    pub anomalies: u64,
+}
+
+/// Counters for the flow table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowStats {
+    /// Whether flow tracking is running.
+    pub enabled: bool,
+    /// Flows currently tracked.
+    pub active: u64,
+    /// Flows created since start.
+    pub created: u64,
+    /// Flows ended by an observed TCP teardown.
+    pub closed: u64,
+    /// Flows ended by the idle timeout.
+    pub timed_out: u64,
+    /// Flows evicted because the table was full. **Non-zero means the sensor
+    /// stopped following conversations that were still live** — raise
+    /// `max_flows`, or find out what is opening so many.
+    pub evicted: u64,
+    /// Maximum flows the table will hold.
+    pub capacity: u64,
 }
 
 /// Counters for the detection engine.
@@ -449,5 +623,143 @@ mod tests {
         let event = stats_event().with_flow_id(7);
         let back: Event = serde_json::from_slice(&event.to_ndjson().unwrap()).unwrap();
         assert_eq!(back, event);
+    }
+
+    fn tuple() -> NetTuple {
+        NetTuple {
+            src_ip: "192.0.2.1".parse().unwrap(),
+            src_port: Some(51_000),
+            dest_ip: "198.51.100.7".parse().unwrap(),
+            dest_port: Some(80),
+            proto: Protocol::Tcp,
+        }
+    }
+
+    #[test]
+    fn an_anomaly_event_carries_every_problem_with_one_packet() {
+        let event = Event::new(
+            Timestamp::now(),
+            sensor(),
+            Payload::anomaly(AnomalyEvent {
+                anomalies: vec![
+                    AnomalyRecord {
+                        layer: "ipv4".into(),
+                        kind: "length_mismatch".into(),
+                    },
+                    AnomalyRecord {
+                        layer: "tcp".into(),
+                        kind: "impossible_length".into(),
+                    },
+                ],
+                interface: "eth0".into(),
+                captured_len: 64,
+                packet_len: 1_514,
+                anomalies_truncated: false,
+            }),
+        )
+        .with_net(tuple());
+
+        let json: Value = serde_json::from_slice(&event.to_ndjson().unwrap()).unwrap();
+        assert_eq!(json["event_type"], "anomaly");
+        assert_eq!(json["anomaly"]["anomalies"].as_array().unwrap().len(), 2);
+        assert_eq!(json["anomaly"]["anomalies"][0]["layer"], "ipv4");
+        assert_eq!(json["anomaly"]["packet_len"], 1_514);
+        // Still attributable to a host even though the packet was malformed.
+        assert_eq!(json["src_ip"], "192.0.2.1");
+        assert!(
+            json["anomaly"].get("anomalies_truncated").is_none(),
+            "a false flag should not clutter every event"
+        );
+    }
+
+    #[test]
+    fn a_flow_event_reports_both_directions() {
+        let start = Timestamp::now();
+        let event = Event::new(
+            start,
+            sensor(),
+            Payload::flow(FlowEvent {
+                reason: FlowEndReason::Closed,
+                start,
+                end: start,
+                duration_ms: 1_234,
+                packets_to_server: 5,
+                bytes_to_server: 600,
+                packets_to_client: 4,
+                bytes_to_client: 4_000,
+                tcp_flags: Some("SAPF".into()),
+            }),
+        )
+        .with_flow_id(99)
+        .with_net(tuple());
+
+        let json: Value = serde_json::from_slice(&event.to_ndjson().unwrap()).unwrap();
+        assert_eq!(json["event_type"], "flow");
+        assert_eq!(json["flow_id"], 99);
+        assert_eq!(json["flow"]["reason"], "closed");
+        assert_eq!(json["flow"]["packets_to_server"], 5);
+        assert_eq!(json["flow"]["bytes_to_client"], 4_000);
+        assert_eq!(json["flow"]["tcp_flags"], "SAPF");
+    }
+
+    #[test]
+    fn every_event_kind_matches_its_body_key() {
+        // The invariant the whole schema rests on: `event_type` names the key
+        // the body is under, so a consumer can dispatch on one field.
+        let bodies = [
+            Payload::stats(StatsEvent::default()),
+            Payload::anomaly(AnomalyEvent {
+                anomalies: Vec::new(),
+                interface: "eth0".into(),
+                captured_len: 0,
+                packet_len: 0,
+                anomalies_truncated: true,
+            }),
+            Payload::flow(FlowEvent {
+                reason: FlowEndReason::TimedOut,
+                start: Timestamp::now(),
+                end: Timestamp::now(),
+                duration_ms: 0,
+                packets_to_server: 0,
+                bytes_to_server: 0,
+                packets_to_client: 0,
+                bytes_to_client: 0,
+                tcp_flags: None,
+            }),
+            Payload::alert(AlertEvent {
+                action: AlertAction::Alerted,
+                source: AlertSource::Network,
+                sid: 1,
+                rev: 1,
+                signature: "s".into(),
+                classtype: None,
+                severity: 3,
+                metadata: BTreeMap::new(),
+            }),
+        ];
+
+        for body in bodies {
+            let kind = body.kind();
+            let event = Event::new(Timestamp::now(), sensor(), body);
+            let json: Value = serde_json::from_slice(&event.to_ndjson().unwrap()).unwrap();
+            assert_eq!(json["event_type"], kind.as_str());
+            assert!(
+                json.get(kind.as_str()).is_some_and(Value::is_object),
+                "{} body must be flattened under its own key: {json}",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn stats_reports_the_new_pipeline_sections() {
+        let json: Value = serde_json::from_slice(&stats_event().to_ndjson().unwrap()).unwrap();
+        for section in ["events", "rules", "capture", "decode", "flows", "engine"] {
+            assert!(
+                json["stats"][section].is_object(),
+                "missing stats.{section}: {json}"
+            );
+        }
+        assert_eq!(json["stats"]["capture"]["drop_rate"], 0.0);
     }
 }
