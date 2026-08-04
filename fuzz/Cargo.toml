@@ -14,6 +14,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+cybersentinel-capture = { path = "../crates/capture" }
+cybersentinel-decode = { path = "../crates/decode" }
 cybersentinel-rules = { path = "../crates/rules" }
 
 [profile.release]
@@ -21,8 +23,8 @@ debug = true
 
 # ---------------------------------------------------------------------------
 # Guide §6: fuzz the rule parser, the decoder, and the reassembler. Each target
-# is added as its phase lands. The rule parser exists now, so it is fuzzed now;
-# `decoder` (Phase 1) and `reassembler` (Phase 2) follow.
+# is added by the phase that introduces the code it covers. `reassembler`
+# follows in Phase 2.
 # ---------------------------------------------------------------------------
 
 [[bin]]
@@ -35,6 +37,20 @@ bench = false
 [[bin]]
 name = "rule_file"
 path = "fuzz_targets/rule_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decoder"
+path = "fuzz_targets/decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pcap_reader"
+path = "fuzz_targets/pcap_reader.rs"
 test = false
 doc = false
 bench = false
