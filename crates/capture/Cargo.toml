@@ -5,10 +5,23 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "CyberSentinel capture stage"
+description = "CyberSentinel packet capture: live sources and pcap replay"
+readme = "README.md"
 
 [lints]
 workspace = true
 
 [dependencies]
-cybersentinel-common.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Live capture links against libpcap. It is target-gated rather than optional so
+# that `cargo build --workspace` works everywhere without feature juggling:
+# Windows has no libpcap and gets its Npcap backend in Phase 5. Replaying .pcap
+# files needs none of this — see README.md.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+pcap.workspace = true
+
+# Capability dropping after the capture handle is open (guide §6).
+[target.'cfg(target_os = "linux")'.dependencies]
+caps.workspace = true
