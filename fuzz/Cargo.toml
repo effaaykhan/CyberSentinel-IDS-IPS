@@ -1,0 +1,40 @@
+[package]
+name = "cybersentinel-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace: cargo-fuzz builds with `-Z sanitizer` on nightly and
+# must not be pulled into the stable workspace build. The root Cargo.toml
+# excludes this directory for the same reason.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cybersentinel-rules = { path = "../crates/rules" }
+
+[profile.release]
+debug = true
+
+# ---------------------------------------------------------------------------
+# Guide §6: fuzz the rule parser, the decoder, and the reassembler. Each target
+# is added as its phase lands. The rule parser exists now, so it is fuzzed now;
+# `decoder` (Phase 1) and `reassembler` (Phase 2) follow.
+# ---------------------------------------------------------------------------
+
+[[bin]]
+name = "rule_parser"
+path = "fuzz_targets/rule_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rule_file"
+path = "fuzz_targets/rule_file.rs"
+test = false
+doc = false
+bench = false

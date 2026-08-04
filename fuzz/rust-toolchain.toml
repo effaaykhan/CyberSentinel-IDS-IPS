@@ -1,0 +1,5 @@
+# libFuzzer needs `-Z sanitizer`, so this directory builds on nightly. Without
+# this file the workspace-root `rust-toolchain.toml` would pin cargo-fuzz to
+# stable and every `cargo fuzz` invocation would fail on the nightly-only flag.
+[toolchain]
+channel = "nightly"
