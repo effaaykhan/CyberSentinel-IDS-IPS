@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# `fuzz` is a separate workspace: cargo-fuzz targets require nightly and must not
+# be pulled into `cargo build --workspace` on stable.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/cybersentinel/cybersentinel-IPS"
+description = "CyberSentinel-IPS — standalone host- and network-based intrusion detection sensor"
+
+[workspace.dependencies]
+# Internal crates
+cybersentinel-common = { path = "crates/common", version = "0.1.0" }
+cybersentinel-capture = { path = "crates/capture", version = "0.1.0" }
+cybersentinel-decode = { path = "crates/decode", version = "0.1.0" }
+cybersentinel-reassembly = { path = "crates/reassembly", version = "0.1.0" }
+cybersentinel-applayer = { path = "crates/applayer", version = "0.1.0" }
+cybersentinel-rules = { path = "crates/rules", version = "0.1.0" }
+cybersentinel-engine = { path = "crates/engine", version = "0.1.0" }
+cybersentinel-hids = { path = "crates/hids", version = "0.1.0" }
+cybersentinel-correlation = { path = "crates/correlation", version = "0.1.0" }
+cybersentinel-storage = { path = "crates/storage", version = "0.1.0" }
+cybersentinel-alerting = { path = "crates/alerting", version = "0.1.0" }
+
+# External
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# "termination" so a systemd/launchd `stop` (SIGTERM) shuts the sensor down as
+# cleanly as an interactive Ctrl-C does.
+ctrlc = { version = "3", features = ["termination"] }
+gethostname = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+time = { version = "0.3", features = ["parsing"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[workspace.lints.rust]
+# The engine parses attacker-controlled input at every stage (guide §6). No `unsafe`
+# anywhere in the workspace; a crate that genuinely needs it must opt out explicitly
+# and document why.
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Panicking in a long-running sensor is an availability bug.
+todo = "warn"
+unimplemented = "warn"
+
+[profile.release]
+# Keep panics unwinding: the event-writer thread must be able to die without
+# taking the capture path with it.
+panic = "unwind"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

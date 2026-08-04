@@ -1,0 +1,12 @@
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+
+# Runtime output of a dev-mode `cybersentinel run` from the repo root.
+/logs
+/data
+
+*.pcap
+!tests/fixtures/**/*.pcap
