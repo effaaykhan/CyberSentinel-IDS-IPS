@@ -36,6 +36,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Live capture links against libpcap; macOS ships it, Linux needs the
+      # headers. Windows has neither and builds without a live backend until
+      # Phase 5 — replaying .pcap files needs none of this, which is why the
+      # decode tests run everywhere. See crates/capture/README.md.
+      - name: Install libpcap (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
       - name: Install the Rust toolchain
         shell: bash
         run: |
@@ -102,6 +110,39 @@ jobs:
 
           echo "stats event OK"
 
+      # The Phase 1 acceptance criterion: the full capture -> decode -> flow
+      # pipeline runs from a capture file, with no privileges and no NIC. This
+      # is the same path on every OS.
+      - name: Smoke test — replay the pcap fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo run --quiet -p cybersentinel -- run \
+            --config config/config.yaml \
+            --replay tests/fixtures/pcap/normal.pcap > normal.json
+
+          echo "--- flow events ---"
+          grep '"event_type":"flow"' normal.json
+
+          flows=$(grep -c '"event_type":"flow"' normal.json || true)
+          test "$flows" -eq 5 || { echo "expected 5 flow events, got $flows"; exit 1; }
+          grep -q '"reason":"closed"' normal.json      || { echo "no closed flow"; exit 1; }
+          grep -q '"proto":"ICMP"' normal.json         || { echo "ICMP flow missing"; exit 1; }
+          grep -q '"src_ip":"2001:db8::10"' normal.json || { echo "IPv6 flow missing"; exit 1; }
+
+          cargo run --quiet -p cybersentinel -- run \
+            --config config/config.yaml \
+            --replay tests/fixtures/pcap/malformed.pcap > malformed.json
+
+          anomalies=$(grep -c '"event_type":"anomaly"' malformed.json || true)
+          test "$anomalies" -eq 14 \
+            || { echo "expected 14 anomaly events, got $anomalies"; exit 1; }
+          grep -q '"anomalous":14' malformed.json \
+            || { echo "anomaly counters missing from stats"; exit 1; }
+
+          echo "replay OK: $flows flows, $anomalies anomalies"
+
       - name: Verify --version
         run: cargo run --quiet -p cybersentinel -- --version
 
@@ -115,6 +156,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
 
       - name: Install the Rust toolchain
         run: |
@@ -173,6 +217,10 @@ jobs:
           # Run against the *installed* config, as an operator would.
           sudo /usr/bin/cybersentinel run --config /etc/cybersentinel/config.yaml --once
           sudo test -s /var/log/cybersentinel/events.json
+          # ... and that it can analyse a capture file.
+          sudo /usr/bin/cybersentinel run \
+            --config /etc/cybersentinel/config.yaml \
+            --replay tests/fixtures/pcap/normal.pcap
           echo "installed sensor ran and wrote its event log"
 
       - name: Upload the package
@@ -197,6 +245,9 @@ jobs:
 
       # libFuzzer needs nightly. `fuzz/rust-toolchain.toml` selects it for that
       # directory, so nothing here changes the default toolchain.
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
       - name: Install the toolchains
         run: |
           rustup toolchain install stable --profile minimal
@@ -205,11 +256,15 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      - name: Fuzz the rule parser and loader
+      # Every parser that touches attacker-supplied input gets a short run, so a
+      # regression surfaces on the PR that caused it rather than months later.
+      - name: Fuzz the parsers
         working-directory: fuzz
         run: |
           cargo fuzz run rule_parser -- -max_total_time=60 -print_final_stats=1
           cargo fuzz run rule_file   -- -max_total_time=60 -print_final_stats=1
+          cargo fuzz run decoder     -- -max_total_time=90 -print_final_stats=1
+          cargo fuzz run pcap_reader -- -max_total_time=90 -print_final_stats=1
 
       - name: Upload any crash artifacts
         if: failure()
