@@ -1,0 +1,220 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Only first-party actions are used. A third-party action runs with access to
+# this repository's build; for a security tool, that supply chain is worth
+# keeping short. The Rust toolchain comes from the rustup that every GitHub
+# runner already ships.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Acceptance criterion: builds and tests pass on Linux, Windows, and macOS,
+  # and `cybersentinel run` actually runs on all three.
+  # -------------------------------------------------------------------------
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version && cargo --version
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # `-D warnings` here rather than in RUSTFLAGS: a global RUSTFLAGS would
+      # also apply to `cargo install` of the packaging tools, failing the build
+      # on warnings in code we do not own. clippy runs the rustc lints too, so
+      # nothing is lost.
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+      # The acceptance criterion is that the sensor *runs* on this OS with the
+      # shipped config — not merely that it compiles. `--once` exercises the
+      # whole startup path (config, rules, identity, pipeline, both sinks) and
+      # exits.
+      #
+      # The detailed shape of the event is asserted by the integration tests in
+      # `crates/cli/tests/run_once.rs`, which ran in the step above on this same
+      # OS. This step checks the shipped `config/config.yaml` and default
+      # ruleset specifically, which those tests deliberately do not use.
+      - name: Smoke test — run the sensor with the shipped config
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --quiet -p cybersentinel -- \
+            run --config config/config.yaml --once > stats.json
+
+          echo "--- emitted event ---"
+          cat stats.json
+
+          test -s stats.json                    || { echo "no event was emitted"; exit 1; }
+          test "$(wc -l < stats.json)" -eq 1    || { echo "expected exactly one event"; exit 1; }
+          test -s logs/events.json              || { echo "the file sink wrote nothing"; exit 1; }
+          cmp -s stats.json logs/events.json    || { echo "the two sinks disagree"; exit 1; }
+
+          grep -q '"event_type":"stats"' stats.json  || { echo "not a stats event"; exit 1; }
+          grep -qE '"timestamp":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z"' stats.json \
+            || { echo "timestamp is not UTC with sub-second precision"; exit 1; }
+          grep -q '"dropped":0' stats.json      || { echo "events were dropped at startup"; exit 1; }
+          if grep -q '"loaded":0' stats.json; then echo "the default ruleset did not load"; exit 1; fi
+
+          echo "stats event OK"
+
+      - name: Verify --version
+        run: cargo run --quiet -p cybersentinel -- --version
+
+  # -------------------------------------------------------------------------
+  # Acceptance criterion: CI produces at least one installable Linux package.
+  # -------------------------------------------------------------------------
+  package-deb:
+    name: package (linux .deb)
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-cargo-deb-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-deb-
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build the release binary
+        run: cargo build --release -p cybersentinel
+
+      - name: Build the .deb
+        run: cargo deb -p cybersentinel --no-build
+
+      # A package that builds but installs wrong is worse than no package: it
+      # fails on the operator's machine instead of ours.
+      - name: Verify the package contents
+        run: |
+          set -euo pipefail
+          deb=$(ls target/debian/*.deb)
+          echo "built $deb"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+
+          for path in \
+            ./usr/bin/cybersentinel \
+            ./etc/cybersentinel/config.yaml \
+            ./etc/cybersentinel/rules/cybersentinel.rules \
+            ./etc/logrotate.d/cybersentinel
+          do
+            dpkg-deb --contents "$deb" | grep -q " $path\$" \
+              || { echo "missing from the package: $path"; exit 1; }
+          done
+
+          dpkg-deb --contents "$deb" | grep -q "cybersentinel.service" \
+            || { echo "the systemd unit is missing from the package"; exit 1; }
+
+      - name: Install the package and run the installed binary
+        run: |
+          set -euo pipefail
+          sudo dpkg --install target/debian/*.deb
+          /usr/bin/cybersentinel --version
+          # Run against the *installed* config, as an operator would.
+          sudo /usr/bin/cybersentinel run --config /etc/cybersentinel/config.yaml --once
+          sudo test -s /var/log/cybersentinel/events.json
+          echo "installed sensor ran and wrote its event log"
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cybersentinel-deb
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Guide §6: a crash in a parser is a vulnerability. Every phase that adds a
+  # parser adds a fuzz target, and CI gives each one a short run so a
+  # regression surfaces on the PR that caused it rather than months later.
+  # -------------------------------------------------------------------------
+  fuzz:
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # libFuzzer needs nightly. `fuzz/rust-toolchain.toml` selects it for that
+      # directory, so nothing here changes the default toolchain.
+      - name: Install the toolchains
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz the rule parser and loader
+        working-directory: fuzz
+        run: |
+          cargo fuzz run rule_parser -- -max_total_time=60 -print_final_stats=1
+          cargo fuzz run rule_file   -- -max_total_time=60 -print_final_stats=1
+
+      - name: Upload any crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
