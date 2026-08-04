@@ -1,0 +1,14 @@
+[package]
+name = "cybersentinel-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CyberSentinel engine stage"
+
+[lints]
+workspace = true
+
+[dependencies]
+cybersentinel-common.workspace = true

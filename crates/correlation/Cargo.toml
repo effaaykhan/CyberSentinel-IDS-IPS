@@ -1,0 +1,14 @@
+[package]
+name = "cybersentinel-correlation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CyberSentinel correlation stage"
+
+[lints]
+workspace = true
+
+[dependencies]
+cybersentinel-common.workspace = true
