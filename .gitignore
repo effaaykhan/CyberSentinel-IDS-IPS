@@ -10,3 +10,6 @@
 
 *.pcap
 !tests/fixtures/**/*.pcap
+
+# Agent/editor local state
+/.claude/
