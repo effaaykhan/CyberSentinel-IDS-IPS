@@ -1,0 +1,57 @@
+[package]
+name = "cybersentinel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CyberSentinel-IPS — standalone host- and network-based intrusion detection sensor"
+readme = "../../README.md"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "cybersentinel"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+cybersentinel-common.workspace = true
+cybersentinel-rules.workspace = true
+cybersentinel-storage.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+# ---------------------------------------------------------------------------
+# Linux packaging (`cargo deb -p cybersentinel`). See packaging/linux/README.md.
+# ---------------------------------------------------------------------------
+[package.metadata.deb]
+name = "cybersentinel"
+maintainer = "CyberSentinel <security@example.invalid>"
+copyright = "2026, CyberSentinel contributors"
+extended-description = """\
+CyberSentinel-IPS is a standalone intrusion detection sensor combining \
+host-based (FIM, auth/log, process) and network-based monitoring in one \
+self-contained binary. Detection-only: it alerts, it does not block. \
+Rules use CyberSentinel's own .rules format and events are emitted as \
+newline-delimited CyberSentinel event JSON."""
+section = "admin"
+priority = "optional"
+assets = [
+    ["target/release/cybersentinel", "usr/bin/", "755"],
+    ["../../packaging/linux/config.yaml", "etc/cybersentinel/config.yaml", "644"],
+    ["../../rules/cybersentinel.rules", "etc/cybersentinel/rules/cybersentinel.rules", "644"],
+    ["../../README.md", "usr/share/doc/cybersentinel/README.md", "644"],
+    ["../../packaging/linux/logrotate", "etc/logrotate.d/cybersentinel", "644"],
+]
+conf-files = ["/etc/cybersentinel/config.yaml", "/etc/cybersentinel/rules/cybersentinel.rules"]
+# cargo-deb generates the maintainer scripts that register the unit. The service
+# is enabled but not started by the package: a sensor should be started once its
+# operator has reviewed the installed config.
+systemd-units = { unit-name = "cybersentinel", unit-scripts = "../../packaging/linux", enable = true, start = false }

@@ -1,0 +1,73 @@
+# CyberSentinel-IPS — development configuration.
+#
+# Run from the repository root:
+#   cybersentinel run --config config/config.yaml
+#
+# Relative paths resolve against the working directory, so this file keeps all
+# state inside the repo. The configuration installed by the packages uses
+# absolute system paths instead — see packaging/linux/config.yaml.
+#
+# Unknown keys are a hard error: a typo must not silently disable a sensor.
+
+sensor:
+  # Omit or leave null to use the host name.
+  name: null
+
+paths:
+  data-dir: data
+  log-dir: logs
+
+# Variables referenced by rule headers. Resolving these into address and port
+# sets is Phase 3 work; Phase 0 only validates that rules reference them.
+vars:
+  address-groups:
+    HOME_NET: "[192.168.0.0/16,10.0.0.0/8,172.16.0.0/12]"
+    EXTERNAL_NET: "!$HOME_NET"
+    DNS_SERVERS: "$HOME_NET"
+    HTTP_SERVERS: "$HOME_NET"
+  port-groups:
+    HTTP_PORTS: "[80,81,8000,8080,8443]"
+    DNS_PORTS: "53"
+    SSH_PORTS: "22"
+
+# Packet capture lands in Phase 1; leaving this enabled today only produces a
+# startup warning.
+capture:
+  enabled: false
+  interfaces: []
+  snaplen: 65535
+  promiscuous: true
+  bpf-filter: null
+
+rules:
+  directory: rules
+  files:
+    - cybersentinel.rules
+
+outputs:
+  # Newline-delimited CyberSentinel event JSON on stdout.
+  stdout:
+    enabled: true
+  # ... and to a file.
+  file:
+    enabled: true
+    path: events.json
+  # Phase 7.
+  syslog:
+    enabled: false
+  webhook:
+    enabled: false
+    url: null
+
+logging:
+  # error | warn | info | debug | trace. Diagnostics go to stderr so stdout
+  # stays a clean event stream.
+  level: info
+  # Depth of the queue between event producers and the writer thread. When it
+  # fills, events are dropped and counted in stats.events.dropped — treat a
+  # non-zero drop count as a coverage hole.
+  queue-capacity: 8192
+
+stats:
+  enabled: true
+  interval-secs: 30
