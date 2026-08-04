@@ -1,0 +1,14 @@
+# Event logs hold captured traffic and host activity — PII (guide §6). Retention
+# is a policy decision; this is a conservative default, not a recommendation.
+/var/log/cybersentinel/events.json {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    # The sensor holds the file open by descriptor and the service runs under a
+    # systemd DynamicUser, so rotate by copying and truncating rather than
+    # renaming and recreating.
+    copytruncate
+}

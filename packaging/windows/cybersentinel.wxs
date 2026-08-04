@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  CyberSentinel-IPS — WiX v4 installer skeleton (Phase 5).
+
+  NOT BUILT YET. This is a shape to argue with, not a finished installer. Before
+  it ships it still needs:
+
+    * a stable UpgradeCode (the placeholder below MUST be replaced exactly once
+      and then never changed — it is how Windows recognises upgrades of this
+      product rather than treating them as a second install);
+    * the Windows Service definition (ServiceInstall / ServiceControl);
+    * a bundle (WiX Burn) that chains the Npcap installer;
+    * ACLs restricting write access to the rules and config;
+    * Authenticode signing of both the payload and the package.
+
+  See README.md in this directory, including the unsettled WiX-vs-Inno decision.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="CyberSentinel-IPS"
+      Manufacturer="CyberSentinel"
+      Version="0.1.0"
+      UpgradeCode="00000000-0000-0000-0000-000000000000"
+      Scope="perMachine"
+      Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of CyberSentinel-IPS is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="CyberSentinel">
+        <Directory Id="RULESFOLDER" Name="rules" />
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="SensorComponents" Directory="INSTALLFOLDER">
+      <Component Id="SensorBinary">
+        <File Id="cybersentinel.exe" Source="target\release\cybersentinel.exe" KeyPath="yes" />
+        <!--
+          TODO(Phase 5): ServiceInstall + ServiceControl here, starting the
+          sensor as a Windows Service with automatic start and a delayed-start
+          dependency on the Npcap driver.
+        -->
+      </Component>
+      <Component Id="SensorConfig" Guid="*">
+        <!-- Marked permanent + never-overwrite so operator edits survive upgrade. -->
+        <File Id="config.yaml" Source="packaging\windows\config.yaml" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="RuleComponents" Directory="RULESFOLDER">
+      <Component Id="DefaultRules" Guid="*">
+        <File Id="cybersentinel.rules" Source="rules\cybersentinel.rules" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="CyberSentinel-IPS sensor" Level="1">
+      <ComponentGroupRef Id="SensorComponents" />
+      <ComponentGroupRef Id="RuleComponents" />
+    </Feature>
+  </Package>
+</Wix>

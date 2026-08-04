@@ -1,0 +1,51 @@
+[Unit]
+Description=CyberSentinel-IPS intrusion detection sensor
+Documentation=https://github.com/cybersentinel/cybersentinel-IPS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cybersentinel run --config /etc/cybersentinel/config.yaml
+Restart=on-failure
+RestartSec=5s
+
+# --- Least privilege (guide §6) --------------------------------------------
+# Phase 0 needs no elevated privileges at all. From Phase 1, packet capture
+# needs CAP_NET_RAW and CAP_NET_ADMIN to open the capture socket; the sensor
+# opens it and then drops privileges, so the capabilities are granted as a
+# bounding set rather than by running as root.
+# DynamicUser lets systemd allocate and own the service account, so the package
+# needs no useradd in a maintainer script and leaves no stale account behind on
+# removal.
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# --- Self-protection (guide §6) --------------------------------------------
+# The sensor is a target: an attacker who can rewrite its rules or delete its
+# event log has blinded it. Everything is read-only except the two directories
+# it owns.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# systemd creates, owns, and permissions these two; they are the only writable
+# paths the sensor has.
+StateDirectory=cybersentinel
+LogsDirectory=cybersentinel
+
+# Captured traffic and host events are PII (guide §6): keep the event log
+# readable only by the sensor and the administrators who need it.
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

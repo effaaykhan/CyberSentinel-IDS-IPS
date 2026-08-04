@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CyberSentinel-IPS launchd daemon (Phase 6). NOT INSTALLED YET.
+
+  Load with:  sudo launchctl load -w /Library/LaunchDaemons/com.cybersentinel.sensor.plist
+
+  Open question for Phase 6: this runs as root because packet capture needs
+  /dev/bpf*. The intent (guide §6) is to open the capture device and then drop
+  privileges inside the process; until that is implemented, running as root is a
+  larger blast radius than this project wants.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cybersentinel.sensor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/cybersentinel</string>
+        <string>run</string>
+        <string>--config</string>
+        <string>/usr/local/etc/cybersentinel/config.yaml</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Diagnostics only. Events go to the file sink configured in config.yaml. -->
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/cybersentinel/daemon.err</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -1,0 +1,56 @@
+# CyberSentinel-IPS — installed configuration (/etc/cybersentinel/config.yaml).
+#
+# Differs from the development config only in using absolute system paths.
+# Edit and then `systemctl start cybersentinel`.
+
+sensor:
+  name: null
+
+paths:
+  data-dir: /var/lib/cybersentinel
+  log-dir: /var/log/cybersentinel
+
+vars:
+  address-groups:
+    HOME_NET: "[192.168.0.0/16,10.0.0.0/8,172.16.0.0/12]"
+    EXTERNAL_NET: "!$HOME_NET"
+    DNS_SERVERS: "$HOME_NET"
+    HTTP_SERVERS: "$HOME_NET"
+  port-groups:
+    HTTP_PORTS: "[80,81,8000,8080,8443]"
+    DNS_PORTS: "53"
+    SSH_PORTS: "22"
+
+capture:
+  enabled: false
+  interfaces: []
+  snaplen: 65535
+  promiscuous: true
+  bpf-filter: null
+
+rules:
+  directory: /etc/cybersentinel/rules
+  files:
+    - cybersentinel.rules
+
+outputs:
+  # Under systemd, stdout would land in the journal alongside the diagnostic
+  # log; the file sink is the event log of record.
+  stdout:
+    enabled: false
+  file:
+    enabled: true
+    path: events.json
+  syslog:
+    enabled: false
+  webhook:
+    enabled: false
+    url: null
+
+logging:
+  level: info
+  queue-capacity: 8192
+
+stats:
+  enabled: true
+  interval-secs: 60
