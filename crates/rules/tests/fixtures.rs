@@ -32,11 +32,23 @@ fn mixed_fixture_loads_the_good_rules_and_accounts_for_the_rest() {
     }
 
     let reasons: Vec<&str> = report.skipped.iter().map(|s| s.reason.as_str()).collect();
-    assert!(reasons.iter().any(|r| r.contains("option block")), "{reasons:?}");
+    assert!(
+        reasons.iter().any(|r| r.contains("option block")),
+        "{reasons:?}"
+    );
     assert!(reasons.iter().any(|r| r.contains("'sid'")), "{reasons:?}");
-    assert!(reasons.iter().any(|r| r.contains("unknown option")), "{reasons:?}");
-    assert!(reasons.iter().any(|r| r.contains("detection-only")), "{reasons:?}");
-    assert!(reasons.iter().any(|r| r.contains("duplicate sid 900001")), "{reasons:?}");
+    assert!(
+        reasons.iter().any(|r| r.contains("unknown option")),
+        "{reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|r| r.contains("detection-only")),
+        "{reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|r| r.contains("duplicate sid 900001")),
+        "{reasons:?}"
+    );
 }
 
 #[test]
@@ -67,12 +79,20 @@ fn the_shipped_default_ruleset_parses() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../rules/cybersentinel.rules");
     let (set, report) = RuleSet::load_files(&[path]);
 
-    assert!(report.skipped.is_empty(), "shipped rules must parse: {:#?}", report.skipped);
+    assert!(
+        report.skipped.is_empty(),
+        "shipped rules must parse: {:#?}",
+        report.skipped
+    );
     assert!(!set.is_empty());
     for rule in set.rules() {
         assert!(!rule.msg.is_empty());
         assert!(rule.origin.is_some());
         // The SID convention from guide §3.1.
-        assert!(rule.sid >= 100_000, "sid {} is below the network range", rule.sid);
+        assert!(
+            rule.sid >= 100_000,
+            "sid {} is below the network range",
+            rule.sid
+        );
     }
 }
