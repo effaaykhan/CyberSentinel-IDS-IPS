@@ -10,56 +10,118 @@ ExecStart=/usr/bin/cybersentinel run --config /etc/cybersentinel/config.yaml
 Restart=on-failure
 RestartSec=5s
 
-# --- Least privilege (guide §6) --------------------------------------------
-# Phase 0 needs no elevated privileges at all. From Phase 1, packet capture
-# needs CAP_NET_RAW and CAP_NET_ADMIN to open the capture socket; the sensor
-# opens it and then drops privileges, so the capabilities are granted as a
-# bounding set rather than by running as root.
+# ---------------------------------------------------------------------------
+# Least privilege (guide §6, CLAUDE.md §8)
+# ---------------------------------------------------------------------------
+# The capability set is **temporal**, and that is the whole design:
+#
+#   CAP_NET_RAW / CAP_NET_ADMIN  are needed once, to open the capture socket.
+#                                The sensor drops them itself immediately
+#                                afterwards, so they are granted at launch and
+#                                gone by the time any packet is parsed.
+#   CAP_DAC_READ_SEARCH          is needed for the process's whole life. Host
+#                                monitoring goes on reading and hashing files it
+#                                does not own — /etc/shadow is mode 0640
+#                                root:shadow — and a baseline that cannot read
+#                                it is a baseline that silently omits the file
+#                                most worth watching.
+#
+# So the ambient set grants all three at launch, and steady state is only
+# CAP_DAC_READ_SEARCH. verify-install.sh asserts exactly that against a running
+# service, because a capability model nobody checks is a capability model
+# nobody knows is wrong.
+#
+# Deliberately absent: CAP_SYS_PTRACE. It would let the sensor attribute a
+# listening socket to another user's process — and would also let it ptrace
+# anything on the box, which is full compromise. The socket is still reported;
+# the owning process shows as "unknown". Losing one attribution is worth far
+# more than handing an attacker that capability.
+#
+# On a HIDS-only install, drop the two NET capabilities. On a NIDS-only one,
+# drop CAP_DAC_READ_SEARCH. The sensor works with either half missing and says
+# so in its `stats` events.
+#
 # DynamicUser lets systemd allocate and own the service account, so the package
 # needs no useradd in a maintainer script and leaves no stale account behind on
 # removal.
-#
-# CAP_DAC_READ_SEARCH is different from the two above: the network path drops
-# its capabilities once the handle is open, but host monitoring goes on reading
-# and hashing files it does not own for as long as it runs. A baseline that
-# cannot read /etc/shadow is a baseline that silently omits the file most worth
-# watching. It is ambient as well as bounded because the sensor execs one child
-# — journalctl — which needs it to read /var/log/journal.
-#
-# Deliberately NOT here: CAP_SYS_PTRACE. It would let the sensor attribute a
-# listening socket to another user's process, and it would also let it ptrace
-# anything on the box. The socket is reported either way; the owner shows as
-# "unknown". See §8 of CLAUDE.md for the full set.
 DynamicUser=yes
 AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_READ_SEARCH
 NoNewPrivileges=yes
 
-# --- Self-protection (guide §6) --------------------------------------------
+# ---------------------------------------------------------------------------
+# Self-protection (guide §6)
+# ---------------------------------------------------------------------------
 # The sensor is a target: an attacker who can rewrite its rules or delete its
 # event log has blinded it. Everything is read-only except the two directories
-# it owns.
+# systemd creates and owns for it.
+#
+# Every directive below was added one at a time and re-verified against a
+# running sensor — live capture, the FIM baseline, real-time file events,
+# /proc sweeps, listening-socket detection, and the journalctl child — because
+# a sandbox that silently removes one of those is worse than no sandbox at all.
+# Two plausible candidates failed that check and are documented at the bottom
+# rather than quietly left out.
 ProtectSystem=strict
-# Host monitoring reads /var/log and /etc; ProtectSystem=strict keeps them
+# Host monitoring reads /etc and /var/log; ProtectSystem=strict makes them
 # read-only rather than hidden, which is exactly what FIM wants.
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
+RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+# The sensor is a long-running parser of hostile input. If one of those parsers
+# is ever turned into code execution, this is the difference between an
+# attacker running a shell and an attacker getting EPERM.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# AF_PACKET is live capture. AF_NETLINK is how libpcap enumerates interfaces
+# and reads their statistics. AF_UNIX is the syslog sink and ordinary libc
+# plumbing. The webhook sink will need AF_INET and AF_INET6 when Phase 7 lands
+# it — add them then, with a check that shows they are needed, rather than now
+# on the assumption that they will be.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_PACKET
+
 # systemd creates, owns, and permissions these two; they are the only writable
-# paths the sensor has.
+# paths the sensor has. StateDirectory holds the sensor id and the FIM baseline.
 StateDirectory=cybersentinel
 LogsDirectory=cybersentinel
 
 # Captured traffic and host events are PII (guide §6): keep the event log
 # readable only by the sensor and the administrators who need it.
 UMask=0027
+
+# ---------------------------------------------------------------------------
+# Deliberately NOT set, with the reason
+# ---------------------------------------------------------------------------
+# ProtectProc=invisible
+#   Hides other users' processes from /proc. Verified against a running sensor:
+#   the service starts, capture works, FIM works — and process monitoring
+#   reports nothing at all, because the only process it can still see is its
+#   own. A sandbox that switches a detection feature off without failing is the
+#   exact class of silence this project exists to avoid.
+#
+# ProcSubset=pid
+#   Hides everything in /proc that is not a process directory, including
+#   /proc/net/tcp — which is where listening sockets are read from. A new
+#   backdoor listening on a port is the host signal that matters most.
+#
+# PrivateNetwork=yes
+#   Would give the sensor an empty network namespace to capture from. Obviously
+#   wrong here, and named because "harden it further" is a reasonable instinct
+#   that leads straight to it.
 
 [Install]
 WantedBy=multi-user.target

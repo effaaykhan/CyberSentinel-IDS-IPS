@@ -110,13 +110,28 @@ check_capture() {
     EVENTS="$LOGS/events.json"
     [ -f "$EVENTS" ] || fail "no event log at $EVENTS"
 
-    # Give the sensor something to see, then wait for a stats event that
-    # reports it. Loopback traffic is enough and needs no external host.
-    ping -c 4 -i 0.2 127.0.0.1 >/dev/null 2>&1 || true
+    # Give the sensor something to see — on the interface it is actually
+    # watching. Pinging loopback while the sensor captures on eth0 proves
+    # nothing, and would fail this check on a working install.
+    # Scoped to the capture block: `source` also appears on alerts (network or
+    # host) and `log_source` on auth records, and picking one of those up gives
+    # an interface name that does not exist.
+    IFACE=$(grep -o '"capture":{[^}]*}' "$EVENTS" | tail -1 |
+            grep -o '"source":"[^"]*"' | cut -d'"' -f4)
+    info "capturing on ${IFACE:-unknown}"
+    case "$IFACE" in
+        lo|"") ping -c 4 -i 0.2 127.0.0.1 >/dev/null 2>&1 || true ;;
+        *)     ping -c 4 -i 0.2 -I "$IFACE" 8.8.8.8 >/dev/null 2>&1 ||
+               ping -c 4 -i 0.2 -I "$IFACE" 1.1.1.1 >/dev/null 2>&1 ||
+               # No route out. Broadcast ARP on the segment instead: it needs
+               # no reachable host and the sensor sees it either way.
+               arping -c 3 -I "$IFACE" -b 255.255.255.255 >/dev/null 2>&1 || true ;;
+    esac
     BEFORE=$(wc -c < "$EVENTS")
-    sleep 6
+    sleep 8
 
-    SEEN=$(tr ',' '\n' < "$EVENTS" | grep -o '"packets":[0-9]*' | tail -1 | cut -d: -f2)
+    SEEN=$(grep -o '"capture":{[^}]*}' "$EVENTS" | tail -1 |
+           grep -o '"packets":[0-9]*' | cut -d: -f2)
     [ -n "${SEEN:-}" ] || fail "no capture counters in $EVENTS"
     [ "$SEEN" -gt 0 ] || fail "capture is enabled but no packets were seen: the handle was opened, then broken"
     pass "capture is live: $SEEN packet(s) seen"

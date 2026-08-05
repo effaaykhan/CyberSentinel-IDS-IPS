@@ -82,11 +82,23 @@ assets = [
     ["../../rules/cybersentinel.rules", "etc/cybersentinel/rules/cybersentinel.rules", "644"],
     ["../../README.md", "usr/share/doc/cybersentinel/README.md", "644"],
     ["../../packaging/linux/logrotate", "etc/logrotate.d/cybersentinel", "644"],
+    # The checks behind CLAUDE.md §8, shipped so an operator can run them on
+    # their own machine rather than trust ours.
+    ["../../packaging/linux/verify-install.sh", "usr/share/doc/cybersentinel/verify-install.sh", "755"],
 ]
 conf-files = ["/etc/cybersentinel/config.yaml", "/etc/cybersentinel/rules/cybersentinel.rules"]
 # cargo-deb generates the maintainer scripts that register the unit. The service
 # is enabled but not started by the package: a sensor should be started once its
 # operator has reviewed the installed config.
+#
+# `maintainer-scripts` is load-bearing and easy to leave out. cargo-deb's
+# `generate_scripts` returns early when it is unset, so `systemd-units` on its
+# own installs the unit file and generates **nothing** to register it: no
+# `daemon-reload`, no `enable`. The package looks right — the unit is in the
+# listing — and the sensor silently does not come back after a reboot. Pointing
+# it at a directory with no maintainer scripts in it is what makes cargo-deb
+# write the generated ones.
+maintainer-scripts = "../../packaging/linux/maintainer"
 systemd-units = { unit-name = "cybersentinel", unit-scripts = "../../packaging/linux", enable = true, start = false }
 
 # ---------------------------------------------------------------------------
@@ -109,6 +121,7 @@ assets = [
     { source = "packaging/linux/cybersentinel.service", dest = "/usr/lib/systemd/system/cybersentinel.service", mode = "644" },
     { source = "packaging/linux/logrotate", dest = "/etc/logrotate.d/cybersentinel", mode = "644", config = true },
     { source = "README.md", dest = "/usr/share/doc/cybersentinel/README.md", mode = "644", doc = true },
+    { source = "packaging/linux/verify-install.sh", dest = "/usr/share/doc/cybersentinel/verify-install.sh", mode = "755" },
 ]
 
 # systemd registration, matching what cargo-deb generates for the .deb. The
