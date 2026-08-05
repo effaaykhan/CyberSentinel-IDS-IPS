@@ -42,6 +42,10 @@ pub struct Config {
     pub flow: FlowConfig,
     /// IP defragmentation and TCP stream reassembly.
     pub reassembly: ReassemblyConfig,
+    /// URI and path normalization.
+    pub normalize: NormalizeConfig,
+    /// The detection engine.
+    pub detect: DetectConfig,
     /// Which `.rules` files to load.
     pub rules: RulesConfig,
     /// Where events go.
@@ -366,6 +370,77 @@ impl ReassemblyConfig {
     }
 }
 
+/// URI and path normalization.
+///
+/// These are target-behaviour decisions, like the overlap policy: they say what
+/// the *server* will make of a request, and a sensor that reads it differently
+/// is looking at something the server never saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct NormalizeConfig {
+    /// Percent-decoding passes.
+    ///
+    /// Two catches ordinary double encoding. Capped rather than repeated to a
+    /// fixed point, because an input can always be encoded one level deeper
+    /// than any limit and unbounded work per request is a denial of service.
+    pub decode_rounds: usize,
+    /// Resolve `.` and `..` segments.
+    pub collapse_path: bool,
+    /// Treat `\` as a path separator, as Windows-hosted servers do.
+    pub backslash_is_separator: bool,
+}
+
+impl Default for NormalizeConfig {
+    fn default() -> Self {
+        Self {
+            decode_rounds: 2,
+            collapse_path: true,
+            backslash_is_separator: false,
+        }
+    }
+}
+
+/// The detection engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct DetectConfig {
+    /// Run detection at all. Off means rules load and report but never fire.
+    pub enabled: bool,
+    /// Byte budget for one compiled regex program.
+    ///
+    /// Linear-time matching does not make *compilation* free. A rule whose
+    /// `pcre` needs more than this is refused at load and reported, rather
+    /// than costing megabytes per rule.
+    pub regex_size_limit: usize,
+    /// Byte budget for one regex's lazy DFA cache.
+    pub regex_dfa_size_limit: usize,
+    /// Flows that may carry detection state at once.
+    pub max_flow_states: usize,
+    /// Flowbits one flow may hold.
+    pub max_flowbits_per_flow: usize,
+    /// Reassembled bytes kept per direction for matching.
+    ///
+    /// The longest content match that can ever fire on a stream: a pattern that
+    /// never sits in the window whole cannot be found.
+    pub inspection_window: usize,
+    /// Threshold counters held at once.
+    pub max_threshold_entries: usize,
+}
+
+impl Default for DetectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            regex_size_limit: 1 << 20,
+            regex_dfa_size_limit: 1 << 20,
+            max_flow_states: 65_536,
+            max_flowbits_per_flow: 64,
+            inspection_window: 64 << 10,
+            max_threshold_entries: 65_536,
+        }
+    }
+}
+
 /// Which `.rules` files to load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
@@ -583,6 +658,21 @@ impl Config {
             ));
         }
         self.reassembly.check()?;
+        if self.detect.inspection_window == 0 {
+            return Err(Error::ConfigInvalid(
+                "detect.inspection-window must be at least 1".into(),
+            ));
+        }
+        if self.detect.max_flow_states == 0 {
+            return Err(Error::ConfigInvalid(
+                "detect.max-flow-states must be at least 1".into(),
+            ));
+        }
+        if self.normalize.decode_rounds > 8 {
+            return Err(Error::ConfigInvalid(
+                "normalize.decode-rounds above 8 is a denial of service, not a setting".into(),
+            ));
+        }
         match self.logging.level.to_ascii_lowercase().as_str() {
             "error" | "warn" | "info" | "debug" | "trace" => {}
             other => {
@@ -633,6 +723,11 @@ impl Config {
         if self.capture.bpf_filter.is_some() {
             warnings.push(
                 "capture.bpf-filter is set: traffic it excludes is invisible to detection".into(),
+            );
+        }
+        if !self.detect.enabled {
+            warnings.push(
+                "detect.enabled is false: rules will load and report, but nothing will fire".into(),
             );
         }
         if self.capture.interfaces.len() > 1 {

@@ -35,7 +35,12 @@ clap = { version = "4", features = ["derive"] }
 # Safe L2-L4 header parsing. We drive it header by header rather than through
 # the all-in-one slicer so every length check, and every anomaly it implies, is
 # ours and explicit.
+# Multi-pattern pre-filter: one pass finds every rule's fast pattern at once.
+aho-corasick = "1"
 etherparse = "0.21"
+# Rule regexes. `regex` rather than PCRE for its linear-time guarantee - rule
+# content is attacker-adjacent as soon as rulesets are shared.
+regex = "1"
 # Live capture only. Reading .pcap *files* is implemented in-tree so the test and
 # CI path needs no libpcap at all — see crates/capture/README.md.
 pcap = "2"

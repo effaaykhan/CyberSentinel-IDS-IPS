@@ -14,6 +14,8 @@ use cybersentinel_common::event::{
 };
 use cybersentinel_common::eventlog::{EventEmitter, EventPipeline, EventSink};
 use cybersentinel_common::sensor;
+use cybersentinel_engine::CompileLimits;
+use cybersentinel_engine::{CompileReport, Engine, EngineLimits, VarTable};
 use cybersentinel_rules::{LoadReport, RuleSet};
 use cybersentinel_storage::{FileEventSink, StdoutEventSink};
 
@@ -58,6 +60,14 @@ pub struct RunArgs {
     /// Override logging.level from the config file.
     #[arg(long, value_name = "LEVEL")]
     pub log_level: Option<String>,
+
+    /// Refuse to start if any rule fails to load or compile.
+    ///
+    /// Off by default: a sensor that will not start because one rule is broken
+    /// is a sensor that is not watching anything. Use this in CI and
+    /// pre-deployment checks, where failing loudly is the point.
+    #[arg(long)]
+    pub strict: bool,
 
     /// Write reassembled TCP stream content into this directory.
     ///
@@ -162,9 +172,30 @@ pub fn run(args: &RunArgs) -> Result<()> {
     let event_log = Arc::new(EventPipeline::spawn(sinks, config.logging.queue_capacity));
     let emitter = EventEmitter::new(sensor_info, Arc::clone(&event_log));
 
-    let (_rules, report) = RuleSet::load_files(&config.rules.files);
+    let (rules, report) = RuleSet::load_files(&config.rules.files);
+    let (engine, compile_report) = build_engine(&config, &rules);
+    log_coverage(&report, &compile_report);
 
-    let result = main_loop(args, &config, &emitter, &report, &mut source);
+    if args.strict {
+        let problems = report.skipped.len() + compile_report.failed.len();
+        if problems > 0 {
+            event_log.shutdown();
+            anyhow::bail!(
+                "--strict: {problems} rule(s) failed to load or compile; \
+                 run `cybersentinel validate-rules` for the detail"
+            );
+        }
+    }
+
+    let result = main_loop(
+        args,
+        &config,
+        &emitter,
+        &report,
+        &compile_report,
+        engine,
+        &mut source,
+    );
 
     // Always drain and flush, even if the run failed: queued events are
     // evidence.
@@ -236,11 +267,69 @@ fn drop_privileges() {
     }
 }
 
+/// Compile the loaded rules into an engine.
+pub fn build_engine(config: &Config, rules: &RuleSet) -> (Engine, CompileReport) {
+    let vars = VarTable::new(
+        config.vars.address_groups.clone(),
+        config.vars.port_groups.clone(),
+    );
+    let limits = EngineLimits {
+        compile: CompileLimits {
+            regex_size_limit: config.detect.regex_size_limit,
+            regex_dfa_size_limit: config.detect.regex_dfa_size_limit,
+        },
+        max_flow_states: config.detect.max_flow_states,
+        max_flowbits_per_flow: config.detect.max_flowbits_per_flow,
+        inspection_window: config.detect.inspection_window,
+        max_threshold_entries: config.detect.max_threshold_entries,
+    };
+    Engine::new(rules.rules().iter(), &vars, limits)
+}
+
+/// Report rule coverage at startup, in buckets an operator can act on.
+///
+/// The distinction matters: "not implemented yet" is the project's problem,
+/// "failed to compile" is the rule author's, and "skipped" means the file has a
+/// line in it that is not a rule at all. Collapsing them into one number would
+/// hide whichever one someone needs to fix.
+fn log_coverage(load: &LoadReport, compile: &CompileReport) {
+    tracing::info!(
+        loaded = load.loaded,
+        armed = compile.compiled,
+        awaiting_support = compile.not_evaluable,
+        failed_to_compile = compile.failed.len(),
+        skipped = load.skipped.len(),
+        "rule coverage"
+    );
+
+    for failure in &compile.failed {
+        tracing::warn!(
+            sid = failure.sid,
+            rule = %failure.origin,
+            reason = %failure.reason,
+            "rule failed to compile and is NOT running"
+        );
+    }
+
+    if compile.without_prefilter > 0 {
+        tracing::debug!(
+            count = compile.without_prefilter,
+            "rule(s) have no pre-filter pattern and are evaluated on every packet"
+        );
+    }
+    if compile.compiled == 0 {
+        tracing::warn!("no rules are armed: the sensor will see traffic but detect nothing");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn main_loop(
     args: &RunArgs,
     config: &Config,
     emitter: &EventEmitter,
     report: &LoadReport,
+    compile_report: &CompileReport,
+    engine: Engine,
     source: &mut Source,
 ) -> Result<()> {
     let started = Instant::now();
@@ -264,6 +353,7 @@ fn main_loop(
     if source.as_packet_source().is_none() {
         return heartbeat_only(config, emitter, report, started, &snapshot, &shutdown);
     }
+    let _ = compile_report;
 
     // Stats run on their own thread so a busy packet loop cannot delay them,
     // and so a quiet link still produces a heartbeat.
@@ -276,6 +366,8 @@ fn main_loop(
         &snapshot,
         &shutdown,
         args.dump_streams.as_ref(),
+        engine,
+        compile_report,
     );
 
     // Stop the stats thread and emit one final stats event with the closing
@@ -291,6 +383,7 @@ fn main_loop(
 
 /// The packet loop. Runs on the main thread, which is the thread that opened
 /// the capture handle and dropped privileges.
+#[allow(clippy::too_many_arguments)]
 fn run_packet_loop(
     config: &Config,
     emitter: &EventEmitter,
@@ -298,6 +391,8 @@ fn run_packet_loop(
     snapshot: &SharedSnapshot,
     shutdown: &Arc<AtomicBool>,
     dump_streams: Option<&PathBuf>,
+    engine: Engine,
+    compile_report: &CompileReport,
 ) -> Result<()> {
     let mut pipeline = PacketPipeline::new(
         emitter.clone(),
@@ -309,6 +404,9 @@ fn run_packet_loop(
         },
         source.name(),
     );
+    if config.detect.enabled {
+        pipeline.arm(engine, compile_report);
+    }
 
     let Some(packets) = source.as_packet_source() else {
         return Ok(());
@@ -523,8 +621,23 @@ fn emit_stats(
             stream_dropped_incomplete: pipeline.streams.dropped_incomplete,
             resets_ignored: pipeline.flows.resets_ignored,
         },
-        // Detection lands in Phase 3, and says so rather than being absent.
-        engine: EngineStats::default(),
+        engine: EngineStats {
+            enabled: capturing && pipeline.rules_armed > 0,
+            rules_armed: pipeline.rules_armed,
+            rules_awaiting_support: pipeline.rules_awaiting_support,
+            rules_failed: pipeline.rules_failed,
+            rules_without_prefilter: pipeline.rules_without_prefilter,
+            inspections: pipeline.engine.inspections,
+            bytes_inspected: pipeline.engine.bytes_inspected,
+            candidates: pipeline.engine.candidates,
+            matches: pipeline.engine.matches,
+            alerts: pipeline.engine.alerts,
+            thresholded: pipeline.engine.thresholded,
+            silent: pipeline.engine.silent,
+            flow_states: pipeline.engine.flow_states,
+            flow_states_evicted: pipeline.engine.flow_states_evicted,
+            inspection_bytes_dropped: pipeline.engine.inspection_bytes_dropped,
+        },
     };
 
     if !emitter.emit(Payload::stats(stats)) {

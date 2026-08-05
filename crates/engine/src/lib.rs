@@ -7,25 +7,15 @@
 //!
 //! Phase 0 defines the counters the engine reports and the verdict it returns.
 
-/// Result of evaluating one unit of input against the ruleset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Verdict {
-    /// Nothing matched.
-    #[default]
-    NoMatch,
-    /// At least one rule matched; alerts have been emitted.
-    Matched,
-}
+pub mod compile;
+pub mod engine;
+pub mod eval;
+pub mod vars;
 
-/// Counters the engine contributes to `stats` events.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct EngineCounters {
-    /// Units of input evaluated.
-    pub evaluated: u64,
-    /// Candidates surfaced by the multi-pattern scan.
-    pub mpm_candidates: u64,
-    /// Alerts raised.
-    pub alerts: u64,
-    /// Alerts suppressed by `threshold` / `detection_filter`.
-    pub thresholded: u64,
-}
+pub use compile::{
+    CompileError, CompileFailure, CompileLimits, CompileReport, CompiledOption, CompiledRule,
+    CompiledRuleset,
+};
+pub use engine::{AlertRecord, Engine, EngineCounters, EngineLimits};
+pub use eval::{evaluate, Buffers, FlowBits, MatchInput, MatchOutcome};
+pub use vars::{AddressSet, CompiledHeader, PortSet, VarError, VarTable};

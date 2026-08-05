@@ -26,11 +26,13 @@ use std::time::SystemTime;
 use cybersentinel_capture::{CaptureCounters, RawPacket};
 use cybersentinel_common::config::Config;
 use cybersentinel_common::event::{
-    AnomalyEvent, AnomalyRecord, FlowEndReason, FlowEvent, NetTuple, Payload, Protocol,
+    AlertAction, AlertEvent, AlertSource, AnomalyEvent, AnomalyRecord, FlowEndReason, FlowEvent,
+    NetTuple, Payload, Protocol,
 };
 use cybersentinel_common::eventlog::EventEmitter;
 use cybersentinel_common::Timestamp;
 use cybersentinel_decode::{DecodeCounters, Decoded, Network, Transport};
+use cybersentinel_engine::{AlertRecord, Engine, EngineCounters};
 use cybersentinel_reassembly::defrag::{DefragCounters, Defragmenter, FragmentView, Reassembled};
 use cybersentinel_reassembly::flow::{
     EndReason, EndedFlow, FlowCounters, FlowTable, PacketSummary,
@@ -62,6 +64,16 @@ pub struct PipelineSnapshot {
     pub streams: StreamCounters,
     /// Bytes held in stream reassembly buffers.
     pub stream_bytes_buffered: u64,
+    /// Detection-engine counters.
+    pub engine: EngineCounters,
+    /// Rules armed and matching.
+    pub rules_armed: u64,
+    /// Rules loaded but awaiting engine support.
+    pub rules_awaiting_support: u64,
+    /// Rules that failed to compile.
+    pub rules_failed: u64,
+    /// Rules with no usable pre-filter pattern.
+    pub rules_without_prefilter: u64,
     /// Whether a replayed capture file was torn.
     pub capture_truncated: bool,
 }
@@ -97,6 +109,14 @@ pub struct PacketPipeline {
     /// Reused across packets so delivery costs no allocation.
     ready: StreamReady,
     stream_bytes_delivered: u64,
+    /// The detection engine, once rules are armed.
+    engine: Option<Engine>,
+    /// Reused across packets so alerting costs no allocation.
+    alerts: Vec<AlertRecord>,
+    rules_armed: u64,
+    rules_awaiting_support: u64,
+    rules_failed: u64,
+    rules_without_prefilter: u64,
     options: PipelineOptions,
     source: String,
 }
@@ -127,9 +147,24 @@ impl PacketPipeline {
             decode: DecodeCounters::default(),
             ready: StreamReady::default(),
             stream_bytes_delivered: 0,
+            engine: None,
+            alerts: Vec::new(),
+            rules_armed: 0,
+            rules_awaiting_support: 0,
+            rules_failed: 0,
+            rules_without_prefilter: 0,
             options,
             source: source.into(),
         }
+    }
+
+    /// Arm the detection engine.
+    pub fn arm(&mut self, engine: Engine, report: &cybersentinel_engine::CompileReport) {
+        self.rules_armed = report.compiled as u64;
+        self.rules_awaiting_support = report.not_evaluable as u64;
+        self.rules_failed = report.failed.len() as u64;
+        self.rules_without_prefilter = report.without_prefilter as u64;
+        self.engine = Some(engine);
     }
 
     /// Decode one captured frame and emit whatever it warrants.
@@ -161,6 +196,7 @@ impl PacketPipeline {
                 destination: (network.destination(), 0),
                 timestamp,
                 frame_len: decoded.frame.len(),
+                payload: decoded.payload_bytes(),
                 tcp: None,
             });
 
@@ -191,6 +227,7 @@ impl PacketPipeline {
                 ),
                 timestamp,
                 frame_len: decoded.frame.len(),
+                payload: decoded.payload_bytes(),
                 tcp: tcp_segment(decoded.transport.as_ref(), decoded.payload_bytes()),
             }),
         )
@@ -260,6 +297,7 @@ impl PacketPipeline {
             // The datagram's own length, not a frame length: it never was one
             // frame.
             frame_len: reassembled.data.len(),
+            payload: decoded.payload_bytes(),
             tcp: tcp_segment(decoded.transport.as_ref(), decoded.payload_bytes()),
         });
     }
@@ -273,15 +311,82 @@ impl PacketPipeline {
         let policy = &self.policy;
         let resolve = |address: IpAddr| policy.for_destination(address);
         let observed = self.flows.observe(packet, &resolve, &mut self.ready);
+        let flow_id = observed.flow_id.get();
 
-        self.consume_ready(observed.flow_id.get());
-        observed.flow_id.get()
+        // Orient the tuple from the flow's initiator, so "to server" means the
+        // same thing to the engine as it does to the flow table.
+        let packet_tuple = summary_tuple(packet);
+        let oriented = if observed.to_server {
+            packet_tuple
+        } else {
+            reverse(packet_tuple)
+        };
+
+        // A datagram protocol has no stream, so its payload is inspected as it
+        // stands. TCP payload reaches detection only through reassembly.
+        if packet.tcp.is_none() && !packet.payload.is_empty() {
+            let payload = packet.payload.to_vec();
+            self.inspect_packet(
+                flow_id,
+                packet_tuple,
+                observed.to_server,
+                &payload,
+                packet.timestamp,
+            );
+        }
+
+        self.consume_ready(flow_id, oriented, packet.timestamp);
+        flow_id
+    }
+
+    fn inspect_packet(
+        &mut self,
+        flow_id: u64,
+        tuple: NetTuple,
+        to_server: bool,
+        payload: &[u8],
+        timestamp: SystemTime,
+    ) {
+        let Some(engine) = &mut self.engine else {
+            return;
+        };
+        self.alerts.clear();
+        engine.inspect_packet(
+            flow_id,
+            tuple,
+            to_server,
+            payload,
+            timestamp,
+            &mut self.alerts,
+        );
+        self.emit_alerts(flow_id, tuple, timestamp);
+    }
+
+    fn emit_alerts(&self, flow_id: u64, tuple: NetTuple, timestamp: SystemTime) {
+        for record in &self.alerts {
+            let body = AlertEvent {
+                action: AlertAction::Alerted,
+                source: AlertSource::Network,
+                sid: record.sid,
+                rev: record.rev,
+                signature: record.signature.clone(),
+                classtype: record.classtype.clone(),
+                severity: record.severity,
+                metadata: record.metadata.clone(),
+            };
+            let event = self
+                .emitter
+                .build_at(to_timestamp(timestamp), Payload::alert(body))
+                .with_flow_id(flow_id)
+                .with_net(tuple);
+            self.emitter.emit_event(event);
+        }
     }
 
     /// Account for — and optionally dump — bytes that reassembly delivered.
     ///
     /// From Phase 3 this is where the detection engine is handed the stream.
-    fn consume_ready(&mut self, flow_id: u64) {
+    fn consume_ready(&mut self, flow_id: u64, oriented: NetTuple, timestamp: SystemTime) {
         if self.ready.is_empty() {
             return;
         }
@@ -291,6 +396,36 @@ impl PacketPipeline {
             dump_stream(directory, flow_id, true, &self.ready.to_server);
             dump_stream(directory, flow_id, false, &self.ready.to_client);
         }
+
+        // Take the delivery so the engine and the emitter can both be borrowed.
+        let to_server = std::mem::take(&mut self.ready.to_server);
+        let to_client = std::mem::take(&mut self.ready.to_client);
+
+        for (bytes, is_to_server) in [(&to_server, true), (&to_client, false)] {
+            if bytes.is_empty() {
+                continue;
+            }
+            let tuple = if is_to_server {
+                oriented
+            } else {
+                reverse(oriented)
+            };
+            if let Some(engine) = &mut self.engine {
+                self.alerts.clear();
+                engine.inspect_stream(
+                    flow_id,
+                    tuple,
+                    is_to_server,
+                    bytes,
+                    timestamp,
+                    &mut self.alerts,
+                );
+                self.emit_alerts(flow_id, tuple, timestamp);
+            }
+        }
+
+        self.ready.to_server = to_server;
+        self.ready.to_client = to_client;
     }
 
     fn emit_anomaly(&self, packet: &RawPacket<'_>, decoded: &Decoded<'_>, flow_id: Option<u64>) {
@@ -363,6 +498,20 @@ impl PacketPipeline {
                 dump_stream(directory, flow_id, false, &ready.to_client);
             }
         }
+
+        // The flows are about to be reported and dropped, so their detection
+        // state goes with them.
+        let ended: Vec<u64> = self
+            .flows
+            .ended_mut()
+            .iter()
+            .map(|ended| ended.flow.id.get())
+            .collect();
+        if let Some(engine) = &mut self.engine {
+            for flow_id in ended {
+                engine.on_flow_end(flow_id);
+            }
+        }
     }
 
     fn emit_flow(&self, ended: &EndedFlow) {
@@ -423,6 +572,15 @@ impl PacketPipeline {
             active_fragment_sets: self.defrag.active_sets() as u64,
             streams,
             stream_bytes_buffered: self.flows.buffered_bytes() as u64,
+            engine: self
+                .engine
+                .as_ref()
+                .map(Engine::counters)
+                .unwrap_or_default(),
+            rules_armed: self.rules_armed,
+            rules_awaiting_support: self.rules_awaiting_support,
+            rules_failed: self.rules_failed,
+            rules_without_prefilter: self.rules_without_prefilter,
             capture_truncated: false,
         };
         if let Ok(mut guard) = slot.lock() {
@@ -430,6 +588,28 @@ impl PacketPipeline {
             *guard = snapshot;
             guard.capture_truncated = truncated;
         }
+    }
+}
+
+/// The 5-tuple a packet summary describes.
+fn summary_tuple(packet: &PacketSummary<'_>) -> NetTuple {
+    NetTuple {
+        src_ip: packet.source.0,
+        src_port: port_or_none(packet.source.1),
+        dest_ip: packet.destination.0,
+        dest_port: port_or_none(packet.destination.1),
+        proto: protocol_from_number(packet.protocol),
+    }
+}
+
+/// The same tuple seen from the other end.
+fn reverse(tuple: NetTuple) -> NetTuple {
+    NetTuple {
+        src_ip: tuple.dest_ip,
+        src_port: tuple.dest_port,
+        dest_ip: tuple.src_ip,
+        dest_port: tuple.src_port,
+        proto: tuple.proto,
     }
 }
 

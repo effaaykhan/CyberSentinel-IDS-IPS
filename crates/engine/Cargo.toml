@@ -5,10 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "CyberSentinel engine stage"
+description = "CyberSentinel detection engine: rule compilation, multi-pattern scan, evaluation"
 
 [lints]
 workspace = true
 
 [dependencies]
+aho-corasick.workspace = true
 cybersentinel-common.workspace = true
+cybersentinel-reassembly.workspace = true
+cybersentinel-rules.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

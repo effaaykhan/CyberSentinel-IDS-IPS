@@ -548,10 +548,36 @@ pub struct ReassemblyStats {
 /// Counters for the detection engine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineStats {
-    /// Whether detection is running. `false` until Phase 3 lands.
+    /// Whether detection is running.
     pub enabled: bool,
+    /// Rules armed and matching.
+    pub rules_armed: u64,
+    /// Rules loaded but awaiting engine support for a keyword.
+    pub rules_awaiting_support: u64,
+    /// Rules that failed to compile. **Not running**, and someone wrote them.
+    pub rules_failed: u64,
+    /// Rules with no usable pre-filter pattern, evaluated on every packet.
+    pub rules_without_prefilter: u64,
+    /// Buffers inspected.
+    pub inspections: u64,
+    /// Bytes inspected.
+    pub bytes_inspected: u64,
+    /// Rules the pre-filter put forward for full evaluation.
+    pub candidates: u64,
+    /// Rules that fully matched.
+    pub matches: u64,
     /// Alerts raised.
     pub alerts: u64,
+    /// Matches suppressed by a `threshold`.
+    pub thresholded: u64,
+    /// Matches that raised no alert because of `flowbits:noalert`.
+    pub silent: u64,
+    /// Flows carrying detection state.
+    pub flow_states: u64,
+    /// Detection states evicted under the cap. **A coverage signal.**
+    pub flow_states_evicted: u64,
+    /// Stream bytes that fell out of an inspection window before matching.
+    pub inspection_bytes_dropped: u64,
 }
 
 #[cfg(test)]

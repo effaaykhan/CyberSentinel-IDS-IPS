@@ -51,7 +51,7 @@ impl Drop for Scratch {
 const RULES: &str = r#"
 # One rule of each outcome, so the load report is non-trivial.
 alert tcp any any -> any any (msg:"E2E header only"; sid:900001;)
-alert http any any -> any any (msg:"E2E with content"; content:"x"; sid:900002;)
+alert http any any -> any any (msg:"E2E awaiting support"; content:"x"; endswith; sid:900002;)
 alert tcp any any -> any any (msg:"E2E missing sid";)
 not a rule at all
 "#;

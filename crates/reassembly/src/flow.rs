@@ -277,6 +277,11 @@ pub struct PacketSummary<'a> {
     pub timestamp: SystemTime,
     /// Whole captured frame length, for flow byte counts.
     pub frame_len: usize,
+    /// The transport payload.
+    ///
+    /// For TCP this is also carried inside `tcp` and reaches detection through
+    /// reassembly; for everything else it is what detection inspects directly.
+    pub payload: &'a [u8],
     /// The TCP segment, for protocols that have one.
     pub tcp: Option<TcpSegment<'a>>,
 }
@@ -706,6 +711,7 @@ mod tests {
                 destination,
                 timestamp,
                 frame_len,
+                payload: b"",
                 tcp,
             },
             &|_| OverlapPolicy::First,
@@ -1267,6 +1273,7 @@ mod tests {
                     destination,
                     timestamp: at(0),
                     frame_len: 74,
+                    payload: b"",
                     tcp: Some(segment),
                 },
                 &|_| OverlapPolicy::First,
@@ -1373,6 +1380,7 @@ mod tests {
                     destination: server,
                     timestamp: at(0),
                     frame_len: 74,
+                    payload: b"",
                     tcp: Some(segment),
                 },
                 &|_| OverlapPolicy::First,
@@ -1437,6 +1445,7 @@ mod tests {
                         destination: server,
                         timestamp: at(0),
                         frame_len: 1_100,
+                        payload: b"",
                         tcp: Some(segment),
                     },
                     &|_| OverlapPolicy::First,

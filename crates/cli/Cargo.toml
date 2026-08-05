@@ -22,6 +22,7 @@ ctrlc.workspace = true
 cybersentinel-capture.workspace = true
 cybersentinel-common.workspace = true
 cybersentinel-decode.workspace = true
+cybersentinel-engine.workspace = true
 cybersentinel-reassembly.workspace = true
 cybersentinel-rules.workspace = true
 cybersentinel-storage.workspace = true

@@ -7,6 +7,7 @@
 
 mod pipeline;
 mod run;
+mod validate;
 
 use clap::{Parser, Subcommand};
 
@@ -30,12 +31,20 @@ struct Cli {
 enum Command {
     /// Run the sensor.
     Run(run::RunArgs),
+
+    /// Load and compile the rules, report on them, and exit.
+    ///
+    /// Exits non-zero if anything is wrong. This is how a CI or pre-deployment
+    /// pipeline gates on bad rules without making the running sensor fragile:
+    /// the sensor loads what it can and reports the rest, while this refuses.
+    ValidateRules(validate::ValidateArgs),
 }
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Run(args) => run::run(&args),
+        Command::ValidateRules(args) => validate::validate(&args),
     };
 
     match result {
@@ -56,6 +65,18 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn validate_rules_requires_a_config() {
+        assert!(Cli::try_parse_from(["cybersentinel", "validate-rules"]).is_err());
+        assert!(Cli::try_parse_from([
+            "cybersentinel",
+            "validate-rules",
+            "--config",
+            "config/config.yaml"
+        ])
+        .is_ok());
     }
 
     #[test]

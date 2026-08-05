@@ -198,6 +198,7 @@ dependencies = [
  "cybersentinel-capture",
  "cybersentinel-common",
  "cybersentinel-decode",
+ "cybersentinel-engine",
  "cybersentinel-reassembly",
  "cybersentinel-rules",
  "cybersentinel-storage",
@@ -263,7 +264,13 @@ dependencies = [
 name = "cybersentinel-engine"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "cybersentinel-common",
+ "cybersentinel-reassembly",
+ "cybersentinel-rules",
+ "regex",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
