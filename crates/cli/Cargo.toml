@@ -19,7 +19,6 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
-caps.workspace = true
 cybersentinel-capture.workspace = true
 cybersentinel-common.workspace = true
 cybersentinel-decode.workspace = true
@@ -31,6 +30,11 @@ cybersentinel-rules.workspace = true
 cybersentinel-storage.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# Naming the one capability host monitoring retains. Linux-only, like the
+# capability model itself.
+[target.'cfg(target_os = "linux")'.dependencies]
+caps.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
