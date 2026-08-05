@@ -442,13 +442,43 @@ pub struct RescanOutcome {
 pub struct Monitor {
     settings: FimSettings,
     baseline: Baseline,
+    /// Whether the baseline still has to be established.
+    ///
+    /// **Snapshotted at construction, before anything else can write.** It used
+    /// to be re-derived from `baseline.is_empty()` at the start of each scan,
+    /// and that was wrong in a way only a live machine showed: the real-time
+    /// watcher is attached before the first scan runs, `/etc` is busy, and a
+    /// single notification handled first inserts a row. The emptiness test then
+    /// answers "not empty", the first scan runs in comparison mode, and every
+    /// file in the tree is reported as `created` — 1651 of them on an ordinary
+    /// host. That is the wall of alerts on first install this whole design says
+    /// must not happen.
+    establishing: bool,
 }
 
 impl Monitor {
     /// Build a monitor over an open baseline.
+    ///
+    /// Whether this is a first run is decided **here**, while nothing else can
+    /// be writing to the store — see [`Monitor::establishing`].
     #[must_use]
     pub fn new(settings: FimSettings, baseline: Baseline) -> Self {
-        Self { settings, baseline }
+        // On the vanishingly unlikely error, assume this is a first run. The
+        // cost is one quiet scan and a comparison delayed to the next one; the
+        // other way round is thousands of fabricated `created` events.
+        let establishing = baseline.is_empty().unwrap_or(true);
+        Self {
+            settings,
+            baseline,
+            establishing,
+        }
+    }
+
+    /// Whether the next scan will establish the baseline rather than compare
+    /// against it.
+    #[must_use]
+    pub fn establishing(&self) -> bool {
+        self.establishing
     }
 
     /// The configuration in force.
@@ -492,7 +522,7 @@ impl Monitor {
         detected_by: FimDetection,
         should_continue: &mut dyn FnMut() -> bool,
     ) -> Result<RescanOutcome, HostError> {
-        let establishing = self.baseline.is_empty()?;
+        let establishing = self.establishing;
         let (paths, limits) = walk(&self.settings.paths, &self.settings);
         let mut outcome = RescanOutcome {
             limits,
@@ -559,6 +589,14 @@ impl Monitor {
             }
         }
 
+        // Only a scan that ran to completion has established anything. An
+        // abandoned one leaves the flag set, so the next scan finishes the job
+        // quietly rather than reporting whatever it did not reach as newly
+        // created.
+        if !outcome.limits.abandoned {
+            self.establishing = false;
+        }
+
         Ok(outcome)
     }
 
@@ -574,6 +612,18 @@ impl Monitor {
             return Ok(None);
         }
         let key = path.to_string_lossy().into_owned();
+
+        if self.establishing {
+            // There is nothing to compare against yet. A notification arriving
+            // now says only "this file exists", which for a file that has been
+            // there for years is not a finding. Record it and stay quiet; the
+            // establishing scan is what sets the starting position.
+            if let Ok(Some(current)) = inspect(path, self.settings.max_file_bytes) {
+                self.baseline.put(&key, &current)?;
+            }
+            return Ok(None);
+        }
+
         let previous = self.baseline.get(&key)?;
 
         match inspect(path, self.settings.max_file_bytes) {
@@ -717,6 +767,79 @@ mod tests {
         );
         assert_eq!(outcome.files_seen, 2);
         assert_eq!(monitor.baseline().len().expect("len"), 2);
+    }
+
+    /// The defect a live machine found and the unit tests did not.
+    ///
+    /// The real-time watcher is attached before the first scan runs, so on a
+    /// busy tree a notification is handled first. That used to insert a row,
+    /// which made the "is the baseline empty?" test answer no, which made the
+    /// establishing scan run in comparison mode — reporting every file in the
+    /// tree as `created`. On an ordinary host's `/etc` that was 1651 alerts on
+    /// first start.
+    #[test]
+    fn a_notification_before_the_first_scan_does_not_turn_it_into_a_wall_of_alerts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..25 {
+            write(&dir.path().join(format!("conf{index}")), "x");
+        }
+
+        let mut monitor = monitor(dir.path());
+        assert!(monitor.establishing(), "an empty baseline is a first run");
+
+        // A watcher notification lands before the scan has had a turn.
+        assert!(
+            monitor
+                .recheck(&dir.path().join("conf0"))
+                .expect("recheck")
+                .is_none(),
+            "with no baseline there is nothing to compare against, so nothing to report"
+        );
+
+        let outcome = monitor.rescan(FimDetection::BaselineRescan).expect("scan");
+        assert!(
+            outcome.events.is_empty(),
+            "the first scan establishes; it reported {} event(s)",
+            outcome.events.len()
+        );
+        assert!(!monitor.establishing(), "and now the baseline exists");
+
+        // From here on, changes are changes.
+        write(&dir.path().join("conf0"), "changed");
+        let outcome = monitor.rescan(FimDetection::BaselineRescan).expect("scan");
+        assert_eq!(outcome.events.len(), 1);
+        assert_eq!(outcome.events[0].change, FileChange::Modified);
+    }
+
+    /// An abandoned first scan must stay a first scan. Otherwise shutdown
+    /// during the initial baseline turns the next start into the wall of alerts
+    /// by another route.
+    #[test]
+    fn an_abandoned_first_scan_leaves_the_baseline_unestablished() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..30 {
+            write(&dir.path().join(format!("conf{index}")), "x");
+        }
+        let mut monitor = monitor(dir.path());
+
+        let mut remaining = 4;
+        let outcome = monitor
+            .rescan_until(FimDetection::BaselineRescan, &mut || {
+                remaining -= 1;
+                remaining > 0
+            })
+            .expect("scan");
+        assert!(outcome.limits.abandoned);
+        assert!(
+            monitor.establishing(),
+            "an abandoned scan established nothing"
+        );
+
+        let outcome = monitor.rescan(FimDetection::BaselineRescan).expect("scan");
+        assert!(
+            outcome.events.is_empty(),
+            "and finishing it is still establishing, not discovery"
+        );
     }
 
     #[test]
