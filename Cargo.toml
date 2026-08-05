@@ -48,9 +48,20 @@ pcap = "2"
 # cleanly as an interactive Ctrl-C does.
 ctrlc = { version = "3", features = ["termination"] }
 gethostname = "1"
+# Real-time file integrity monitoring. inotify on Linux, and the same API over
+# FSEvents / ReadDirectoryChangesW when Phases 5 and 6 land.
+notify = "8"
+# The FIM baseline store. `bundled` compiles SQLite in rather than linking the
+# host's — the sensor ships as a standalone install with no prerequisites, and
+# a missing libsqlite3 must never be the reason integrity monitoring is off.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# File content hashing for the baseline.
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# Test-only: scratch directories for FIM and baseline tests.
+tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["parsing"] }
 tracing = "0.1"
