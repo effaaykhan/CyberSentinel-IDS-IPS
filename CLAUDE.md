@@ -57,7 +57,7 @@ crates/
   common/        event schema, config.yaml loader, decoupled event pipeline, sensor identity
   capture/       PacketSource: pcap replay (live) + libpcap live capture
   decode/        L2–L4 decode, decoder anomalies            (live)
-  reassembly/    flow table (live) · IP defrag + TCP reassembly (Phase 2)
+  reassembly/    flow table, IP defrag, TCP reassembly, normalization (live)
   applayer/      HTTP → DNS → TLS parsers, sticky buffers   (Phase 3, 8)
   rules/         .rules parser + rule model + loader        (parser stub live)
   engine/        rule grouping, aho-corasick MPM, evaluation(Phase 3)
@@ -93,9 +93,9 @@ post-hoc log joining.
 
 **Phase 0 built the ends**: config and rule loading at the front, the event
 schema and output path at the back. **Phase 1 filled in capture, decode, and
-flow tracking**, so packets now flow all the way through to `flow` and `anomaly`
-events. Reassembly (Phase 2) and detection (Phase 3) drop into a pipeline that
-already exists and is already observable.
+flow tracking**. **Phase 2 added defragmentation, stream reassembly, and
+normalization**, so packets now become the byte stream a server would actually
+see. Detection (Phase 3) is the last stage missing.
 
 ### Capture sources
 
@@ -112,6 +112,65 @@ signal on a quiet link.
 **Live capture needs libpcap at runtime** — present by default on Linux and
 macOS, bundled as Npcap on Windows from Phase 5. Replay needs nothing. See
 `crates/capture/README.md`.
+
+### Reassembly, and why it decides whether any of this works
+
+Guide §7 calls Phase 2 the evasion-resistance core, and it is: an attacker who
+can make the sensor and the destination host disagree about what the byte
+stream contains walks past every rule silently, with no error anywhere.
+
+**Overlap policy is configured, never fingerprinted.** When two copies of the
+same bytes arrive *disagreeing*, the sensor picks one — and it must pick what
+the destination host will. Guessing the stack from its packets is itself
+evadable: an attacker who can influence the fingerprint gets to choose the
+policy the sensor uses, which is worse than having none.
+
+```yaml
+reassembly:
+  overlap-policy: first        # first | last — the default
+  host-policies:               # per-DESTINATION overrides, longest prefix wins
+    - network: 10.1.0.0/16     # a bare address means a single host
+      policy: last
+```
+
+`first` matches Linux and most BSDs; `last` matches older Windows stacks. The
+enum is `#[non_exhaustive]`, so OS-family policies can be added without breaking
+anything. Lookups are by **destination**, so the two halves of a connection can
+resolve overlaps differently — they are two different stacks.
+
+**Delivery is gated on acknowledgement.** Reassembled bytes are held until the
+peer ACKs them. That is what makes overlap policy mean anything: a
+contradicting retransmission always arrives before the ACK, so at the moment the
+sensor must choose it still holds both copies. A reassembler that delivered
+bytes as soon as they were contiguous could not implement `last` at all. Where
+no ACK is visible — asymmetric routing, a one-way tap — `delivery-flush-bytes`
+releases the data anyway, so matching does not stall on exactly the networks
+hardest to monitor.
+
+Once delivered, data cannot be revised. A retransmission contradicting
+already-delivered bytes is counted, not applied; there is a test pinning that
+limit so it cannot regress into silence.
+
+**The ambiguities, and which way each is resolved:**
+
+| Case | Behaviour | Why |
+|---|---|---|
+| Data on the SYN | Accepted, counted | TCP Fast Open makes it real traffic |
+| Data past the FIN | Rejected, counted | The host has closed that direction; accepting it lets an attacker write into the sensor's view of a stream the host has stopped reading |
+| Data filling a gap *before* the FIN | Accepted | An ordinary retransmission, not an injection |
+| **Out-of-window RST** | **Ignored**, counted | Honouring a forged reset stops the sensor watching a live connection. Ignoring a real one only costs a flow entry until its timeout — a far cheaper mistake. The window is one un-scaled receive window (64 KiB), not the reassembly buffer |
+| In-window RST | Tears down | What the host will do |
+| Fragment too small to hold the transport header | Reassembled, and flagged | RFC 1858's tiny-fragment attack |
+
+**Normalization runs decode-then-collapse.** `%2e%2e%2f` has to become `../`
+before traversal can be resolved — that ordering *is* the technique. Decoding is
+capped at `decode_rounds` passes, because an input can always be encoded one
+level deeper than any limit; when the cap is hit with escapes still present, the
+result says so. Nothing in normalization can grow its input.
+
+The flags normalization returns — double-encoded, above-root, null byte, invalid
+escape — are **detection signal in their own right** and become matchable rule
+conditions in Phase 3.
 
 ---
 
@@ -144,13 +203,21 @@ malformed, adversarial, and enormous. No panics, no unbounded recursion. Guide
 invariants, not just absence of panics.
 
 ### Bound all state
-Reassembly and flow tracking get per-flow and global caps plus timeouts
-(`cybersentinel-reassembly::Limits`). An attacker must not be able to exhaust
-memory by opening flows or sending fragments that never complete. The flow table
-enforces this today: past `flow.max-flows` it sweeps timeouts, then evicts
-least-recently-seen, and **counts the evictions** — an eviction means the sensor
-stopped following a live conversation, which is a coverage hole, not a memory
-statistic.
+Reassembly and flow tracking get per-flow and global caps plus timeouts. An
+attacker must not be able to exhaust memory by opening flows or sending
+fragments that never complete. Past `flow.max-flows` the table sweeps timeouts,
+then evicts least-recently-seen, and **counts the evictions** — an eviction
+means the sensor stopped following a live conversation, which is a coverage
+hole, not a memory statistic.
+
+**Bound the bookkeeping, not just the bytes.** A flood of one-byte writes at
+alternating offsets holds few bytes but an unbounded number of gap descriptors,
+which is the same denial of service wearing a different hat. `RangeBuffer` caps
+both, and the caps have tests that drive floods at them.
+
+**Two ceilings, always.** An attacker can exhaust either a few flows each
+holding a lot or many flows each holding a little, so there is a per-flow cap
+*and* a global one.
 
 ### Bound the events one packet can cause
 A packet produces at most one `anomaly` event however many things are wrong with
@@ -364,6 +431,12 @@ Recorded so they can be revisited deliberately.
 | A non-initial IP fragment gets no transport header | Its bytes are payload; reading ports out of them attributes the packet to a port nobody used | Never |
 | Flow ids from FNV-1a, not `DefaultHasher` | `DefaultHasher` is randomly seeded per process, so replaying one capture twice would produce incomparable events | Never |
 | One `anomaly` event per packet, not per anomaly | Bounds the events an attacker can cause per packet | Never |
+| **Overlap policy configured, not fingerprinted** | A fingerprint an attacker can influence lets them choose the sensor's policy | Never |
+| **Delivery gated on the peer's ACK** | It is the only way `last` policy can be implemented at all; the choice must still be open when it is made | If a phase needs lower matching latency than an RTT — then the trade has to be made explicitly |
+| Reassembled content is never an event | It is bulk payload and PII; alert-triggered evidence capture is a different, later thing | Never |
+| `--dump-streams` exists but is off by default | The end-to-end evasion properties have to be assertable somehow, and it is a debugging aid an operator opts into | Never make it a default |
+| Normalization decodes before collapsing | `%2e%2e%2f` must become `../` before traversal resolves; a server rejecting encoded slashes would not serve the request anyway, so the cost is a false positive not a false negative | Never |
+| RST accepted only within 64 KiB of what we have seen | Sizing the window off the reassembly buffer would give a blind attacker a target thousands of times larger | Never |
 | `tracing` + `tracing-subscriber` for diagnostics | Ecosystem standard, structured fields, level filtering | — |
 | `ctrlc` with `termination` | SIGTERM from systemd/launchd must shut down as cleanly as Ctrl-C | — |
 | **`serde_yaml` (0.9)** | The guide names it | **Open — see below** |
@@ -390,7 +463,14 @@ Recorded so they can be revisited deliberately.
    the obvious shape, but flow-table sharing across them needs thought.
 7. **Link types.** Only Ethernet is decoded. `LINUX_SLL` (113) — what capturing
    on the `any` device produces — is the likely next one.
-8. **Privilege dropping is per-thread on Linux.** The sensor opens the capture
+8. **`%uXXXX` escapes are not decoded.** IIS accepted them, and they are a real
+   evasion vector. Implementing it needs careful UTF-16 handling and a decision
+   about which targets do it, so it is deliberately absent rather than
+   half-present. Phase 3 or 8.
+9. **Normalization options are not yet in `config.yaml`.** `NormalizeOptions`
+   has code defaults; exposing `decode-rounds` and `backslash-is-separator` per
+   target belongs with the HTTP parser that actually calls them (Phase 3).
+10. **Privilege dropping is per-thread on Linux.** The sensor opens the capture
    handle and drops capabilities while still single-threaded, so every thread
    spawned afterwards inherits the dropped set. That ordering is load-bearing:
    `run()` opens capture *before* building the event pipeline for exactly this
@@ -423,10 +503,14 @@ dropping after the handle is open · decoder and pcap-reader fuzz targets.
 **Done when:** replaying a pcap yields correct flow metadata and anomaly events
 for malformed packets, and the decoder fuzz target runs clean.
 
-### Phase 2 — Reassembly + normalization
-IP defragmentation · TCP stream reassembly with bounded state, timeouts, and a
-target-based overlap policy · HTTP normalization. The evasion-resistance core.
-Builds on the Phase 1 flow table, which already keys and bounds the state.
+### Phase 2 — Reassembly + normalization ✅
+IP defragmentation with a bounded, timed-out fragment table · TCP stream
+reassembly keyed on the flow table, with ACK-gated delivery · target-based
+overlap policy at both levels, from config with per-host overrides ·
+normalization primitives (percent-decode, double-decode, path collapse) ·
+`reassembler` and `normalization` fuzz targets · an adversarial pcap fixture
+covering split, out-of-order, contradicting-overlap, past-FIN, forged-RST, and
+tiny-fragment cases.
 
 **Done when:** an attack string split across segments or fragments reassembles
 correctly · overlapping-segment and encoded-URI cases resolve correctly · the
@@ -435,7 +519,9 @@ reassembler fuzz target runs clean · state is provably bounded.
 ### Phase 3 — Native rule engine → **NIDS milestone**
 Full `.rules` parsing of the §6 subset · rule grouping by header ·
 `aho-corasick` MPM on `fast_pattern` · full evaluation · HTTP app-layer parser
-feeding sticky buffers · verdict → `alert` event.
+locating the URI and feeding sticky buffers through the Phase 2 normalization
+primitives · verdict → `alert` event. The engine consumes the reassembled
+stream that `StreamReady` already delivers.
 
 **Done when:** a known signature in replayed traffic produces a correct alert ·
 the loader reports supported vs. skipped · the rule-parser fuzz target runs
@@ -492,8 +578,15 @@ cargo run -p cybersentinel -- run --config config/config.yaml \
 sudo apt-get install libpcap-dev
 python3 tests/fixtures/pcap/generate.py       # regenerate the pcap fixtures
 
-# Fuzzing — from inside fuzz/, whose rust-toolchain.toml selects nightly
-cd fuzz && cargo fuzz run rule_parser -- -max_total_time=60
+# Analyse the adversarial capture, dumping what reassembly produced.
+# --dump-streams writes captured payload to disk; it is off by default.
+cargo run -p cybersentinel -- run --config config/config.yaml \
+    --replay tests/fixtures/pcap/evasion.pcap --dump-streams /tmp/streams
+
+# Fuzzing — run from INSIDE fuzz/, whose rust-toolchain.toml selects nightly.
+# `cargo fuzz` resolves the toolchain from the working directory, so running it
+# from the repo root picks up the root pin (stable) and fails.
+cd fuzz && cargo fuzz run reassembler -- -max_total_time=60
 ```
 
 **Write the test first where practical.** The decoupled-pipeline test

@@ -143,6 +143,73 @@ jobs:
 
           echo "replay OK: $flows flows, $anomalies anomalies"
 
+      # The Phase 2 acceptance criteria, end to end: the same capture must
+      # produce different reassembled streams under the two overlap policies,
+      # and the injection and teardown tricks in it must not work.
+      - name: Smoke test — the evasion fixture under both overlap policies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_policy() {
+            local policy="$1" outdir="$2"
+            rm -rf "$outdir" evasion-state
+            mkdir -p "$outdir"
+            cat > evasion.yaml <<YAML
+          paths:
+            data-dir: evasion-state
+            log-dir: evasion-state
+          rules:
+            files: []
+          outputs:
+            stdout:
+              enabled: true
+            file:
+              enabled: false
+          logging:
+            level: warn
+          reassembly:
+            overlap-policy: ${policy}
+          YAML
+            cargo run --quiet -p cybersentinel -- run \
+              --config evasion.yaml \
+              --replay tests/fixtures/pcap/evasion.pcap \
+              --dump-streams "$outdir" > "evasion-${policy}.json"
+            cat "$outdir"/*-to-server.bin > "streams-${policy}.txt"
+          }
+
+          run_policy first first-streams
+          run_policy last  last-streams
+
+          echo "--- reassembled streams (first) ---"; cat streams-first.txt; echo
+          echo "--- reassembled streams (last) ---";  cat streams-last.txt;  echo
+
+          # Split across TCP segments, and across IP fragments, both reassemble.
+          grep -q 'ATTACK-PAYLOAD-MARKER' streams-first.txt \
+            || { echo "the segmented marker did not reassemble"; exit 1; }
+          grep -q 'FRAGMENTED-ATTACK-MARKER' streams-first.txt \
+            || { echo "the fragmented marker did not reassemble"; exit 1; }
+
+          # Contradicting overlaps resolve differently under the two policies.
+          grep -q 'XXXXXXXX-TAIL' streams-first.txt \
+            || { echo "first-wins did not keep the original bytes"; exit 1; }
+          grep -q 'ATTACKED-TAIL' streams-last.txt \
+            || { echo "last-wins did not take the newer bytes"; exit 1; }
+          if grep -q 'ATTACKED' streams-first.txt; then
+            echo "the contradicting copy leaked under first-wins"; exit 1
+          fi
+
+          # Injection and teardown tricks must not work.
+          if grep -q 'EVIL' streams-first.txt; then
+            echo "data past the FIN entered the stream"; exit 1
+          fi
+          grep -q 'BEFORE-AFTER-RESET' streams-first.txt \
+            || { echo "a forged reset stopped the sensor watching"; exit 1; }
+          grep -q '"resets_ignored":1' evasion-first.json \
+            || { echo "the ignored reset is missing from stats"; exit 1; }
+
+          echo "evasion suite OK"
+
       - name: Verify --version
         run: cargo run --quiet -p cybersentinel -- --version
 
@@ -265,6 +332,8 @@ jobs:
           cargo fuzz run rule_file   -- -max_total_time=60 -print_final_stats=1
           cargo fuzz run decoder     -- -max_total_time=90 -print_final_stats=1
           cargo fuzz run pcap_reader -- -max_total_time=90 -print_final_stats=1
+          cargo fuzz run reassembler   -- -max_total_time=150 -print_final_stats=1
+          cargo fuzz run normalization -- -max_total_time=90 -print_final_stats=1
 
       - name: Upload any crash artifacts
         if: failure()

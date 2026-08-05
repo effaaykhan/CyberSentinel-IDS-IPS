@@ -22,11 +22,11 @@ The design document it implements:
 
 ---
 
-## Status: Phase 1 complete
+## Status: Phase 2 complete
 
-Capture and decode. The sensor now sees traffic, decodes it, tracks flows, and
-reports what it could not parse — but **it does not detect anything yet**:
-stream reassembly lands in Phase 2 and the rule engine in Phase 3.
+The sensor now reconstructs the byte stream a server would actually see —
+defragmenting, reassembling, and normalizing — but **it does not detect anything
+yet**: the rule engine lands in Phase 3.
 
 What works today:
 
@@ -36,16 +36,20 @@ What works today:
   headers, TCP, UDP, ICMP — to a 5-tuple and a zero-copy payload range;
 * **decoder anomalies** as first-class events: malformed packets are detection
   signal, not parse failures to swallow;
-* **flow tracking** with a hard cap and idle timeout, emitting `flow` events
-  with per-direction packet and byte counts;
-* **real counters** — kernel and interface drops, decode classification, flow
-  evictions — in every `stats` event;
+* **IP defragmentation and TCP stream reassembly**, with a **target-based
+  overlap policy** so the sensor resolves contradictory data the way the
+  destination host will — and counts the times they disagreed;
+* **normalization primitives** — percent-decoding, double-decoding, path
+  collapse — so `/foo/../etc/passwd` and `%252e%252e%252fetc/passwd` are the
+  same request;
+* **flow tracking** with hard caps and idle timeouts, emitting `flow` events;
+* **real counters** — kernel drops, decode classification, flow evictions,
+  reassembly conflicts, ignored resets — in every `stats` event;
 * the `config.yaml` loader and the `.rules` parser (headers and metadata in
   full; match conditions recognised but not yet evaluated);
-* the decoupled event pipeline, with a test proving a blocked sink cannot stall
-  event production;
-* matrix CI on Linux, Windows, and macOS that replays the fixtures, fuzzes every
-  parser, and builds, installs, and runs a Linux `.deb`.
+* matrix CI on Linux, Windows, and macOS that replays the fixtures, runs the
+  evasion suite under both overlap policies, fuzzes every parser, and builds,
+  installs, and runs a Linux `.deb`.
 
 ---
 
@@ -78,6 +82,39 @@ cargo run -p cybersentinel -- run --config config/config.yaml \
  "anomaly":{"anomalies":[{"layer":"ipv4","kind":"length_mismatch"}],
             "interface":"…/malformed.pcap","captured_len":61,"packet_len":61}}
 ```
+
+## Evasion resistance
+
+An attacker who can make the sensor and the destination host disagree about what
+was sent walks past every rule — silently. So overlapping data that
+**contradicts** itself is resolved the way the *destination* will resolve it,
+and that is configured rather than guessed:
+
+```yaml
+reassembly:
+  overlap-policy: first        # first (Linux, BSD) | last (older Windows)
+  host-policies:               # per-destination overrides, longest prefix wins
+    - network: 10.1.0.0/16
+      policy: last
+```
+
+The same capture, read two ways:
+
+```sh
+cargo run -p cybersentinel -- run --config config/config.yaml \
+    --replay tests/fixtures/pcap/evasion.pcap --dump-streams /tmp/streams
+```
+
+| Policy | What the reassembled stream says |
+|---|---|
+| `first` | `XXXXXXXX-TAIL` |
+| `last` | `ATTACKED-TAIL` |
+
+Those are the same bytes on the wire. Which one the server acts on depends on
+its TCP stack, which is why the sensor has to be told.
+
+`--dump-streams` writes reassembled payload to disk and is **off by default** —
+it is a debugging aid, and reassembled traffic is personal data.
 
 Or start it as a sensor:
 
