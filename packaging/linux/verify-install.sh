@@ -66,6 +66,9 @@ check_service() {
 # anything less means FIM cannot read what it was installed to read.
 CAP_DAC_READ_SEARCH_MASK=4
 
+# How long to wait for the first FIM baseline to reach /etc/shadow.
+BASELINE_WAIT_SECS=300
+
 check_capabilities() {
     printf '\n2. steady-state capabilities\n'
     PID=$(systemctl show -p MainPID --value "$UNIT")
@@ -97,6 +100,23 @@ check_capabilities() {
 # The whole point of dropping CAP_NET_RAW *after* opening the handle is that
 # capture keeps working without it. Proving the drop without proving capture
 # would be proving the sensor is safely useless.
+# How long to wait for a stats event carrying capture counters. Comfortably
+# more than the default `stats.interval-secs` of 60.
+CAPTURE_WAIT_SECS=90
+
+# Put something on the wire the sensor is watching. Pinging loopback while the
+# sensor captures on eth0 proves nothing and would fail a working install.
+generate_traffic() {
+    case "$IFACE" in
+        lo|"") ping -c 4 -i 0.2 127.0.0.1 >/dev/null 2>&1 || true ;;
+        *)     ping -c 4 -i 0.2 -I "$IFACE" 8.8.8.8 >/dev/null 2>&1 ||
+               ping -c 4 -i 0.2 -I "$IFACE" 1.1.1.1 >/dev/null 2>&1 ||
+               # No route out. Broadcast ARP on the segment instead: it needs
+               # no reachable host, and the sensor sees it either way.
+               arping -c 3 -I "$IFACE" -b 255.255.255.255 >/dev/null 2>&1 || true ;;
+    esac
+}
+
 check_capture() {
     printf '\n3. live capture\n'
 
@@ -119,20 +139,31 @@ check_capture() {
     IFACE=$(grep -o '"capture":{[^}]*}' "$EVENTS" | tail -1 |
             grep -o '"source":"[^"]*"' | cut -d'"' -f4)
     info "capturing on ${IFACE:-unknown}"
-    case "$IFACE" in
-        lo|"") ping -c 4 -i 0.2 127.0.0.1 >/dev/null 2>&1 || true ;;
-        *)     ping -c 4 -i 0.2 -I "$IFACE" 8.8.8.8 >/dev/null 2>&1 ||
-               ping -c 4 -i 0.2 -I "$IFACE" 1.1.1.1 >/dev/null 2>&1 ||
-               # No route out. Broadcast ARP on the segment instead: it needs
-               # no reachable host and the sensor sees it either way.
-               arping -c 3 -I "$IFACE" -b 255.255.255.255 >/dev/null 2>&1 || true ;;
-    esac
+    generate_traffic
     BEFORE=$(wc -c < "$EVENTS")
-    sleep 8
 
-    SEEN=$(grep -o '"capture":{[^}]*}' "$EVENTS" | tail -1 |
-           grep -o '"packets":[0-9]*' | cut -d: -f2)
-    [ -n "${SEEN:-}" ] || fail "no capture counters in $EVENTS"
+    # Wait for a *fresh* stats event rather than sleeping a fixed interval.
+    # Capture counters only reach the event log when one is emitted, and
+    # `stats.interval-secs` defaults to 60 — so a fixed sleep reads the startup
+    # event, sees zero packets, and fails a perfectly healthy sensor. A check
+    # that cries wolf gets ignored, which is the same end state as no check.
+    STATS_BEFORE=$(grep -c '"event_type":"stats"' "$EVENTS" || true)
+    DEADLINE=$(( $(date +%s) + CAPTURE_WAIT_SECS ))
+    SEEN=""
+    while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+        NOW_COUNT=$(grep -c '"event_type":"stats"' "$EVENTS" || true)
+        if [ "$NOW_COUNT" -gt "$STATS_BEFORE" ]; then
+            SEEN=$(grep -o '"capture":{[^}]*}' "$EVENTS" | tail -1 |
+                   grep -o '"packets":[0-9]*' | cut -d: -f2)
+            [ "${SEEN:-0}" -gt 0 ] && break
+            # A fresh event reporting zero: keep the link busy and try again,
+            # in case the ping landed between two stats windows.
+            generate_traffic
+        fi
+        sleep 2
+    done
+
+    [ -n "${SEEN:-}" ] || fail "no fresh capture counters within ${CAPTURE_WAIT_SECS}s (is the sensor emitting stats?)"
     [ "$SEEN" -gt 0 ] || fail "capture is enabled but no packets were seen: the handle was opened, then broken"
     pass "capture is live: $SEEN packet(s) seen"
 
@@ -156,10 +187,22 @@ check_shadow() {
         info "/etc is not in hids.fim.paths — skipping"
         return 0
     fi
-    [ -f "$BASELINE" ] || fail "no FIM baseline at $BASELINE (has the first scan run?)"
+    # The first baseline hashes every watched file, which on a default install
+    # is /etc plus four binary directories — tens of thousands of files. Wait
+    # for it, bounded, rather than failing a sensor that is simply still
+    # working: same reasoning as the capture check.
+    DEADLINE=$(( $(date +%s) + BASELINE_WAIT_SECS ))
+    ROW=""
+    while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+        if [ -f "$BASELINE" ]; then
+            ROW=$(sqlite_query "SELECT hash FROM baseline WHERE path = '/etc/shadow';")
+            [ -n "$ROW" ] && break
+        fi
+        sleep 3
+    done
 
-    ROW=$(sqlite_query "SELECT hash FROM baseline WHERE path = '/etc/shadow';")
-    [ -n "$ROW" ] || fail "/etc/shadow is not in the baseline: FIM cannot see the file most worth watching"
+    [ -f "$BASELINE" ] || fail "no FIM baseline at $BASELINE after ${BASELINE_WAIT_SECS}s"
+    [ -n "$ROW" ] || fail "/etc/shadow is not in the baseline after ${BASELINE_WAIT_SECS}s: FIM cannot see the file most worth watching"
     pass "/etc/shadow is tracked"
 
     case "$ROW" in

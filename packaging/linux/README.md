@@ -119,7 +119,21 @@ service:
 4. `/etc/shadow` is hashed into the FIM baseline — the thing
    `CAP_DAC_READ_SEARCH` was retained for.
 
-It exits non-zero on the first failure, so it can gate a deployment.
+It exits non-zero on the first failure, so it can gate a deployment. It also
+waits — bounded — for a fresh stats event and for the first baseline scan,
+rather than sleeping a fixed interval: a check that fails on a healthy sensor
+gets ignored, which ends in the same place as no check at all.
+
+### What it catches, demonstrated
+
+Removing `CAP_DAC_READ_SEARCH` from the unit while leaving capture working is
+the subtle failure, and it is worth seeing what it actually looks like. The
+sensor starts. Capture runs. The baseline fills up. `/etc/shadow` is *in* it —
+with `hash = NULL`, tracked by metadata alone, so a same-length edit to it
+would be missed entirely and nothing would appear wrong.
+
+That is the whole argument for the capability in one row of a table, and it is
+why the check tests for a hash rather than for the file's presence.
 
 ## Service design
 
