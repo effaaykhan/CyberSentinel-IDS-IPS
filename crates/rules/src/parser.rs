@@ -17,8 +17,9 @@ use crate::model::{
     Rule, RuleHeader,
 };
 use crate::options::{
-    Buffer, ByteJump, ByteTest, ContentMatch, DsizeMatch, Endian, FlowBitsOp, FlowMatch,
-    NormalizationCondition, NumericOp, PcreMatch, RuleOption, Threshold, ThresholdKind, Track,
+    Buffer, ByteJump, ByteTest, ContentMatch, DsizeMatch, Endian, FlowBitsOp, FlowMatch, HostField,
+    HostFieldMatch, HostMatcher, NormalizationCondition, NumericOp, PcreMatch, RuleOption,
+    Threshold, ThresholdKind, Track,
 };
 
 /// Option keywords this format defines but this build cannot yet evaluate.
@@ -34,12 +35,6 @@ pub const RECOGNISED_UNIMPLEMENTED_OPTIONS: &[&str] = &[
     "detection_filter",
     // Annotations with no effect on matching (Phase 8)
     "target",
-    // Host-rule keywords (Phase 4)
-    "file.path",
-    "file.change",
-    "auth.outcome",
-    "auth.user",
-    "process.name",
 ];
 
 /// Why a rule could not be parsed.
@@ -629,6 +624,43 @@ fn build_rule(header: RuleHeader, options: Vec<RawOption>, raw: &str) -> Result<
                 );
             }
 
+            // --- host events ----------------------------------------------
+            keyword if HostField::from_keyword(keyword).is_some() => {
+                let field = HostField::from_keyword(keyword)
+                    .ok_or_else(|| invalid(&name, "unknown host field"))?;
+                let values = parse_host_values(&require_value(&name, value)?)
+                    .map_err(|reason| invalid(&name, &reason))?;
+                matches.push(RuleOption::Host(HostFieldMatch {
+                    field,
+                    matcher: HostMatcher::AnyOf {
+                        values,
+                        kind: field.default_match_kind(),
+                        nocase: false,
+                    },
+                    negated,
+                }));
+            }
+            keyword
+                if keyword
+                    .strip_suffix(".pcre")
+                    .and_then(HostField::from_keyword)
+                    .is_some() =>
+            {
+                let field = keyword
+                    .strip_suffix(".pcre")
+                    .and_then(HostField::from_keyword)
+                    .ok_or_else(|| invalid(&name, "unknown host field"))?;
+                let expression = require_value(&name, value)?;
+                if expression.trim().is_empty() {
+                    return Err(invalid(&name, "empty expression"));
+                }
+                matches.push(RuleOption::Host(HostFieldMatch {
+                    field,
+                    matcher: HostMatcher::Regex(expression),
+                    negated,
+                }));
+            }
+
             // --- recognised, not yet implemented ---------------------------
             other if RECOGNISED_UNIMPLEMENTED_OPTIONS.contains(&other) => {
                 if seen_unsupported.insert(other.to_string()) {
@@ -656,6 +688,22 @@ fn build_rule(header: RuleHeader, options: Vec<RawOption>, raw: &str) -> Result<
         raw: raw.to_string(),
         origin: None,
     })
+}
+
+/// Split a host keyword's comma-separated alternatives.
+///
+/// Whitespace around each is trimmed and empties dropped, so
+/// `file.path:"/etc/passwd, /etc/shadow"` reads the way it looks.
+fn parse_host_values(text: &str) -> Result<Vec<String>, String> {
+    let values: Vec<String> = text
+        .split(',')
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if values.is_empty() {
+        return Err("needs at least one value".to_string());
+    }
+    Ok(values)
 }
 
 fn invalid(option: &str, reason: &str) -> ParseError {

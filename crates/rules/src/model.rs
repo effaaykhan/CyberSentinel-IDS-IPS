@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::options::{Buffer, RuleOption, Threshold};
+use crate::options::{Buffer, HostEventKind, RuleOption, Threshold};
 
 /// What a rule does when it matches.
 ///
@@ -283,6 +283,31 @@ impl Rule {
         buffers.sort_unstable();
         buffers.dedup();
         buffers
+    }
+
+    /// The host event kind this rule matches, if it is a host rule.
+    ///
+    /// `None` means it is a network rule. A rule naming fields from two
+    /// different kinds could never match a single record, so that is an error
+    /// the loader reports rather than an armed rule that never fires.
+    ///
+    /// # Errors
+    /// The two kinds that conflicted.
+    pub fn host_event_kind(&self) -> Result<Option<HostEventKind>, (HostEventKind, HostEventKind)> {
+        let mut found: Option<HostEventKind> = None;
+        for kind in self.options.iter().filter_map(RuleOption::host_event_kind) {
+            match found {
+                Some(existing) if existing != kind => return Err((existing, kind)),
+                _ => found = Some(kind),
+            }
+        }
+        Ok(found)
+    }
+
+    /// Whether this rule matches host events rather than network traffic.
+    #[must_use]
+    pub fn is_host_rule_by_options(&self) -> bool {
+        self.options.iter().any(|o| o.host_event_kind().is_some())
     }
 
     /// Whether matching this rule needs the HTTP parser.

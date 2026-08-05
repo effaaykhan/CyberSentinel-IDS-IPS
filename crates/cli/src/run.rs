@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use cybersentinel_capture::{Captured, PacketSource, PcapReplay};
 use cybersentinel_common::config::Config;
 use cybersentinel_common::event::{
-    CaptureStats, DecodeStats, EngineStats, EventStats, FlowStats, Payload, ReassemblyStats,
-    RuleStats, StatsEvent,
+    CaptureStats, CorrelationStats, DecodeStats, EngineStats, EventStats, FlowStats, HidsStats,
+    Payload, ReassemblyStats, RuleStats, StatsEvent,
 };
 use cybersentinel_common::eventlog::{EventEmitter, EventPipeline, EventSink};
 use cybersentinel_common::sensor;
@@ -627,6 +627,8 @@ fn emit_stats(
             stream_dropped_incomplete: pipeline.streams.dropped_incomplete,
             resets_ignored: pipeline.flows.resets_ignored,
         },
+        hids: HidsStats::default(),
+        correlation: CorrelationStats::default(),
         engine: EngineStats {
             enabled: capturing && pipeline.rules_armed > 0,
             rules_armed: pipeline.rules_armed,

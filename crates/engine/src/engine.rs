@@ -17,10 +17,11 @@ use std::time::{Duration, SystemTime};
 use cybersentinel_applayer::HttpParser;
 use cybersentinel_common::event::NetTuple;
 use cybersentinel_reassembly::normalize::NormalizeOptions;
-use cybersentinel_rules::{Buffer, Rule, ThresholdKind, Track};
+use cybersentinel_rules::{Buffer, HostEventKind, Rule, ThresholdKind, Track};
 
 use crate::compile::{CompileLimits, CompileReport, CompiledRuleset};
 use crate::eval::{evaluate, Buffers, FlowBits, MatchInput};
+use crate::host::{evaluate_host, HostObservation, HostRuleset};
 use crate::vars::VarTable;
 
 /// Engine limits.
@@ -175,6 +176,10 @@ pub struct Engine {
     counters: EngineCounters,
     /// Longest pattern in the ruleset, for the re-scan overlap.
     longest_pattern: usize,
+    /// Host rules, matched directly rather than through the packet pre-filter.
+    host_rules: HostRuleset,
+    /// Flowbits for host rules. One set, because there is one host.
+    host_bits: FlowBits,
 }
 
 impl Engine {
@@ -185,7 +190,16 @@ impl Engine {
         vars: &VarTable,
         limits: EngineLimits,
     ) -> (Self, CompileReport) {
-        let (ruleset, report) = CompiledRuleset::compile(rules, vars, limits.compile);
+        // Host and network rules are compiled by different machinery: one wants
+        // a header and a multi-pattern scan, the other named fields. Splitting
+        // them here keeps each compiler honest about what it can evaluate.
+        let (host_rules_input, network_rules): (Vec<&Rule>, Vec<&Rule>) = rules
+            .into_iter()
+            .partition(|rule| rule.is_host_rule_by_options());
+
+        let (ruleset, mut report) = CompiledRuleset::compile(network_rules, vars, limits.compile);
+        let (host_rules, host_report) = HostRuleset::compile(host_rules_input, limits.compile);
+        report.merge(host_report);
         let longest_pattern = ruleset
             .rules()
             .iter()
@@ -205,9 +219,99 @@ impl Engine {
                 thresholds: HashMap::new(),
                 counters: EngineCounters::default(),
                 longest_pattern,
+                host_rules,
+                host_bits: FlowBits::default(),
             },
             report,
         )
+    }
+
+    /// The compiled host rules.
+    #[must_use]
+    pub fn host_rules(&self) -> &HostRuleset {
+        &self.host_rules
+    }
+
+    /// Match a host event against the armed host rules.
+    ///
+    /// Candidates are selected by event kind — the only narrowing records with
+    /// a handful of short named fields need.
+    pub fn inspect_host(
+        &mut self,
+        observation: &HostObservation<'_>,
+        timestamp: SystemTime,
+        alerts: &mut Vec<AlertRecord>,
+    ) {
+        let kind: HostEventKind = observation.kind();
+        let candidates = self.host_rules.candidates(kind).to_vec();
+        if candidates.is_empty() {
+            return;
+        }
+        self.counters.inspections += 1;
+
+        let bits = self.host_bits.clone();
+        let mut pending = Vec::new();
+
+        for index in candidates {
+            let Some(rule) = self.host_rules.rule(index) else {
+                continue;
+            };
+            let Some(outcome) = evaluate_host(rule, observation, &bits) else {
+                continue;
+            };
+            let sid = rule.sid;
+            let threshold = rule.threshold;
+            let no_alert = rule.no_alert;
+            let record = AlertRecord {
+                sid: rule.sid,
+                rev: rule.rev,
+                signature: rule.msg.clone(),
+                classtype: rule.classtype.clone(),
+                severity: rule.severity,
+                metadata: rule.metadata.clone(),
+            };
+
+            self.counters.matches += 1;
+            pending.extend(outcome.side_effects);
+
+            if no_alert {
+                self.counters.silent += 1;
+                continue;
+            }
+            if !self.host_threshold_allows(sid, threshold, &observation.subject(), timestamp) {
+                self.counters.thresholded += 1;
+                continue;
+            }
+            self.counters.alerts += 1;
+            alerts.push(record);
+        }
+
+        let limit = self.limits.max_flowbits_per_flow;
+        for op in &pending {
+            self.host_bits.apply(op, limit);
+        }
+    }
+
+    /// Whether a host rule's threshold lets this match alert.
+    ///
+    /// `by_src` counts against whoever did it — the address an attempt came
+    /// from, the file that changed, the process that ran — because a burst from
+    /// one source and from a thousand are different events.
+    fn host_threshold_allows(
+        &mut self,
+        sid: u32,
+        threshold: Option<cybersentinel_rules::Threshold>,
+        subject: &str,
+        now: SystemTime,
+    ) -> bool {
+        let Some(threshold) = threshold else {
+            return true;
+        };
+        let key = match threshold.track {
+            Track::BySource => subject.to_string(),
+            Track::ByDestination | Track::ByRule => String::new(),
+        };
+        self.count_against_threshold(sid, threshold, key, now)
     }
 
     /// The compiled ruleset.
@@ -499,9 +603,24 @@ impl Engine {
             Track::ByRule => String::new(),
         };
 
-        // Bounded: the key can be an address, and addresses are chosen by
-        // whoever is sending. A full table drops the counter rather than the
-        // alert — alerting too often is a lesser failure than not at all.
+        self.count_against_threshold(sid, threshold, key, now)
+    }
+
+    /// Apply one event to a threshold counter and say whether it alerts.
+    ///
+    /// Shared by the packet and host paths: the counting is identical, only the
+    /// key differs.
+    fn count_against_threshold(
+        &mut self,
+        sid: u32,
+        threshold: cybersentinel_rules::Threshold,
+        key: String,
+        now: SystemTime,
+    ) -> bool {
+        // Bounded: the key can be an address or a path, and both are chosen by
+        // whoever is generating the events. A full table drops the counter
+        // rather than the alert — alerting too often is a lesser failure than
+        // not alerting at all.
         if self.thresholds.len() >= self.limits.max_threshold_entries
             && !self.thresholds.contains_key(&(sid, key.clone()))
         {

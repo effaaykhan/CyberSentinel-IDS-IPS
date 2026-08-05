@@ -58,6 +58,7 @@ pub use model::{
 };
 pub use options::{
     Buffer, ByteJump, ByteTest, ContentMatch, DsizeMatch, Endian, FlowBitsOp, FlowMatch,
-    NormalizationCondition, NumericOp, PcreMatch, RuleOption, Threshold, ThresholdKind, Track,
+    HostEventKind, HostField, HostFieldMatch, HostMatchKind, HostMatcher, NormalizationCondition,
+    NumericOp, PcreMatch, RuleOption, Threshold, ThresholdKind, Track,
 };
 pub use parser::{parse_rule, ParseError};

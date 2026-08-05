@@ -78,6 +78,14 @@ pub enum EventKind {
     Anomaly,
     /// A flow ended.
     Flow,
+    /// A watched file changed.
+    Fim,
+    /// An authentication attempt was observed.
+    Auth,
+    /// A process started, exited, or began listening.
+    Process,
+    /// Several events on one host were judged to be one incident.
+    Incident,
     /// Periodic sensor health and counters.
     Stats,
 }
@@ -90,6 +98,10 @@ impl EventKind {
             Self::Alert => "alert",
             Self::Anomaly => "anomaly",
             Self::Flow => "flow",
+            Self::Fim => "fim",
+            Self::Auth => "auth",
+            Self::Process => "process",
+            Self::Incident => "incident",
             Self::Stats => "stats",
         }
     }
@@ -108,6 +120,14 @@ pub enum Payload {
     Anomaly(Box<AnomalyEvent>),
     /// A flow ended. See [`FlowEvent`].
     Flow(Box<FlowEvent>),
+    /// A watched file changed. See [`FimEvent`].
+    Fim(Box<FimEvent>),
+    /// An authentication attempt. See [`AuthEvent`].
+    Auth(Box<AuthEvent>),
+    /// A process event. See [`ProcessEvent`].
+    Process(Box<ProcessEvent>),
+    /// Correlated events. See [`IncidentEvent`].
+    Incident(Box<IncidentEvent>),
     /// Periodic counters. See [`StatsEvent`].
     Stats(Box<StatsEvent>),
 }
@@ -120,6 +140,10 @@ impl Payload {
             Self::Alert(_) => EventKind::Alert,
             Self::Anomaly(_) => EventKind::Anomaly,
             Self::Flow(_) => EventKind::Flow,
+            Self::Fim(_) => EventKind::Fim,
+            Self::Auth(_) => EventKind::Auth,
+            Self::Process(_) => EventKind::Process,
+            Self::Incident(_) => EventKind::Incident,
             Self::Stats(_) => EventKind::Stats,
         }
     }
@@ -146,6 +170,30 @@ impl Payload {
     #[must_use]
     pub fn flow(flow: FlowEvent) -> Self {
         Self::Flow(Box::new(flow))
+    }
+
+    /// Wrap a [`FimEvent`].
+    #[must_use]
+    pub fn fim(fim: FimEvent) -> Self {
+        Self::Fim(Box::new(fim))
+    }
+
+    /// Wrap an [`AuthEvent`].
+    #[must_use]
+    pub fn auth(auth: AuthEvent) -> Self {
+        Self::Auth(Box::new(auth))
+    }
+
+    /// Wrap a [`ProcessEvent`].
+    #[must_use]
+    pub fn process(process: ProcessEvent) -> Self {
+        Self::Process(Box::new(process))
+    }
+
+    /// Wrap an [`IncidentEvent`].
+    #[must_use]
+    pub fn incident(incident: IncidentEvent) -> Self {
+        Self::Incident(Box::new(incident))
     }
 }
 
@@ -372,6 +420,229 @@ pub struct FlowEvent {
 }
 
 // ---------------------------------------------------------------------------
+// host events
+// ---------------------------------------------------------------------------
+
+/// What happened to a watched file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChange {
+    /// The path appeared.
+    Created,
+    /// Contents changed.
+    Modified,
+    /// Ownership, mode, or timestamps changed.
+    AttributesChanged,
+    /// The path was removed.
+    Deleted,
+    /// The path was renamed.
+    Renamed,
+}
+
+impl FileChange {
+    /// Stable identifier used in event JSON and rules.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Modified => "modified",
+            Self::AttributesChanged => "attributes_changed",
+            Self::Deleted => "deleted",
+            Self::Renamed => "renamed",
+        }
+    }
+}
+
+/// How a file change came to the sensor's attention.
+///
+/// The distinction matters operationally: a change found by the rescan is one
+/// real-time watching **did not see**, which is either a gap in coverage or a
+/// change made while the sensor was down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FimDetection {
+    /// Reported by the kernel as it happened.
+    RealTime,
+    /// Found by comparing against the stored baseline.
+    BaselineRescan,
+}
+
+impl FimDetection {
+    /// Stable identifier used in event JSON.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RealTime => "real_time",
+            Self::BaselineRescan => "baseline_rescan",
+        }
+    }
+}
+
+/// Body of a `fim` event: a watched file changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FimEvent {
+    /// The path that changed.
+    pub path: String,
+    /// What happened to it.
+    pub change: FileChange,
+    /// Whether the kernel told us or the rescan found it.
+    pub detected_by: FimDetection,
+    /// Size after the change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Content hash after the change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Content hash before it, where a baseline existed.
+    ///
+    /// Both hashes present and equal means the metadata moved but the bytes did
+    /// not — a touch, not an edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_sha256: Option<String>,
+    /// Unix mode after the change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    /// Owning user id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    /// Owning group id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
+}
+
+/// Whether an authentication attempt succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthOutcome {
+    /// The attempt succeeded.
+    Success,
+    /// The attempt failed.
+    Failure,
+}
+
+impl AuthOutcome {
+    /// Stable identifier used in event JSON and rules.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+/// Body of an `auth` event: an authentication attempt.
+///
+/// The fields come from log text an attacker may partly control — a username is
+/// whatever was typed at a login prompt. [`AuthEvent::suspicious`] records what
+/// the parser refused to take at face value, so a forged-looking record is
+/// visible rather than quietly trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthEvent {
+    /// Success or failure.
+    pub outcome: AuthOutcome,
+    /// The account named in the attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The service that reported it — `sshd`, `sudo`, ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// Where the attempt came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_address: Option<IpAddr>,
+    /// Source port, where the log recorded one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_port: Option<u16>,
+    /// The log line, sanitised for transport.
+    pub message: String,
+    /// Where the record came from — `journald`, or a file path.
+    pub log_source: String,
+    /// What looked wrong about the record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suspicious: Vec<String>,
+}
+
+/// What a process did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessChange {
+    /// A process appeared.
+    Started,
+    /// A process went away.
+    Exited,
+    /// A process began listening on a socket.
+    Listening,
+}
+
+impl ProcessChange {
+    /// Stable identifier used in event JSON and rules.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Exited => "exited",
+            Self::Listening => "listening",
+        }
+    }
+}
+
+/// Body of a `process` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessEvent {
+    /// What happened.
+    pub change: ProcessChange,
+    /// Process id.
+    pub pid: u32,
+    /// Executable name.
+    pub name: String,
+    /// Full path to the executable, where it could be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    /// The command line, truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_line: Option<String>,
+    /// Owning user id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    /// Parent process id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_pid: Option<u32>,
+}
+
+/// One event that contributed to an incident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncidentContributor {
+    /// The contributing event's type.
+    pub event_type: EventKind,
+    /// Signature id, for contributors that were alerts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<u32>,
+    /// A one-line description.
+    pub summary: String,
+    /// When it happened.
+    pub timestamp: Timestamp,
+}
+
+/// Body of an `incident` event: several observations judged to be one thing.
+///
+/// The point of running host and network detection in one sensor: a file change
+/// and a network alert on the same host inside a short window are usually one
+/// story, and an analyst should be shown it as one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncidentEvent {
+    /// Why these events were grouped.
+    pub reason: String,
+    /// Highest severity among the contributors.
+    pub severity: u8,
+    /// Earliest contributing event.
+    pub first_seen: Timestamp,
+    /// Latest contributing event.
+    pub last_seen: Timestamp,
+    /// What went into it, in time order.
+    pub contributors: Vec<IncidentContributor>,
+}
+
+// ---------------------------------------------------------------------------
 // stats
 // ---------------------------------------------------------------------------
 
@@ -396,6 +667,10 @@ pub struct StatsEvent {
     pub reassembly: ReassemblyStats,
     /// Detection-engine counters.
     pub engine: EngineStats,
+    /// Host-monitoring counters.
+    pub hids: HidsStats,
+    /// Correlation counters.
+    pub correlation: CorrelationStats,
 }
 
 /// Counters for the decoupled event pipeline.
@@ -543,6 +818,57 @@ pub struct ReassemblyStats {
     /// broken middlebox, or an attempt to stop the sensor watching a live
     /// connection.
     pub resets_ignored: u64,
+}
+
+/// Counters for host monitoring.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HidsStats {
+    /// Whether host monitoring is running.
+    pub enabled: bool,
+    /// Paths currently watched in real time.
+    pub watched_paths: u64,
+    /// Watches that could not be established. **A coverage hole**: changes to
+    /// those paths are only caught by the rescan.
+    pub watch_failures: u64,
+    /// File changes reported by the kernel as they happened.
+    pub fim_realtime: u64,
+    /// File changes found by comparing against the baseline.
+    ///
+    /// Non-zero means real-time watching did not see them — because the sensor
+    /// was down, or because the kernel queue overflowed.
+    pub fim_rescan: u64,
+    /// Times the kernel's event queue overflowed.
+    ///
+    /// **Every overflow is an unknown number of missed changes.** Each one
+    /// forces an immediate rescan and is reported.
+    pub inotify_overflows: u64,
+    /// Baseline rescans completed.
+    pub rescans: u64,
+    /// Files in the baseline.
+    pub baseline_entries: u64,
+    /// Authentication records parsed.
+    pub auth_records: u64,
+    /// Log lines that could not be parsed into a record.
+    pub auth_unparsed: u64,
+    /// Auth records carrying something the parser would not take at face value.
+    pub auth_suspicious: u64,
+    /// Process events emitted.
+    pub process_events: u64,
+    /// Host alerts raised.
+    pub host_alerts: u64,
+}
+
+/// Counters for host/network correlation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorrelationStats {
+    /// Whether correlation is running.
+    pub enabled: bool,
+    /// Observations offered for correlation.
+    pub observations: u64,
+    /// Incidents emitted.
+    pub incidents: u64,
+    /// Observations dropped because the window was full.
+    pub dropped: u64,
 }
 
 /// Counters for the detection engine.

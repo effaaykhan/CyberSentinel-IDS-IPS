@@ -95,6 +95,17 @@ pub struct CompileReport {
 }
 
 impl CompileReport {
+    /// Fold another report into this one.
+    ///
+    /// The network and host halves compile separately; an operator wants one
+    /// set of numbers.
+    pub fn merge(&mut self, other: Self) {
+        self.compiled += other.compiled;
+        self.not_evaluable += other.not_evaluable;
+        self.without_prefilter += other.without_prefilter;
+        self.failed.extend(other.failed);
+    }
+
     /// A one-line summary for logs.
     #[must_use]
     pub fn summary(&self) -> String {

@@ -409,6 +409,162 @@ impl NormalizationCondition {
     }
 }
 
+/// A field of a host event that a rule can match on.
+///
+/// Host events are records with named fields, not byte streams, so they get
+/// their own vocabulary rather than being forced through the packet buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum HostField {
+    /// `file.path` — the path that changed.
+    FilePath,
+    /// `file.change` — created, modified, attributes_changed, deleted, renamed.
+    FileChange,
+    /// `auth.outcome` — success or failure.
+    AuthOutcome,
+    /// `auth.user` — the account named in the attempt.
+    AuthUser,
+    /// `auth.service` — sshd, sudo, ...
+    AuthService,
+    /// `auth.source` — the address the attempt came from.
+    AuthSource,
+    /// `process.name` — the executable's name.
+    ProcessName,
+    /// `process.change` — started, exited, listening.
+    ProcessChange,
+    /// `process.cmdline` — the command line.
+    ProcessCommandLine,
+}
+
+/// Which host event kind a field belongs to.
+///
+/// A rule mixing fields from different kinds could never match a single record,
+/// so the loader refuses it rather than letting it sit armed and silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HostEventKind {
+    /// A file integrity event.
+    Fim,
+    /// An authentication event.
+    Auth,
+    /// A process event.
+    Process,
+}
+
+impl HostEventKind {
+    /// Stable identifier used in messages.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fim => "fim",
+            Self::Auth => "auth",
+            Self::Process => "process",
+        }
+    }
+}
+
+impl HostField {
+    /// The keyword that selects this field.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FilePath => "file.path",
+            Self::FileChange => "file.change",
+            Self::AuthOutcome => "auth.outcome",
+            Self::AuthUser => "auth.user",
+            Self::AuthService => "auth.service",
+            Self::AuthSource => "auth.source",
+            Self::ProcessName => "process.name",
+            Self::ProcessChange => "process.change",
+            Self::ProcessCommandLine => "process.cmdline",
+        }
+    }
+
+    /// Parse a field keyword.
+    #[must_use]
+    pub fn from_keyword(keyword: &str) -> Option<Self> {
+        [
+            Self::FilePath,
+            Self::FileChange,
+            Self::AuthOutcome,
+            Self::AuthUser,
+            Self::AuthService,
+            Self::AuthSource,
+            Self::ProcessName,
+            Self::ProcessChange,
+            Self::ProcessCommandLine,
+        ]
+        .into_iter()
+        .find(|field| field.as_str() == keyword)
+    }
+
+    /// Which kind of host event carries this field.
+    #[must_use]
+    pub fn event_kind(self) -> HostEventKind {
+        match self {
+            Self::FilePath | Self::FileChange => HostEventKind::Fim,
+            Self::AuthOutcome | Self::AuthUser | Self::AuthService | Self::AuthSource => {
+                HostEventKind::Auth
+            }
+            Self::ProcessName | Self::ProcessChange | Self::ProcessCommandLine => {
+                HostEventKind::Process
+            }
+        }
+    }
+
+    /// How values for this field are compared by default.
+    ///
+    /// Paths match by prefix so `file.path:"/usr/bin"` covers everything under
+    /// it — which is how an operator means it. Everything else is an exact
+    /// match, because a username or an outcome is a whole value, and matching
+    /// `root` as a substring of `chroot` would be a surprise.
+    #[must_use]
+    pub fn default_match_kind(self) -> HostMatchKind {
+        match self {
+            Self::FilePath => HostMatchKind::Prefix,
+            Self::ProcessCommandLine => HostMatchKind::Contains,
+            _ => HostMatchKind::Exact,
+        }
+    }
+}
+
+/// How a host field value is compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostMatchKind {
+    /// The whole value must be equal.
+    Exact,
+    /// The value must start with the pattern.
+    Prefix,
+    /// The pattern must appear somewhere in the value.
+    Contains,
+}
+
+/// How a host field is matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostMatcher {
+    /// Any of these values, compared by the field's match kind.
+    AnyOf {
+        /// The alternatives, as written.
+        values: Vec<String>,
+        /// How each is compared.
+        kind: HostMatchKind,
+        /// Compare case-insensitively.
+        nocase: bool,
+    },
+    /// A regular expression, from a `<field>.pcre` keyword.
+    Regex(String),
+}
+
+/// A condition on one field of a host event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostFieldMatch {
+    /// The field.
+    pub field: HostField,
+    /// How it is matched.
+    pub matcher: HostMatcher,
+    /// The condition must **not** hold.
+    pub negated: bool,
+}
+
 /// One match condition from a rule, in the order it was written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -429,6 +585,8 @@ pub enum RuleOption {
     Dsize(DsizeMatch),
     /// A condition on what normalization found.
     Normalized(NormalizationCondition),
+    /// A condition on a host event's field.
+    Host(HostFieldMatch),
 }
 
 impl RuleOption {
@@ -438,6 +596,15 @@ impl RuleOption {
         match self {
             Self::Content(content) => Some(content.buffer),
             Self::Pcre(pcre) => Some(pcre.buffer),
+            _ => None,
+        }
+    }
+
+    /// The host event kind this option requires, if it is a host condition.
+    #[must_use]
+    pub fn host_event_kind(&self) -> Option<HostEventKind> {
+        match self {
+            Self::Host(host) => Some(host.field.event_kind()),
             _ => None,
         }
     }

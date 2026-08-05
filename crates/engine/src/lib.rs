@@ -10,6 +10,7 @@
 pub mod compile;
 pub mod engine;
 pub mod eval;
+pub mod host;
 pub mod vars;
 
 pub use compile::{
@@ -18,4 +19,5 @@ pub use compile::{
 };
 pub use engine::{AlertRecord, Engine, EngineCounters, EngineLimits};
 pub use eval::{evaluate, Buffers, FlowBits, MatchInput, MatchOutcome};
+pub use host::{evaluate_host, CompiledHostRule, HostObservation, HostRuleset};
 pub use vars::{AddressSet, CompiledHeader, PortSet, VarError, VarTable};
