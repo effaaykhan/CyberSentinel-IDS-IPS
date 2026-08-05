@@ -48,6 +48,10 @@ pub struct Config {
     pub detect: DetectConfig,
     /// Which `.rules` files to load.
     pub rules: RulesConfig,
+    /// Host-based monitoring: FIM, authentication logs, processes.
+    pub hids: HidsConfig,
+    /// Joining host and network evidence into incidents.
+    pub correlation: CorrelationConfig,
     /// Where events go.
     pub outputs: OutputsConfig,
     /// Diagnostic logging (distinct from event output).
@@ -566,6 +570,177 @@ impl Default for StatsConfig {
     }
 }
 
+/// Host-based monitoring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct HidsConfig {
+    /// Run host monitoring at all.
+    pub enabled: bool,
+    /// File integrity monitoring.
+    pub fim: FimConfig,
+    /// Authentication log sources.
+    pub auth: AuthConfig,
+    /// Process and listening-socket monitoring.
+    pub process: ProcessConfig,
+}
+
+impl Default for HidsConfig {
+    fn default() -> Self {
+        Self {
+            // On by default: a host sensor that ships switched off is a host
+            // sensor nobody turns on.
+            enabled: true,
+            fim: FimConfig::default(),
+            auth: AuthConfig::default(),
+            process: ProcessConfig::default(),
+        }
+    }
+}
+
+/// File integrity monitoring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct FimConfig {
+    /// Watch files at all.
+    pub enabled: bool,
+    /// The critical paths to monitor.
+    ///
+    /// Deliberately a short list rather than the whole filesystem: every
+    /// watched directory consumes one of the kernel's finite
+    /// `max_user_watches`, and a sensor that exhausts them degrades the host it
+    /// is supposed to protect.
+    pub paths: Vec<PathBuf>,
+    /// Where the hash baseline lives, relative to [`PathsConfig::data_dir`].
+    pub baseline: PathBuf,
+    /// Seconds between baseline rescans.
+    ///
+    /// The rescan is what catches changes made while the sensor was down and
+    /// changes lost to a queue overflow, so this is a **detection-latency**
+    /// setting, not a performance knob.
+    pub rescan_interval_secs: u64,
+    /// Largest file hashed. Bigger files are tracked by size and metadata.
+    pub max_file_bytes: u64,
+    /// Deepest directory nesting walked below a configured path.
+    pub max_depth: usize,
+    /// Most files tracked across all configured paths.
+    pub max_entries: usize,
+}
+
+impl Default for FimConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // The files that decide who can log in and what runs as root.
+            paths: vec![
+                PathBuf::from("/etc"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/usr/sbin"),
+                PathBuf::from("/bin"),
+                PathBuf::from("/sbin"),
+            ],
+            baseline: PathBuf::from("fim-baseline.db"),
+            rescan_interval_secs: 3_600,
+            max_file_bytes: 64 * 1_024 * 1_024,
+            max_depth: 16,
+            max_entries: 50_000,
+        }
+    }
+}
+
+/// Authentication log sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Read authentication records at all.
+    pub enabled: bool,
+    /// Follow journald, via `journalctl`.
+    ///
+    /// Preferred over a log file: journald records carry the service as a
+    /// structured field, so a message cannot claim to have come from `sshd`.
+    pub journald: bool,
+    /// Syslog-format files to follow, for hosts without journald.
+    pub files: Vec<PathBuf>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            journald: true,
+            // Debian and RHEL name it differently; a file that is not there is
+            // not an error, so listing both is the portable default.
+            files: vec![
+                PathBuf::from("/var/log/auth.log"),
+                PathBuf::from("/var/log/secure"),
+            ],
+        }
+    }
+}
+
+/// Process and listening-socket monitoring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct ProcessConfig {
+    /// Sweep `/proc` at all.
+    pub enabled: bool,
+    /// Where `/proc` is mounted.
+    ///
+    /// Configurable because a sensor in a container is often given the host's
+    /// `/proc` at another path, and because it makes the whole reader testable
+    /// against a fixture tree.
+    pub proc_root: PathBuf,
+    /// Seconds between sweeps.
+    ///
+    /// A poller cannot see a process that starts and exits between sweeps.
+    /// Shorter is more thorough and more expensive; this is the trade.
+    pub interval_secs: u64,
+    /// Most processes tracked in one sweep.
+    pub max_processes: usize,
+    /// Most listening sockets tracked in one sweep.
+    pub max_sockets: usize,
+}
+
+impl Default for ProcessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            proc_root: PathBuf::from("/proc"),
+            interval_secs: 5,
+            max_processes: 16_384,
+            max_sockets: 8_192,
+        }
+    }
+}
+
+/// Joining host and network evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct CorrelationConfig {
+    /// Emit `incident` events.
+    pub enabled: bool,
+    /// How far apart two events can be and still be one incident.
+    pub window_secs: u64,
+    /// Quiet period after an incident on a host, so sustained activity is one
+    /// incident rather than a stream of them.
+    pub cooldown_secs: u64,
+    /// Most hosts tracked at once.
+    pub max_hosts: usize,
+    /// Most observations retained per host.
+    pub max_per_host: usize,
+}
+
+impl Default for CorrelationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_secs: 120,
+            cooldown_secs: 300,
+            max_hosts: 1_024,
+            max_per_host: 256,
+        }
+    }
+}
+
 impl Config {
     /// Read and parse a `config.yaml`, then resolve its relative paths.
     ///
@@ -615,6 +790,9 @@ impl Config {
                 *file = directory.join(&*file);
             }
         }
+        if self.hids.fim.baseline.is_relative() {
+            self.hids.fim.baseline = self.paths.data_dir.join(&self.hids.fim.baseline);
+        }
     }
 
     /// Reject values the sensor cannot act on.
@@ -658,6 +836,31 @@ impl Config {
             ));
         }
         self.reassembly.check()?;
+        // A zero rescan interval would mean a rescan on every poll: the sensor
+        // would spend its life hashing and never service anything else.
+        if self.hids.fim.enabled && self.hids.fim.rescan_interval_secs == 0 {
+            return Err(Error::ConfigInvalid(
+                "hids.fim.rescan-interval-secs must be at least 1 when FIM is enabled".into(),
+            ));
+        }
+        if self.hids.fim.enabled && self.hids.fim.max_entries == 0 {
+            return Err(Error::ConfigInvalid(
+                "hids.fim.max-entries must be at least 1 when FIM is enabled".into(),
+            ));
+        }
+        if self.hids.process.enabled && self.hids.process.interval_secs == 0 {
+            return Err(Error::ConfigInvalid(
+                "hids.process.interval-secs must be at least 1 when process monitoring is enabled"
+                    .into(),
+            ));
+        }
+        // A zero window correlates nothing, which is a silently disabled
+        // feature rather than a configured one.
+        if self.correlation.enabled && self.correlation.window_secs == 0 {
+            return Err(Error::ConfigInvalid(
+                "correlation.window-secs must be at least 1 when correlation is enabled".into(),
+            ));
+        }
         if self.detect.inspection_window == 0 {
             return Err(Error::ConfigInvalid(
                 "detect.inspection-window must be at least 1".into(),

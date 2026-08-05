@@ -6,16 +6,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use cybersentinel_capture::{Captured, PacketSource, PcapReplay};
+use cybersentinel_capture::{CaptureCounters, Captured, PacketSource, PcapReplay};
 use cybersentinel_common::config::Config;
 use cybersentinel_common::event::{
-    CaptureStats, CorrelationStats, DecodeStats, EngineStats, EventStats, FlowStats, HidsStats,
-    Payload, ReassemblyStats, RuleStats, StatsEvent,
+    CaptureStats, DecodeStats, EngineStats, EventStats, FlowStats, Payload, ReassemblyStats,
+    RuleStats, StatsEvent,
 };
 use cybersentinel_common::eventlog::{EventEmitter, EventPipeline, EventSink};
 use cybersentinel_common::sensor;
+use cybersentinel_correlation::{CorrelationSettings, Correlator};
 use cybersentinel_engine::CompileLimits;
 use cybersentinel_engine::{CompileReport, Engine, EngineLimits, VarTable};
+use cybersentinel_hids::fim::FimSettings;
+use cybersentinel_hids::process::ScanLimits;
+use cybersentinel_hids::sensor::{HostSensor, HostSettings};
 use cybersentinel_rules::{LoadReport, RuleSet};
 use cybersentinel_storage::{FileEventSink, StdoutEventSink};
 
@@ -35,6 +39,16 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 /// next packet — and only when the link was idle, which is when latency matters
 /// least — while keeping shutdown responsive and counters fresh.
 const IDLE_POLL: Duration = Duration::from_millis(1);
+
+/// How long the host-only loop waits between polls.
+///
+/// Longer than [`IDLE_POLL`] because host events are not packets: there is no
+/// per-microsecond arrival to keep up with, and a sensor that spins a core on
+/// an idle host is a sensor an operator uninstalls.
+const HOST_POLL: Duration = Duration::from_millis(200);
+
+/// How long shutdown waits for the host sensors to hand over what they found.
+const HOST_DRAIN: Duration = Duration::from_secs(5);
 
 /// Arguments to `cybersentinel run`.
 #[derive(Debug, clap::Args)]
@@ -328,6 +342,94 @@ fn log_coverage(load: &LoadReport, compile: &CompileReport) {
     }
 }
 
+/// Translate the `hids` config section into sensor settings.
+///
+/// Returns `None` when host monitoring is switched off entirely, so the caller
+/// never starts a sensor that would do nothing.
+fn host_settings(config: &Config) -> Option<HostSettings> {
+    if !config.hids.enabled {
+        return None;
+    }
+    let fim = config.hids.fim.enabled.then(|| FimSettings {
+        paths: config.hids.fim.paths.clone(),
+        baseline_path: Some(config.hids.fim.baseline.clone()),
+        rescan_interval: Duration::from_secs(config.hids.fim.rescan_interval_secs),
+        max_file_bytes: config.hids.fim.max_file_bytes,
+        max_depth: config.hids.fim.max_depth,
+        max_entries: config.hids.fim.max_entries,
+    });
+
+    let settings = HostSettings {
+        fim,
+        auth_files: if config.hids.auth.enabled {
+            config.hids.auth.files.clone()
+        } else {
+            Vec::new()
+        },
+        journald: config.hids.auth.enabled && config.hids.auth.journald,
+        proc_root: config.hids.process.proc_root.clone(),
+        process_monitoring: config.hids.process.enabled,
+        process_interval: Duration::from_secs(config.hids.process.interval_secs),
+        process_limits: ScanLimits {
+            max_processes: config.hids.process.max_processes,
+            max_sockets: config.hids.process.max_sockets,
+        },
+    };
+
+    // Every sensor off is the same as host monitoring off, and starting one
+    // would advertise coverage that does not exist.
+    let anything_enabled = settings.fim.is_some()
+        || !settings.auth_files.is_empty()
+        || settings.journald
+        || settings.process_monitoring;
+    anything_enabled.then_some(settings)
+}
+
+/// Attach host monitoring to the pipeline, if it is configured.
+///
+/// A host sensor that cannot start is reported and skipped rather than fatal:
+/// the network half of the sensor still works, and half a sensor beats none.
+fn attach_host_monitoring(config: &Config, pipeline: &mut PacketPipeline) {
+    let Some(settings) = host_settings(config) else {
+        tracing::info!("host monitoring is disabled");
+        return;
+    };
+
+    let correlator = config.correlation.enabled.then(|| {
+        Correlator::new(CorrelationSettings {
+            window: Duration::from_secs(config.correlation.window_secs),
+            cooldown: Duration::from_secs(config.correlation.cooldown_secs),
+            max_hosts: config.correlation.max_hosts,
+            max_per_host: config.correlation.max_per_host,
+        })
+    });
+
+    match HostSensor::start(settings) {
+        Ok(sensor) => {
+            let stats = sensor.stats();
+            tracing::info!(
+                watched_paths = stats.watched_paths,
+                watch_failures = stats.watch_failures,
+                baseline_entries = stats.baseline_entries,
+                correlation = correlator.is_some(),
+                "host monitoring started"
+            );
+            if stats.watch_failures > 0 {
+                tracing::warn!(
+                    watch_failures = stats.watch_failures,
+                    "some paths could not be watched in real time; they are covered by the \
+                     periodic baseline rescan only"
+                );
+            }
+            pipeline.attach_host(sensor, correlator);
+        }
+        Err(error) => tracing::error!(
+            error = %error,
+            "host monitoring could not start; the network sensor continues without it"
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn main_loop(
     args: &RunArgs,
@@ -348,6 +450,28 @@ fn main_loop(
         ..PipelineSnapshot::default()
     }));
 
+    // The pipeline is built here rather than inside the packet loop because
+    // host monitoring runs whether or not there is a capture source: a
+    // HIDS-only install is a supported deployment, not a degraded one.
+    let mut pipeline = PacketPipeline::new(
+        emitter.clone(),
+        config,
+        PipelineOptions {
+            emit_anomaly_events: config.decode.emit_anomaly_events,
+            emit_flow_events: config.flow.emit_events,
+            dump_streams_to: args.dump_streams.clone(),
+        },
+        source.name(),
+    );
+    if config.detect.enabled {
+        pipeline.arm(engine, compile_report);
+    }
+    attach_host_monitoring(config, &mut pipeline);
+
+    // Publish before the first stats event so the startup heartbeat reports the
+    // real baseline and watch counts rather than zeroes.
+    pipeline.publish(&snapshot, CaptureCounters::default());
+
     // A stats event at t=0 doubles as a startup heartbeat: a consumer sees the
     // sensor is alive without waiting a full interval.
     emit_stats(emitter, report, started, &snapshot);
@@ -356,25 +480,15 @@ fn main_loop(
         return Ok(());
     }
 
-    if source.as_packet_source().is_none() {
-        return heartbeat_only(config, emitter, report, started, &snapshot, &shutdown);
-    }
-    let _ = compile_report;
-
     // Stats run on their own thread so a busy packet loop cannot delay them,
     // and so a quiet link still produces a heartbeat.
     let stats_thread = spawn_stats_thread(config, emitter, report, started, &snapshot, &shutdown);
 
-    let outcome = run_packet_loop(
-        config,
-        emitter,
-        source,
-        &snapshot,
-        &shutdown,
-        args.dump_streams.as_ref(),
-        engine,
-        compile_report,
-    );
+    let outcome = if source.as_packet_source().is_some() {
+        run_packet_loop(source, &snapshot, &shutdown, &mut pipeline)
+    } else {
+        host_only_loop(&snapshot, &shutdown, &mut pipeline)
+    };
 
     // Stop the stats thread and emit one final stats event with the closing
     // counters — in particular whether anything was dropped.
@@ -387,33 +501,39 @@ fn main_loop(
     outcome
 }
 
+/// The host-only loop: no capture source, but a host to watch.
+///
+/// A sensor installed for FIM and authentication monitoring alone is a normal
+/// deployment — a database server with no span port still wants to know when
+/// `/etc/shadow` changes — so this path is a first-class loop rather than the
+/// old bare heartbeat.
+fn host_only_loop(
+    snapshot: &SharedSnapshot,
+    shutdown: &Arc<AtomicBool>,
+    pipeline: &mut PacketPipeline,
+) -> Result<()> {
+    if !pipeline.has_host() {
+        tracing::info!("no capture source and no host monitoring: running as a heartbeat only");
+    }
+    while !shutdown.load(Ordering::Relaxed) {
+        pipeline.service_host();
+        pipeline.publish(snapshot, CaptureCounters::default());
+        std::thread::sleep(HOST_POLL);
+    }
+    pipeline.drain_host(HOST_DRAIN);
+    pipeline.publish(snapshot, CaptureCounters::default());
+    tracing::info!("shutdown signal received");
+    Ok(())
+}
+
 /// The packet loop. Runs on the main thread, which is the thread that opened
 /// the capture handle and dropped privileges.
-#[allow(clippy::too_many_arguments)]
 fn run_packet_loop(
-    config: &Config,
-    emitter: &EventEmitter,
     source: &mut Source,
     snapshot: &SharedSnapshot,
     shutdown: &Arc<AtomicBool>,
-    dump_streams: Option<&PathBuf>,
-    engine: Engine,
-    compile_report: &CompileReport,
+    pipeline: &mut PacketPipeline,
 ) -> Result<()> {
-    let mut pipeline = PacketPipeline::new(
-        emitter.clone(),
-        config,
-        PipelineOptions {
-            emit_anomaly_events: config.decode.emit_anomaly_events,
-            emit_flow_events: config.flow.emit_events,
-            dump_streams_to: dump_streams.cloned(),
-        },
-        source.name(),
-    );
-    if config.detect.enabled {
-        pipeline.arm(engine, compile_report);
-    }
-
     let Some(packets) = source.as_packet_source() else {
         return Ok(());
     };
@@ -427,6 +547,9 @@ fn run_packet_loop(
                 pipeline.on_packet(&frame);
                 seen += 1;
                 if seen % PUBLISH_EVERY_PACKETS == 0 {
+                    // A saturated link must not starve host monitoring, so it
+                    // is serviced on the same cadence as counter publication.
+                    pipeline.service_host();
                     let counters = packets.counters();
                     pipeline.publish(snapshot, counters);
                 }
@@ -436,6 +559,9 @@ fn run_packet_loop(
             // a moment so an idle link does not spin a core, and go round again
             // so the shutdown check runs.
             Ok(Captured::Idle) => {
+                // A quiet link is exactly when the host sensors get serviced:
+                // no packet is waiting, so nothing is delayed by doing it here.
+                pipeline.service_host();
                 let counters = packets.counters();
                 pipeline.publish(snapshot, counters);
                 std::thread::sleep(IDLE_POLL);
@@ -449,8 +575,10 @@ fn run_packet_loop(
         }
     }
 
-    // End every open flow so nothing is lost at the end of a capture.
+    // End every open flow so nothing is lost at the end of a capture, and give
+    // the host sensors the same courtesy.
     pipeline.flush();
+    pipeline.drain_host(HOST_DRAIN);
     let counters = packets.counters();
     pipeline.publish(snapshot, counters);
 
@@ -479,32 +607,6 @@ fn run_packet_loop(
         Some(error) => Err(anyhow::Error::new(error).context("packet capture")),
         None => Ok(()),
     }
-}
-
-/// The no-capture path: emit `stats` on an interval until signalled.
-fn heartbeat_only(
-    config: &Config,
-    emitter: &EventEmitter,
-    report: &LoadReport,
-    started: Instant,
-    snapshot: &SharedSnapshot,
-    shutdown: &Arc<AtomicBool>,
-) -> Result<()> {
-    if !config.stats.enabled {
-        tracing::info!("stats events are disabled; running until signalled");
-        while !shutdown.load(Ordering::Relaxed) {
-            std::thread::sleep(SHUTDOWN_POLL);
-        }
-        return Ok(());
-    }
-
-    let interval = Duration::from_secs(config.stats.interval_secs);
-    while !sleep_until(interval, shutdown) {
-        emit_stats(emitter, report, started, snapshot);
-    }
-    tracing::info!("shutdown signal received");
-    emit_stats(emitter, report, started, snapshot);
-    Ok(())
 }
 
 fn spawn_stats_thread(
@@ -627,8 +729,8 @@ fn emit_stats(
             stream_dropped_incomplete: pipeline.streams.dropped_incomplete,
             resets_ignored: pipeline.flows.resets_ignored,
         },
-        hids: HidsStats::default(),
-        correlation: CorrelationStats::default(),
+        hids: pipeline.hids.clone(),
+        correlation: pipeline.correlation.clone(),
         engine: EngineStats {
             enabled: capturing && pipeline.rules_armed > 0,
             rules_armed: pipeline.rules_armed,

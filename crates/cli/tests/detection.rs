@@ -95,6 +95,10 @@ paths:
 rules:
   directory: "{rules_dir}"
   files: ["{rules_file}"]
+hids:
+  # These tests exercise the network path. Host monitoring is switched off so
+  # they neither hash the machine's real /etc nor depend on what is in it.
+  enabled: false
 outputs:
   stdout:
     enabled: true
@@ -183,7 +187,7 @@ fn the_alert_event_carries_the_rule_and_the_flow() {
     std::fs::write(
         &config,
         format!(
-            "paths:\n  data-dir: \"{}\"\n  log-dir: \"{}\"\nrules:\n  directory: \"{}\"\n  files: [\"detection.rules\"]\noutputs:\n  file:\n    enabled: false\nlogging:\n  level: warn\n",
+            "paths:\n  data-dir: \"{}\"\n  log-dir: \"{}\"\nrules:\n  directory: \"{}\"\n  files: [\"detection.rules\"]\nhids:\n  enabled: false\noutputs:\n  file:\n    enabled: false\nlogging:\n  level: warn\n",
             scratch.yaml("data"),
             scratch.yaml("logs"),
             scratch.yaml(""),
@@ -445,7 +449,7 @@ fn strict_refuses_to_start_when_a_rule_is_broken() {
     std::fs::write(
         &config,
         format!(
-            "paths:\n  data-dir: \"{}\"\n  log-dir: \"{}\"\nrules:\n  directory: \"{}\"\n  files: [\"mixed.rules\"]\noutputs:\n  file:\n    enabled: false\n",
+            "paths:\n  data-dir: \"{}\"\n  log-dir: \"{}\"\nrules:\n  directory: \"{}\"\n  files: [\"mixed.rules\"]\nhids:\n  enabled: false\noutputs:\n  file:\n    enabled: false\n",
             scratch.yaml("data"),
             scratch.yaml("logs"),
             scratch.yaml(""),

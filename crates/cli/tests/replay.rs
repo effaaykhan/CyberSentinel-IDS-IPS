@@ -58,6 +58,10 @@ paths:
 rules:
   directory: "{dir}"
   files: []
+hids:
+  # These tests exercise the network path. Host monitoring is switched off so
+  # they neither hash the machine's real /etc nor depend on what is in it.
+  enabled: false
 outputs:
   stdout:
     enabled: true
@@ -377,7 +381,7 @@ fn a_missing_capture_file_fails_with_a_clear_message() {
     std::fs::write(
         &config_path,
         format!(
-            "paths:\n  data-dir: \"{}\"\n  log-dir: \"{}\"\nrules:\n  files: []\noutputs:\n  file:\n    enabled: false\n",
+            "paths:\n  data-dir: \"{}\"\n  log-dir: \"{}\"\nrules:\n  files: []\nhids:\n  enabled: false\noutputs:\n  file:\n    enabled: false\n",
             scratch.yaml_path("data"),
             scratch.yaml_path("logs"),
         ),
@@ -410,7 +414,7 @@ fn a_file_that_is_not_a_capture_is_rejected() {
     std::fs::write(
         &config_path,
         format!(
-            "paths:\n  data-dir: \"{}\"\n  log-dir: \"{}\"\nrules:\n  files: []\noutputs:\n  file:\n    enabled: false\n",
+            "paths:\n  data-dir: \"{}\"\n  log-dir: \"{}\"\nrules:\n  files: []\nhids:\n  enabled: false\noutputs:\n  file:\n    enabled: false\n",
             scratch.yaml_path("data"),
             scratch.yaml_path("logs"),
         ),

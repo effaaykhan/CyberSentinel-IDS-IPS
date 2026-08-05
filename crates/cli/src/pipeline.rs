@@ -26,13 +26,16 @@ use std::time::SystemTime;
 use cybersentinel_capture::{CaptureCounters, RawPacket};
 use cybersentinel_common::config::Config;
 use cybersentinel_common::event::{
-    AlertAction, AlertEvent, AlertSource, AnomalyEvent, AnomalyRecord, FlowEndReason, FlowEvent,
-    NetTuple, Payload, Protocol,
+    AlertAction, AlertEvent, AlertSource, AnomalyEvent, AnomalyRecord, CorrelationStats, EventKind,
+    FlowEndReason, FlowEvent, HidsStats, NetTuple, Payload, Protocol,
 };
 use cybersentinel_common::eventlog::EventEmitter;
 use cybersentinel_common::Timestamp;
+use cybersentinel_correlation::{Correlator, Domain, Observation};
 use cybersentinel_decode::{DecodeCounters, Decoded, Network, Transport};
+use cybersentinel_engine::host::HostObservation;
 use cybersentinel_engine::{AlertRecord, Engine, EngineCounters};
+use cybersentinel_hids::sensor::{HostBatch, HostSensor};
 use cybersentinel_reassembly::defrag::{DefragCounters, Defragmenter, FragmentView, Reassembled};
 use cybersentinel_reassembly::flow::{
     EndReason, EndedFlow, FlowCounters, FlowTable, PacketSummary,
@@ -74,6 +77,10 @@ pub struct PipelineSnapshot {
     pub rules_failed: u64,
     /// Rules with no usable pre-filter pattern.
     pub rules_without_prefilter: u64,
+    /// Host-monitoring counters.
+    pub hids: HidsStats,
+    /// Correlation counters.
+    pub correlation: CorrelationStats,
     /// Whether a replayed capture file was torn.
     pub capture_truncated: bool,
 }
@@ -111,6 +118,16 @@ pub struct PacketPipeline {
     stream_bytes_delivered: u64,
     /// The detection engine, once rules are armed.
     engine: Option<Engine>,
+    /// Host monitoring, when it is configured.
+    ///
+    /// It lives here rather than beside the pipeline because host rules are
+    /// evaluated by the same [`Engine`], and one engine with two owners would
+    /// mean a lock on the packet fast path.
+    host: Option<HostSensor>,
+    /// Joins host and network evidence, when correlation is enabled.
+    correlator: Option<Correlator>,
+    /// Host alerts raised so far.
+    host_alerts: u64,
     /// Reused across packets so alerting costs no allocation.
     alerts: Vec<AlertRecord>,
     rules_armed: u64,
@@ -148,6 +165,9 @@ impl PacketPipeline {
             ready: StreamReady::default(),
             stream_bytes_delivered: 0,
             engine: None,
+            host: None,
+            correlator: None,
+            host_alerts: 0,
             alerts: Vec::new(),
             rules_armed: 0,
             rules_awaiting_support: 0,
@@ -165,6 +185,229 @@ impl PacketPipeline {
         self.rules_failed = report.failed.len() as u64;
         self.rules_without_prefilter = report.without_prefilter as u64;
         self.engine = Some(engine);
+    }
+
+    /// Attach host monitoring and, optionally, correlation.
+    pub fn attach_host(&mut self, sensor: HostSensor, correlator: Option<Correlator>) {
+        self.host = Some(sensor);
+        self.correlator = correlator;
+    }
+
+    /// Whether host monitoring is attached.
+    #[must_use]
+    pub fn has_host(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// Service the host sensors once, emitting whatever they found.
+    ///
+    /// Called from the same loop that services capture, so there is one
+    /// shutdown path and one place events enter the pipeline. It never blocks:
+    /// a host with nothing happening costs one non-blocking poll.
+    pub fn service_host(&mut self) {
+        let Some(sensor) = self.host.as_mut() else {
+            return;
+        };
+        let batch = sensor.poll();
+        self.emit_host_batch(batch);
+    }
+
+    /// Give the host sensors a last chance to report before shutdown.
+    ///
+    /// The FIM baseline runs on its own thread, so a short run — replaying a
+    /// capture file, say — can finish before the first scan has been collected.
+    /// Exiting then would silently discard findings the sensor had already
+    /// made, which is the one thing this whole crate exists not to do. Bounded
+    /// by `deadline` so a wedged worker cannot hold shutdown open.
+    pub fn drain_host(&mut self, deadline: std::time::Duration) {
+        if self.host.is_none() {
+            return;
+        }
+        let until = std::time::Instant::now() + deadline;
+        loop {
+            let Some(sensor) = self.host.as_mut() else {
+                return;
+            };
+            let batch = sensor.poll();
+            let seen_something = !batch.is_empty() || batch.overflows > 0;
+            let baseline_ready = sensor.stats().rescans > 0;
+            self.emit_host_batch(batch);
+            if (seen_something && baseline_ready) || std::time::Instant::now() >= until {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Emit one batch of host findings, inspect them, and correlate them.
+    fn emit_host_batch(&mut self, batch: HostBatch) {
+        if batch.overflows > 0 {
+            // The gap is reported in its own right. An analyst reading the
+            // stream has to be able to see *that* changes were lost, not just
+            // the ones the forced rescan managed to recover.
+            let body = AnomalyEvent {
+                anomalies: vec![AnomalyRecord {
+                    layer: "host".to_string(),
+                    kind: "fim_queue_overflow".to_string(),
+                }],
+                interface: String::new(),
+                captured_len: 0,
+                packet_len: 0,
+                anomalies_truncated: false,
+            };
+            for _ in 0..batch.overflows {
+                let event = self
+                    .emitter
+                    .build_at(Timestamp::now(), Payload::anomaly(body.clone()));
+                self.emitter.emit_event(event);
+            }
+        }
+
+        // Taken apart rather than iterated as one list because each body type
+        // is a different `Payload` variant and a different host-rule kind.
+        let HostBatch {
+            fim,
+            auth,
+            process,
+            overflows: _,
+        } = batch;
+
+        for event in fim {
+            let summary = format!("{} {}", event.change.as_str(), event.path);
+            let timestamp = SystemTime::now();
+            self.inspect_and_emit_host(
+                &HostObservation::Fim(&event),
+                EventKind::Fim,
+                summary,
+                timestamp,
+            );
+            self.emit_host_event(Payload::fim(event), timestamp);
+        }
+        for event in auth {
+            let summary = format!(
+                "{} authentication for {}",
+                event.outcome.as_str(),
+                event.user.as_deref().unwrap_or("an unnamed account")
+            );
+            let timestamp = SystemTime::now();
+            self.inspect_and_emit_host(
+                &HostObservation::Auth(&event),
+                EventKind::Auth,
+                summary,
+                timestamp,
+            );
+            self.emit_host_event(Payload::auth(event), timestamp);
+        }
+        for event in process {
+            let summary = format!(
+                "{} {} (pid {})",
+                event.change.as_str(),
+                event.name,
+                event.pid
+            );
+            let timestamp = SystemTime::now();
+            self.inspect_and_emit_host(
+                &HostObservation::Process(&event),
+                EventKind::Process,
+                summary,
+                timestamp,
+            );
+            self.emit_host_event(Payload::process(event), timestamp);
+        }
+    }
+
+    /// Run the host rules over one observation, emit any alerts, and offer both
+    /// the observation and its alerts to correlation.
+    fn inspect_and_emit_host(
+        &mut self,
+        observation: &HostObservation<'_>,
+        event_type: EventKind,
+        summary: String,
+        timestamp: SystemTime,
+    ) {
+        self.alerts.clear();
+        if let Some(engine) = self.engine.as_mut() {
+            let mut alerts = std::mem::take(&mut self.alerts);
+            engine.inspect_host(observation, timestamp, &mut alerts);
+            self.alerts = alerts;
+        }
+
+        let records = std::mem::take(&mut self.alerts);
+        self.host_alerts += records.len() as u64;
+        for record in &records {
+            let body = AlertEvent {
+                action: AlertAction::Alerted,
+                source: AlertSource::Host,
+                sid: record.sid,
+                rev: record.rev,
+                signature: record.signature.clone(),
+                classtype: record.classtype.clone(),
+                severity: record.severity,
+                metadata: record.metadata.clone(),
+            };
+            let event = self
+                .emitter
+                .build_at(to_timestamp(timestamp), Payload::alert(body));
+            self.emitter.emit_event(event);
+        }
+
+        // A host alert is stronger evidence than the bare event, so it is what
+        // gets offered when there is one. Severity 3 is the neutral default for
+        // an observation nothing matched.
+        let (sid, severity, summary) = match records.first() {
+            Some(record) => (Some(record.sid), record.severity, record.signature.clone()),
+            None => (None, 3, summary),
+        };
+        self.correlate(Domain::Host, event_type, sid, severity, summary, timestamp);
+        self.alerts = records;
+        self.alerts.clear();
+    }
+
+    /// Offer one observation to correlation and emit any incident it completes.
+    fn correlate(
+        &mut self,
+        domain: Domain,
+        event_type: EventKind,
+        sid: Option<u32>,
+        severity: u8,
+        summary: String,
+        timestamp: SystemTime,
+    ) {
+        let Some(correlator) = self.correlator.as_mut() else {
+            return;
+        };
+        let incident = correlator.observe(Observation {
+            host: self.emitter.sensor().name.clone(),
+            timestamp: to_timestamp(timestamp),
+            domain,
+            event_type,
+            sid,
+            severity,
+            summary,
+        });
+        if let Some(incident) = incident {
+            let event = self
+                .emitter
+                .build_at(to_timestamp(timestamp), Payload::incident(incident));
+            self.emitter.emit_event(event);
+        }
+    }
+
+    /// Emit one host event body.
+    fn emit_host_event(&self, payload: Payload, timestamp: SystemTime) {
+        let event = self.emitter.build_at(to_timestamp(timestamp), payload);
+        self.emitter.emit_event(event);
+    }
+
+    /// Host counters, merged with the alert count the pipeline owns.
+    fn host_stats(&self) -> HidsStats {
+        let mut stats = self
+            .host
+            .as_ref()
+            .map(|sensor| sensor.stats().clone())
+            .unwrap_or_default();
+        stats.host_alerts = self.host_alerts;
+        stats
     }
 
     /// Decode one captured frame and emit whatever it warrants.
@@ -362,8 +605,10 @@ impl PacketPipeline {
         self.emit_alerts(flow_id, tuple, timestamp);
     }
 
-    fn emit_alerts(&self, flow_id: u64, tuple: NetTuple, timestamp: SystemTime) {
-        for record in &self.alerts {
+    fn emit_alerts(&mut self, flow_id: u64, tuple: NetTuple, timestamp: SystemTime) {
+        // Taken so the emitter and the correlator can both be borrowed.
+        let records = std::mem::take(&mut self.alerts);
+        for record in &records {
             let body = AlertEvent {
                 action: AlertAction::Alerted,
                 source: AlertSource::Network,
@@ -381,6 +626,24 @@ impl PacketPipeline {
                 .with_net(tuple);
             self.emitter.emit_event(event);
         }
+
+        // Offer the network side to correlation. Only alerts: an ordinary flow
+        // is not evidence of anything, and feeding every packet in would make
+        // "a host event happened while the network was busy" look like a
+        // finding.
+        for record in &records {
+            self.correlate(
+                Domain::Network,
+                EventKind::Alert,
+                Some(record.sid),
+                record.severity,
+                record.signature.clone(),
+                timestamp,
+            );
+        }
+
+        self.alerts = records;
+        self.alerts.clear();
     }
 
     /// Account for — and optionally dump — bytes that reassembly delivered.
@@ -581,6 +844,12 @@ impl PacketPipeline {
             rules_awaiting_support: self.rules_awaiting_support,
             rules_failed: self.rules_failed,
             rules_without_prefilter: self.rules_without_prefilter,
+            hids: self.host_stats(),
+            correlation: self
+                .correlator
+                .as_ref()
+                .map(|correlator| correlator.stats().clone())
+                .unwrap_or_default(),
             capture_truncated: false,
         };
         if let Ok(mut guard) = slot.lock() {

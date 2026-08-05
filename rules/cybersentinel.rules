@@ -97,3 +97,10 @@ alert ip any any -> any any ( \
     classtype:attempted-admin; \
     metadata:phase 4, confidence high, tactic credential-access; \
     sid:1000010; rev:1;)
+
+alert ip any any -> any any ( \
+    msg:"CYBERSENTINEL PROCESS a new listening socket appeared"; \
+    process.change:"listening"; \
+    classtype:policy-violation; \
+    metadata:phase 4, confidence medium, tactic persistence; \
+    sid:1000020; rev:1;)

@@ -69,6 +69,10 @@ rules:
   directory: "{dir}"
   files:
     - test.rules
+hids:
+  # These tests exercise the network path. Host monitoring is switched off so
+  # they neither hash the machine's real /etc nor depend on what is in it.
+  enabled: false
 outputs:
   stdout:
     enabled: true

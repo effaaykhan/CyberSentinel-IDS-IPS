@@ -8,6 +8,19 @@
 //! run loop calls alongside the capture poll, so there is one shutdown path,
 //! one stats snapshot, and one place where host events enter the pipeline.
 //!
+//! # FIM runs on its own thread, and that is not an optimisation
+//!
+//! Establishing a baseline over `/etc` and `/usr/bin` means hashing tens of
+//! thousands of files. Doing that on the caller's thread would stall packet
+//! capture for as long as it takes — dropping traffic, on a sensor whose whole
+//! job is not to miss things — and would make startup appear to hang. So
+//! [`FimWorker`] owns the baseline and the watcher on a dedicated thread and
+//! hands finished events back over a bounded channel. The poll then costs one
+//! `try_recv` whether the baseline is idle or mid-scan.
+//!
+//! Auth logs and `/proc` stay inline: both are bounded, fast reads, and neither
+//! can take longer than the poll interval.
+//!
 //! # inotify overflow is a first-class event, not an error
 //!
 //! The kernel's inotify queue is bounded. Fill it faster than we drain it and
@@ -20,8 +33,9 @@
 //!
 //! 1. It **forces an immediate rescan**, so the change that was dropped is
 //!    still found by comparing hashes against the baseline.
-//! 2. It is **reported** as its own decoder-anomaly-style event, so the gap is
-//!    visible in the event stream rather than inferred from an absence.
+//! 2. It is **reported** — the batch carries the overflow count so the caller
+//!    emits it as its own event, and the gap is visible in the event stream
+//!    rather than inferred from an absence.
 //! 3. It is **counted** in [`HidsStats::inotify_overflows`], so a host that
 //!    overflows repeatedly shows up as a coverage problem.
 //!
@@ -35,22 +49,27 @@ use crate::HostError;
 use cybersentinel_common::event::{AuthEvent, FimDetection, FimEvent, HidsStats, ProcessEvent};
 use notify::{RecursiveMode, Watcher as _};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// How many pending notifications and log lines are held before dropping.
+/// How many pending notifications, log lines, and updates are held before
+/// dropping.
 ///
 /// Bounded like every other queue in the sensor: back-pressure that blocks the
 /// watcher thread would be worse than a counted drop, and unbounded growth
 /// would be worse than both.
 const CHANNEL_DEPTH: usize = 4_096;
-/// Most real-time notifications turned into events in one poll.
+/// Most real-time notifications turned into events in one worker tick.
 ///
-/// Keeps a burst of file activity from monopolising the run loop; the rest is
-/// picked up on the next poll, or by the rescan.
-const MAX_NOTIFICATIONS_PER_POLL: usize = 512;
+/// Keeps a burst of file activity from monopolising the worker; the rest is
+/// picked up on the next tick, or by the rescan.
+const MAX_NOTIFICATIONS_PER_TICK: usize = 512;
 /// Most log lines parsed in one poll.
 const MAX_LOG_LINES_PER_POLL: usize = 1_024;
+/// How long the FIM worker waits between ticks.
+const FIM_TICK: Duration = Duration::from_millis(100);
 /// Default gap between `/proc` sweeps.
 pub const DEFAULT_PROCESS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -109,41 +128,284 @@ impl HostBatch {
     pub fn is_empty(&self) -> bool {
         self.fim.is_empty() && self.auth.is_empty() && self.process.is_empty()
     }
+}
 
-    fn absorb(&mut self, other: HostBatch) {
-        self.fim.extend(other.fim);
-        self.auth.extend(other.auth);
-        self.process.extend(other.process);
-        self.overflows += other.overflows;
+// ---------------------------------------------------------------------------
+// the FIM worker
+// ---------------------------------------------------------------------------
+
+/// What FIM has done so far.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FimCounters {
+    /// Paths successfully watched in real time.
+    pub watched_paths: u64,
+    /// Watches that could not be established, or that were lost.
+    pub watch_failures: u64,
+    /// Changes the kernel reported as they happened.
+    pub realtime: u64,
+    /// Changes found by the baseline comparison.
+    pub rescan: u64,
+    /// Queue overflows seen.
+    pub overflows: u64,
+    /// Rescans completed.
+    pub rescans: u64,
+    /// Files in the baseline.
+    pub baseline_entries: u64,
+}
+
+/// One tick's worth of FIM findings.
+#[derive(Debug, Default)]
+pub struct FimUpdate {
+    /// The changes found.
+    pub events: Vec<FimEvent>,
+    /// Overflows seen this tick.
+    pub overflows: u64,
+    /// Counters as of this tick.
+    pub counters: FimCounters,
+}
+
+/// Owns the baseline and the real-time watcher.
+///
+/// Public so its behaviour — particularly the overflow path — can be exercised
+/// directly. Inducing a real `IN_Q_OVERFLOW` in a test would mean outrunning
+/// the kernel's queue, which is neither reliable nor fast.
+#[allow(missing_debug_implementations)] // `notify::Watcher` is not `Debug`.
+pub struct FimWorker {
+    monitor: fim::Monitor,
+    /// Kept alive for as long as we want notifications; dropping it stops them.
+    _watcher: Option<Box<dyn notify::Watcher + Send>>,
+    notifications: Option<Receiver<notify::Result<notify::Event>>>,
+    rescan_interval: Duration,
+    next_rescan: Option<Instant>,
+    /// Cleared when the sensor is shutting down, so a long scan can be
+    /// abandoned rather than held to.
+    running: Arc<AtomicBool>,
+    /// Set when a gap is detected, cleared when the forced rescan runs.
+    ///
+    /// Held on the worker rather than passed along the call stack so that an
+    /// overflow noticed at any point is guaranteed to reach a rescan, even if
+    /// the tick that noticed it is interrupted.
+    overflow_pending: bool,
+    counters: FimCounters,
+}
+
+impl FimWorker {
+    /// Open the baseline and attach the watcher.
+    ///
+    /// Deliberately does **no** scanning: the first [`Self::tick`] does that,
+    /// on whatever thread the worker is running on.
+    pub fn start(settings: &FimSettings) -> Result<Self, HostError> {
+        let baseline = fim::Baseline::open(settings.baseline_path.as_deref())?;
+        let mut worker = Self {
+            monitor: fim::Monitor::new(settings.clone(), baseline),
+            _watcher: None,
+            notifications: None,
+            rescan_interval: settings.rescan_interval,
+            // `None` means "scan on the first tick". That first scan is what
+            // catches changes made while the sensor was down, by comparing
+            // against what was stored last time rather than against whatever
+            // the watcher happens to see from now on.
+            next_rescan: None,
+            running: Arc::new(AtomicBool::new(true)),
+            overflow_pending: false,
+            counters: FimCounters::default(),
+        };
+        worker.install_watcher(settings);
+        Ok(worker)
+    }
+
+    /// The counters so far.
+    #[must_use]
+    pub fn counters(&self) -> FimCounters {
+        self.counters
+    }
+
+    /// The flag that keeps a scan going. Clearing it abandons the current one.
+    #[must_use]
+    pub fn running_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.running)
+    }
+
+    /// Attach the real-time watcher, counting rather than failing on the paths
+    /// it cannot take.
+    fn install_watcher(&mut self, settings: &FimSettings) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(CHANNEL_DEPTH);
+        let forwarder = move |event| {
+            // A full channel means we are behind. Dropping is the right answer
+            // — blocking here would stall the watcher thread and make the
+            // kernel queue overflow, which is strictly worse — and the rescan
+            // is the backstop that makes the drop recoverable.
+            let _ = SyncSender::try_send(&sender, event);
+        };
+
+        let mut watcher = match notify::recommended_watcher(forwarder) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "real-time file watching unavailable; the periodic rescan still runs"
+                );
+                self.counters.watch_failures += 1;
+                return;
+            }
+        };
+
+        for path in &settings.paths {
+            match watcher.watch(path, RecursiveMode::Recursive) {
+                Ok(()) => self.counters.watched_paths += 1,
+                Err(error) => {
+                    // The usual causes are a missing path or an exhausted
+                    // `max_user_watches`. Neither is fatal, and both must be
+                    // visible: an unwatched path is a coverage gap, not a clean
+                    // bill of health.
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "could not watch path; it is covered by the periodic rescan only"
+                    );
+                    self.counters.watch_failures += 1;
+                }
+            }
+        }
+
+        self._watcher = Some(Box::new(watcher));
+        self.notifications = Some(receiver);
+    }
+
+    /// Do one round of FIM work.
+    pub fn tick(&mut self, now: Instant) -> FimUpdate {
+        let mut update = FimUpdate::default();
+
+        for _ in 0..MAX_NOTIFICATIONS_PER_TICK {
+            let Some(receiver) = self.notifications.as_ref() else {
+                break;
+            };
+            match receiver.try_recv() {
+                Ok(notification) => {
+                    let (events, _) = self.handle_notification(notification);
+                    update.events.extend(events);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The watcher thread is gone. Rescans continue, but the
+                    // loss of real-time coverage must not be silent.
+                    tracing::warn!("file watcher stopped; falling back to periodic rescan only");
+                    self.counters.watch_failures += 1;
+                    // Losing the watcher is losing real-time coverage, so it
+                    // gets the same treatment as an overflow: rescan now.
+                    self.overflow_pending = true;
+                    self.notifications = None;
+                    self._watcher = None;
+                    break;
+                }
+            }
+        }
+
+        let forced = std::mem::take(&mut self.overflow_pending);
+        let due = self.next_rescan.is_none_or(|next| now >= next);
+        if forced || due {
+            update.events.extend(self.rescan());
+            self.next_rescan = Some(now + self.rescan_interval);
+        }
+        if forced {
+            update.overflows += 1;
+        }
+
+        update.counters = self.counters;
+        update
+    }
+
+    /// Turn one notification into events, and say whether it was an overflow.
+    pub fn handle_notification(
+        &mut self,
+        notification: notify::Result<notify::Event>,
+    ) -> (Vec<FimEvent>, bool) {
+        let event = match notification {
+            Ok(event) => event,
+            Err(error) => {
+                // notify reports queue overflow as an error on some backends
+                // and as a rescan flag on others. Both must reach the same
+                // handler, or the platform decides whether we notice.
+                tracing::warn!(error = %error, "file watcher error");
+                self.counters.watch_failures += 1;
+                self.overflow_pending = true;
+                return (Vec::new(), true);
+            }
+        };
+
+        if event.need_rescan() {
+            tracing::warn!(
+                "file watch queue overflowed; changes were dropped — forcing a baseline rescan"
+            );
+            self.counters.overflows += 1;
+            self.overflow_pending = true;
+            return (Vec::new(), true);
+        }
+
+        // Whatever the notification claims happened, the baseline decides. A
+        // notification is a hint about *where* to look, never about *what*
+        // changed — the hashes settle that.
+        let mut events = Vec::new();
+        for path in &event.paths {
+            match self.monitor.recheck(path) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(error = %error, "rechecking a changed path"),
+            }
+        }
+        self.counters.realtime += events.len() as u64;
+        (events, false)
+    }
+
+    /// Run a baseline comparison now, abandoning it if asked to stop.
+    pub fn rescan(&mut self) -> Vec<FimEvent> {
+        let running = Arc::clone(&self.running);
+        let mut should_continue = move || running.load(Ordering::Relaxed);
+        match self
+            .monitor
+            .rescan_until(FimDetection::BaselineRescan, &mut should_continue)
+        {
+            Ok(outcome) => {
+                self.counters.rescans += 1;
+                self.counters.rescan += outcome.events.len() as u64;
+                self.counters.baseline_entries = self.monitor.baseline().len().unwrap_or(0);
+                outcome.events
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "baseline rescan failed");
+                Vec::new()
+            }
+        }
     }
 }
+
+// ---------------------------------------------------------------------------
+// the sensor
+// ---------------------------------------------------------------------------
 
 /// The polled host runtime.
 pub struct HostSensor {
     settings: HostSettings,
-    /// `None` when FIM is off or the baseline could not be opened.
-    fim: Option<fim::Monitor>,
-    /// Kept alive for as long as we want notifications; dropping it stops them.
-    watcher: Option<Box<dyn notify::Watcher + Send>>,
-    notifications: Option<Receiver<notify::Result<notify::Event>>>,
+    /// Findings from the FIM worker thread.
+    fim_updates: Option<Receiver<FimUpdate>>,
+    fim_thread: Option<std::thread::JoinHandle<()>>,
+    fim_shutdown: Arc<AtomicBool>,
+    /// Cleared on shutdown to abandon an in-flight baseline scan.
+    fim_running: Arc<AtomicBool>,
+    fim_counters: FimCounters,
     tailers: Vec<Tailer>,
     journal: Option<JournalReader>,
     processes: Option<process::Watcher>,
-    /// Findings from the startup rescan, handed out on the first poll.
-    startup_findings: Vec<FimEvent>,
-    next_rescan: Instant,
     next_sweep: Instant,
     stats: HidsStats,
 }
 
 impl std::fmt::Debug for HostSensor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `notify::Watcher` is not `Debug`, so the interesting state is
-        // summarised rather than derived.
         formatter
             .debug_struct("HostSensor")
             .field("settings", &self.settings)
-            .field("watching", &self.watcher.is_some())
+            .field("fim", &self.fim_thread.is_some())
             .field("tailers", &self.tailers.len())
             .field("journald", &self.journal.is_some())
             .field("process_monitoring", &self.processes.is_some())
@@ -160,25 +422,23 @@ impl HostSensor {
     /// exist — FIM continues with the periodic rescan alone and the failure is
     /// counted in [`HidsStats::watch_failures`]. Refusing to run because one of
     /// three sensors is degraded would trade partial visibility for none.
+    ///
+    /// Returns as soon as the watcher is attached. The baseline scan happens on
+    /// the FIM thread, so a sensor watching `/usr/bin` starts immediately
+    /// rather than after several thousand files have been hashed.
     pub fn start(settings: HostSettings) -> Result<Self, HostError> {
-        let now = Instant::now();
-        let rescan_interval = settings
-            .fim
-            .as_ref()
-            .map_or(fim::DEFAULT_RESCAN_INTERVAL, |fim| fim.rescan_interval);
-
         let mut sensor = Self {
-            fim: None,
-            watcher: None,
-            notifications: None,
+            fim_updates: None,
+            fim_thread: None,
+            fim_shutdown: Arc::new(AtomicBool::new(false)),
+            fim_running: Arc::new(AtomicBool::new(true)),
+            fim_counters: FimCounters::default(),
             tailers: settings.auth_files.iter().map(Tailer::new).collect(),
             journal: None,
-            startup_findings: Vec::new(),
             processes: settings.process_monitoring.then(|| {
                 process::Watcher::new(settings.proc_root.clone(), settings.process_limits)
             }),
-            next_rescan: now + rescan_interval,
-            next_sweep: now,
+            next_sweep: Instant::now(),
             stats: HidsStats {
                 enabled: true,
                 ..HidsStats::default()
@@ -187,20 +447,7 @@ impl HostSensor {
         };
 
         if let Some(fim_settings) = sensor.settings.fim.clone() {
-            let baseline = fim::Baseline::open(fim_settings.baseline_path.as_deref())?;
-            let mut monitor = fim::Monitor::new(fim_settings.clone(), baseline);
-
-            // Establish (or refresh) the baseline before watching. Doing it in
-            // this order is what catches changes made while the sensor was
-            // down: the first comparison happens against what we stored last
-            // time, not against what we are about to see.
-            let outcome = monitor.rescan(FimDetection::BaselineRescan)?;
-            sensor.stats.rescans += 1;
-            sensor.stats.baseline_entries = monitor.baseline().len().unwrap_or(0);
-            sensor.startup_findings = outcome.events;
-
-            sensor.fim = Some(monitor);
-            sensor.install_watcher(&fim_settings);
+            sensor.spawn_fim(&fim_settings)?;
         }
 
         if sensor.settings.journald {
@@ -218,58 +465,40 @@ impl HostSensor {
         Ok(sensor)
     }
 
-    /// Attach the real-time watcher, counting rather than failing on the paths
-    /// it cannot take.
-    fn install_watcher(&mut self, settings: &FimSettings) {
+    /// Put the FIM worker on its own thread.
+    fn spawn_fim(&mut self, settings: &FimSettings) -> Result<(), HostError> {
+        // Opening the baseline happens here, on the caller's thread, so a
+        // broken store is a startup error rather than a silent thread death.
+        let mut worker = FimWorker::start(settings)?;
+        self.fim_counters = worker.counters();
+        // Shutting the sensor down must abandon an in-flight scan, not wait
+        // for it: hashing `/usr/bin` takes longer than a service manager's
+        // patience.
+        self.fim_running = worker.running_flag();
+
         let (sender, receiver) = std::sync::mpsc::sync_channel(CHANNEL_DEPTH);
-        let forwarder = move |event| {
-            // A full channel means we are behind. Dropping is the right answer —
-            // blocking here would stall the watcher thread and make the kernel
-            // queue overflow, which is strictly worse — and the rescan is the
-            // backstop that makes the drop recoverable.
-            let _ = SyncSender::try_send(&sender, event);
-        };
-
-        let mut watcher = match notify::recommended_watcher(forwarder) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "real-time file watching unavailable; the periodic rescan still runs"
-                );
-                self.stats.watch_failures += 1;
-                return;
-            }
-        };
-
-        for path in &settings.paths {
-            match watcher.watch(path, RecursiveMode::Recursive) {
-                Ok(()) => self.stats.watched_paths += 1,
-                Err(error) => {
-                    // The usual causes are a missing path or an exhausted
-                    // `max_user_watches`. Neither is fatal, and both must be
-                    // visible: an unwatched path is a coverage gap, not a
-                    // clean bill of health.
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %error,
-                        "could not watch path; it is covered by the periodic rescan only"
-                    );
-                    self.stats.watch_failures += 1;
+        let shutdown = Arc::clone(&self.fim_shutdown);
+        let handle = std::thread::Builder::new()
+            .name("cybersentinel-fim".to_string())
+            .spawn(move || {
+                while !shutdown.load(Ordering::Relaxed) {
+                    let update = worker.tick(Instant::now());
+                    // Always send: even an empty update carries counters, which
+                    // is how the baseline-entry count reaches `stats`.
+                    if sender.try_send(update).is_err() {
+                        // The receiver is gone, or is not draining. Either way
+                        // there is nothing useful to do but carry on watching.
+                    }
+                    std::thread::sleep(FIM_TICK);
                 }
-            }
-        }
+            })
+            .map_err(|error| HostError::Watcher {
+                detail: error.to_string(),
+            })?;
 
-        self.watcher = Some(Box::new(watcher));
-        self.notifications = Some(receiver);
-    }
-
-    /// Hand out the startup rescan's findings.
-    ///
-    /// Held rather than returned from [`Self::start`] so callers have exactly
-    /// one place that consumes host events.
-    fn take_startup_findings(&mut self) -> Vec<FimEvent> {
-        std::mem::take(&mut self.startup_findings)
+        self.fim_updates = Some(receiver);
+        self.fim_thread = Some(handle);
+        Ok(())
     }
 
     /// The counters so far.
@@ -285,142 +514,45 @@ impl HostSensor {
 
     /// [`Self::poll`] with an injected clock, so timer behaviour is testable.
     pub fn poll_at(&mut self, now: Instant) -> HostBatch {
-        let mut batch = HostBatch {
-            fim: self.take_startup_findings(),
-            ..HostBatch::default()
-        };
-        self.stats.fim_rescan += batch.fim.len() as u64;
-
-        batch.absorb(self.poll_notifications());
-        if now >= self.next_rescan {
-            batch.absorb(self.run_rescan(FimDetection::BaselineRescan));
-            self.next_rescan = now
-                + self
-                    .settings
-                    .fim
-                    .as_ref()
-                    .map_or(fim::DEFAULT_RESCAN_INTERVAL, |fim| fim.rescan_interval);
-        }
-        batch.absorb(self.poll_logs());
+        let mut batch = HostBatch::default();
+        self.drain_fim(&mut batch);
+        self.poll_logs(&mut batch);
         if self.processes.is_some() && now >= self.next_sweep {
-            batch.absorb(self.sweep_processes());
+            self.sweep_processes(&mut batch);
             self.next_sweep = now + self.settings.process_interval;
         }
-
         batch
     }
 
-    /// Drain pending real-time notifications.
-    fn poll_notifications(&mut self) -> HostBatch {
-        let mut batch = HostBatch::default();
-        let mut overflowed = false;
-
-        for _ in 0..MAX_NOTIFICATIONS_PER_POLL {
-            let Some(receiver) = self.notifications.as_ref() else {
-                break;
-            };
+    /// Collect whatever the FIM thread has finished.
+    fn drain_fim(&mut self, batch: &mut HostBatch) {
+        let Some(receiver) = self.fim_updates.as_ref() else {
+            return;
+        };
+        loop {
             match receiver.try_recv() {
-                Ok(notification) => {
-                    let (events, overflow) = self.handle_notification(notification);
-                    batch.fim.extend(events);
-                    overflowed |= overflow;
+                Ok(update) => {
+                    batch.events_from(update, &mut self.fim_counters);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    // The watcher thread is gone. Rescans continue, but the
-                    // loss of real-time coverage must not be silent.
-                    tracing::warn!("file watcher stopped; falling back to periodic rescan only");
-                    self.stats.watch_failures += 1;
-                    self.notifications = None;
-                    self.watcher = None;
+                    tracing::error!("the file integrity thread stopped");
+                    self.fim_updates = None;
                     break;
                 }
             }
         }
-
-        if overflowed {
-            // Point 1 of the overflow contract: find what was dropped.
-            batch.absorb(self.run_rescan(FimDetection::BaselineRescan));
-            batch.overflows += 1;
-        }
-        batch
-    }
-
-    /// Turn one notification into events, and say whether it was an overflow.
-    ///
-    /// Split out so the overflow path can be exercised directly: inducing a
-    /// real `IN_Q_OVERFLOW` in a test would need to outrun the kernel's queue,
-    /// which is neither reliable nor fast.
-    pub fn handle_notification(
-        &mut self,
-        notification: notify::Result<notify::Event>,
-    ) -> (Vec<FimEvent>, bool) {
-        let event = match notification {
-            Ok(event) => event,
-            Err(error) => {
-                // notify reports queue overflow as an error on some backends
-                // and as a rescan flag on others. Both must reach the same
-                // handler, or the platform decides whether we notice.
-                tracing::warn!(error = %error, "file watcher error");
-                self.stats.watch_failures += 1;
-                return (Vec::new(), true);
-            }
-        };
-
-        if event.need_rescan() {
-            // Point 2: report the gap. The count is the report; the caller
-            // turns it into an event so it appears in the stream.
-            tracing::warn!(
-                "file watch queue overflowed; changes were dropped — forcing a baseline rescan"
-            );
-            self.stats.inotify_overflows += 1;
-            return (Vec::new(), true);
-        }
-
-        let Some(monitor) = self.fim.as_mut() else {
-            return (Vec::new(), false);
-        };
-
-        // Whatever the notification claims happened, the baseline decides. A
-        // notification is a hint about *where* to look, never about *what*
-        // changed — the hashes settle that.
-        let mut events = Vec::new();
-        for path in &event.paths {
-            match monitor.recheck(path) {
-                Ok(Some(event)) => events.push(event),
-                Ok(None) => {}
-                Err(error) => tracing::warn!(error = %error, "rechecking a changed path"),
-            }
-        }
-        self.stats.fim_realtime += events.len() as u64;
-        (events, false)
-    }
-
-    /// Run a baseline rescan now.
-    fn run_rescan(&mut self, detected_by: FimDetection) -> HostBatch {
-        let Some(monitor) = self.fim.as_mut() else {
-            return HostBatch::default();
-        };
-        match monitor.rescan(detected_by) {
-            Ok(outcome) => {
-                self.stats.rescans += 1;
-                self.stats.fim_rescan += outcome.events.len() as u64;
-                self.stats.baseline_entries = monitor.baseline().len().unwrap_or(0);
-                HostBatch {
-                    fim: outcome.events,
-                    ..HostBatch::default()
-                }
-            }
-            Err(error) => {
-                tracing::error!(error = %error, "baseline rescan failed");
-                HostBatch::default()
-            }
-        }
+        self.stats.watched_paths = self.fim_counters.watched_paths;
+        self.stats.watch_failures = self.fim_counters.watch_failures;
+        self.stats.fim_realtime = self.fim_counters.realtime;
+        self.stats.fim_rescan = self.fim_counters.rescan;
+        self.stats.inotify_overflows = self.fim_counters.overflows;
+        self.stats.rescans = self.fim_counters.rescans;
+        self.stats.baseline_entries = self.fim_counters.baseline_entries;
     }
 
     /// Read whatever the log sources have produced.
-    fn poll_logs(&mut self) -> HostBatch {
-        let mut batch = HostBatch::default();
+    fn poll_logs(&mut self, batch: &mut HostBatch) {
         let mut budget = MAX_LOG_LINES_PER_POLL;
 
         for index in 0..self.tailers.len() {
@@ -470,20 +602,37 @@ impl HostSensor {
                 }
             }
         }
-
-        batch
     }
 
     /// Take one `/proc` sweep.
-    fn sweep_processes(&mut self) -> HostBatch {
+    fn sweep_processes(&mut self, batch: &mut HostBatch) {
         let Some(watcher) = self.processes.as_mut() else {
-            return HostBatch::default();
+            return;
         };
         let outcome = watcher.sweep();
         self.stats.process_events += outcome.events.len() as u64;
-        HostBatch {
-            process: outcome.events,
-            ..HostBatch::default()
+        batch.process.extend(outcome.events);
+    }
+}
+
+impl HostBatch {
+    /// Fold one FIM update in, updating the running counters.
+    fn events_from(&mut self, update: FimUpdate, counters: &mut FimCounters) {
+        self.fim.extend(update.events);
+        self.overflows += update.overflows;
+        *counters = update.counters;
+    }
+}
+
+impl Drop for HostSensor {
+    fn drop(&mut self) {
+        self.fim_shutdown.store(true, Ordering::Relaxed);
+        self.fim_running.store(false, Ordering::Relaxed);
+        // Dropping the receiver first would leave the worker sending into a
+        // closed channel for up to one tick, which is harmless; joining keeps
+        // the baseline's SQLite handle from outliving the sensor.
+        if let Some(handle) = self.fim_thread.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -499,7 +648,7 @@ impl HostSensor {
 /// across distributions, and the sensor's promise is a standalone install with
 /// no prerequisites. A subprocess that is absent simply means this source is
 /// unavailable and the configured log files carry the load — which is exactly
-/// what happens on a non-systemd host.
+/// what happens on a host without systemd.
 #[derive(Debug)]
 struct JournalReader {
     child: std::process::Child,
@@ -545,9 +694,7 @@ impl JournalReader {
                     // Bounded, and a drop on a full channel: same reasoning as
                     // the file watcher. Falling behind must not turn into
                     // unbounded memory.
-                    if sender.try_send(line).is_err() {
-                        continue;
-                    }
+                    let _ = sender.try_send(line);
                 }
             })
             .map_err(|error| error.to_string())?;
@@ -592,15 +739,34 @@ mod tests {
         file.write_all(contents.as_bytes()).expect("write");
     }
 
-    fn fim_settings(root: &std::path::Path) -> HostSettings {
-        HostSettings {
-            fim: Some(FimSettings {
-                paths: vec![root.to_path_buf()],
-                ..FimSettings::default()
-            }),
-            ..HostSettings::default()
+    fn fim_settings(root: &std::path::Path) -> FimSettings {
+        FimSettings {
+            paths: vec![root.to_path_buf()],
+            ..FimSettings::default()
         }
     }
+
+    /// Wait for a condition the FIM thread will eventually satisfy.
+    ///
+    /// The worker runs on its own clock, so tests wait on the outcome rather
+    /// than on a fixed sleep.
+    fn poll_until(
+        sensor: &mut HostSensor,
+        mut done: impl FnMut(&HostBatch) -> bool,
+    ) -> Option<HostBatch> {
+        for _ in 0..200 {
+            let batch = sensor.poll();
+            if done(&batch) {
+                return Some(batch);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    // -----------------------------------------------------------------------
+    // the overflow contract
+    // -----------------------------------------------------------------------
 
     /// **inotify-overflow-isn't-silent.**
     ///
@@ -612,28 +778,33 @@ mod tests {
         let target = dir.path().join("passwd");
         write(&target, "root:x:0:0");
 
-        let mut sensor = HostSensor::start(fim_settings(dir.path())).expect("sensor");
-        sensor.poll(); // consume the startup baseline
+        let mut worker = FimWorker::start(&fim_settings(dir.path())).expect("worker");
+        worker.tick(Instant::now()); // establishes the baseline
 
-        // A change the watcher never told us about, because the queue overflowed.
+        // A change the watcher never told us about, because the queue
+        // overflowed and the kernel dropped the notification.
         write(&target, "root:x:0:0\nbackdoor:x:0:0");
 
         let overflow = notify::Event::new(EventKind::Other).set_flag(Flag::Rescan);
-        let (events, forced) = sensor.handle_notification(Ok(overflow));
-
+        let (events, forced) = worker.handle_notification(Ok(overflow));
         assert!(events.is_empty(), "the overflow itself carries no paths");
         assert!(forced, "and it must force a rescan");
         assert_eq!(
-            sensor.stats().inotify_overflows,
+            worker.counters().overflows,
             1,
             "a dropped-event window must be counted, not swallowed"
         );
 
-        // The rescan the overflow forced finds the change the kernel dropped.
-        let found = sensor.run_rescan(FimDetection::BaselineRescan);
+        // The next tick runs the forced rescan, which finds what was dropped
+        // and reports the overflow alongside it.
+        let update = worker.tick(Instant::now());
+        assert_eq!(
+            update.overflows, 1,
+            "the gap must be reported, not just recovered from"
+        );
         assert!(
-            found
-                .fim
+            update
+                .events
                 .iter()
                 .any(|event| event.change == FileChange::Modified
                     && event.path == target.to_string_lossy()),
@@ -647,34 +818,36 @@ mod tests {
     fn a_watcher_error_also_forces_a_rescan() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("a"), "x");
-        let mut sensor = HostSensor::start(fim_settings(dir.path())).expect("sensor");
+        let mut worker = FimWorker::start(&fim_settings(dir.path())).expect("worker");
 
-        let (_, forced) = sensor.handle_notification(Err(notify::Error::generic("backend died")));
+        let (_, forced) = worker.handle_notification(Err(notify::Error::generic("backend died")));
         assert!(forced);
-        assert_eq!(sensor.stats().watch_failures, 1);
+        assert_eq!(worker.counters().watch_failures, 1);
     }
 
-    /// **real-time-missed-it → periodic-rescan-caught-it**, end to end through
-    /// the sensor rather than through the FIM monitor alone.
+    /// **real-time-missed-it → periodic-rescan-caught-it**, through the worker.
     #[test]
-    fn a_change_made_before_startup_is_reported_on_the_first_poll() {
+    fn a_change_made_while_the_sensor_was_down_is_found_on_the_first_tick() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = dir.path().join("baseline.db");
         let watched = dir.path().join("etc");
         let target = watched.join("sudoers");
         write(&target, "root ALL=(ALL) ALL");
 
-        let settings = HostSettings {
-            fim: Some(FimSettings {
-                paths: vec![watched],
-                baseline_path: Some(store),
-                ..FimSettings::default()
-            }),
-            ..HostSettings::default()
+        let settings = FimSettings {
+            paths: vec![watched],
+            baseline_path: Some(store),
+            ..FimSettings::default()
         };
 
         // First run establishes the baseline, then goes away.
-        drop(HostSensor::start(settings.clone()).expect("sensor"));
+        {
+            let mut worker = FimWorker::start(&settings).expect("worker");
+            assert!(
+                worker.tick(Instant::now()).events.is_empty(),
+                "establishing a baseline is not a wall of alerts"
+            );
+        }
 
         // Nothing is watching.
         write(
@@ -682,39 +855,112 @@ mod tests {
             "root ALL=(ALL) ALL\nattacker ALL=(ALL) NOPASSWD: ALL",
         );
 
-        let mut sensor = HostSensor::start(settings).expect("sensor");
-        let batch = sensor.poll();
+        let mut worker = FimWorker::start(&settings).expect("worker");
+        let update = worker.tick(Instant::now());
 
-        assert_eq!(batch.fim.len(), 1, "the offline change must surface");
-        assert_eq!(batch.fim[0].change, FileChange::Modified);
-        assert_eq!(batch.fim[0].detected_by, FimDetection::BaselineRescan);
-        assert!(sensor.stats().rescans >= 1);
+        assert_eq!(update.events.len(), 1, "the offline change must surface");
+        assert_eq!(update.events[0].change, FileChange::Modified);
+        assert_eq!(
+            update.events[0].detected_by,
+            FimDetection::BaselineRescan,
+            "and it must be labelled as found by rescan, not claimed as real-time"
+        );
     }
 
     #[test]
-    fn a_first_start_reports_nothing_and_establishes_the_baseline() {
+    fn the_first_tick_does_not_rescan_again_immediately() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("a"), "x");
-        write(&dir.path().join("b"), "y");
+        let mut worker = FimWorker::start(&FimSettings {
+            rescan_interval: Duration::from_secs(3_600),
+            ..fim_settings(dir.path())
+        })
+        .expect("worker");
 
-        let mut sensor = HostSensor::start(fim_settings(dir.path())).expect("sensor");
-        assert!(sensor.poll().is_empty());
-        assert_eq!(sensor.stats().baseline_entries, 2);
+        let start = Instant::now();
+        worker.tick(start);
+        worker.tick(start);
+        assert_eq!(
+            worker.counters().rescans,
+            1,
+            "the rescan interval must be honoured after the first scan"
+        );
     }
 
     #[test]
     fn an_unwatchable_path_is_counted_not_fatal() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let settings = HostSettings {
+        let worker = FimWorker::start(&FimSettings {
+            paths: vec![dir.path().join("does-not-exist")],
+            ..FimSettings::default()
+        })
+        .expect("a degraded worker still starts");
+        assert_eq!(worker.counters().watch_failures, 1);
+        assert_eq!(worker.counters().watched_paths, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // the sensor
+    // -----------------------------------------------------------------------
+
+    /// Starting must not block on hashing. A baseline over `/usr/bin` takes
+    /// seconds to minutes; paying that on the caller's thread would stall
+    /// packet capture and look like a hang.
+    #[test]
+    fn starting_does_not_wait_for_the_baseline_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..200 {
+            write(&dir.path().join(format!("file{index}")), &"x".repeat(4_096));
+        }
+
+        let before = Instant::now();
+        let sensor = HostSensor::start(HostSettings {
+            fim: Some(fim_settings(dir.path())),
+            ..HostSettings::default()
+        })
+        .expect("sensor");
+        let elapsed = before.elapsed();
+        drop(sensor);
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "start took {elapsed:?}; the scan belongs on the FIM thread"
+        );
+    }
+
+    #[test]
+    fn a_change_reaches_the_caller_through_the_worker_thread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("passwd");
+        write(&target, "root:x:0:0");
+
+        let mut sensor = HostSensor::start(HostSettings {
             fim: Some(FimSettings {
-                paths: vec![dir.path().join("does-not-exist")],
-                ..FimSettings::default()
+                rescan_interval: Duration::from_millis(50),
+                ..fim_settings(dir.path())
             }),
             ..HostSettings::default()
-        };
-        let sensor = HostSensor::start(settings).expect("a degraded sensor still starts");
-        assert_eq!(sensor.stats().watch_failures, 1);
-        assert_eq!(sensor.stats().watched_paths, 0);
+        })
+        .expect("sensor");
+
+        // Wait for the baseline to be established before changing anything,
+        // or the change would simply be part of the starting position.
+        for _ in 0..200 {
+            sensor.poll();
+            if sensor.stats().rescans >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(sensor.stats().rescans >= 1, "the baseline never settled");
+        write(&target, "root:x:0:0\nbackdoor:x:0:0");
+
+        let batch = poll_until(&mut sensor, |batch| !batch.fim.is_empty())
+            .expect("the change must reach the caller");
+        assert!(batch
+            .fim
+            .iter()
+            .any(|event| event.change == FileChange::Modified));
     }
 
     #[test]

@@ -79,6 +79,10 @@ paths:
   log-dir: "{logs}"
 rules:
   files: []
+hids:
+  # These tests exercise the network path. Host monitoring is switched off so
+  # they neither hash the machine's real /etc nor depend on what is in it.
+  enabled: false
 outputs:
   stdout:
     enabled: true
@@ -323,7 +327,7 @@ fn stream_dumping_is_off_unless_asked_for() {
     std::fs::write(
         &config_path,
         format!(
-            "paths:\n  data-dir: \"{}\"\n  log-dir: \"{}\"\nrules:\n  files: []\noutputs:\n  file:\n    enabled: false\nlogging:\n  level: warn\n",
+            "paths:\n  data-dir: \"{}\"\n  log-dir: \"{}\"\nrules:\n  files: []\nhids:\n  enabled: false\noutputs:\n  file:\n    enabled: false\nlogging:\n  level: warn\n",
             scratch.yaml_path("data"),
             scratch.yaml_path("logs"),
         ),
@@ -359,7 +363,7 @@ fn enabling_the_dump_warns_that_payload_is_being_written() {
     std::fs::write(
         &config_path,
         format!(
-            "paths:\n  data-dir: \"{}\"\n  log-dir: \"{}\"\nrules:\n  files: []\noutputs:\n  file:\n    enabled: false\n",
+            "paths:\n  data-dir: \"{}\"\n  log-dir: \"{}\"\nrules:\n  files: []\nhids:\n  enabled: false\noutputs:\n  file:\n    enabled: false\n",
             scratch.yaml_path("data"),
             scratch.yaml_path("logs"),
         ),

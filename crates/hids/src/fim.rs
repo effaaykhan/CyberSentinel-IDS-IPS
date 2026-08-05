@@ -351,13 +351,18 @@ pub struct WalkLimits {
     pub unreadable: u64,
     /// Symlinks not followed.
     pub symlinks_skipped: u64,
+    /// The scan was asked to stop before it finished.
+    pub abandoned: bool,
 }
 
 impl WalkLimits {
     /// Whether anything was left out.
     #[must_use]
     pub fn truncated(&self) -> bool {
-        self.over_entry_limit > 0 || self.over_depth_limit > 0 || self.unreadable > 0
+        self.abandoned
+            || self.over_entry_limit > 0
+            || self.over_depth_limit > 0
+            || self.unreadable > 0
     }
 }
 
@@ -468,6 +473,25 @@ impl Monitor {
     /// nothing. Every file on the box is not a thousand alerts; it is the
     /// starting position.
     pub fn rescan(&mut self, detected_by: FimDetection) -> Result<RescanOutcome, HostError> {
+        self.rescan_until(detected_by, &mut || true)
+    }
+
+    /// [`Self::rescan`], abandoned as soon as `should_continue` says stop.
+    ///
+    /// A first scan of `/etc` and `/usr/bin` hashes tens of thousands of files
+    /// and takes real time. Without a way to abandon it, shutdown would have to
+    /// wait for it to finish — a sensor that ignores SIGTERM for a minute is a
+    /// sensor a service manager kills, and an operator distrusts.
+    ///
+    /// An abandoned scan is treated exactly like one that hit a bound: partial
+    /// results, `limits.truncated()` set, and therefore no deletions inferred.
+    /// What was recorded still lands in the baseline, so the next run resumes
+    /// from a better starting point rather than from nothing.
+    pub fn rescan_until(
+        &mut self,
+        detected_by: FimDetection,
+        should_continue: &mut dyn FnMut() -> bool,
+    ) -> Result<RescanOutcome, HostError> {
         let establishing = self.baseline.is_empty()?;
         let (paths, limits) = walk(&self.settings.paths, &self.settings);
         let mut outcome = RescanOutcome {
@@ -477,6 +501,13 @@ impl Monitor {
 
         let mut seen = BTreeSet::new();
         for path in paths {
+            if !should_continue() {
+                // Abandoned, not finished. Saying so is what stops the
+                // deletion pass below from reading "we stopped looking" as
+                // "everything else is gone".
+                outcome.limits.abandoned = true;
+                return Ok(outcome);
+            }
             let key = path.to_string_lossy().into_owned();
             seen.insert(key.clone());
             outcome.files_seen += 1;
@@ -925,6 +956,56 @@ mod tests {
     /// A truncated walk must not be read as mass deletion. Otherwise an
     /// attacker who can make the walk hit its bound gets to bury a real change
     /// under thousands of fabricated ones.
+    /// Shutdown must not have to wait for a scan of `/usr/bin` to finish.
+    #[test]
+    fn a_scan_can_be_abandoned_partway_and_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..50 {
+            write(&dir.path().join(format!("file{index}")), "x");
+        }
+        let mut monitor = monitor(dir.path());
+
+        let mut remaining = 5;
+        let outcome = monitor
+            .rescan_until(FimDetection::BaselineRescan, &mut || {
+                remaining -= 1;
+                remaining > 0
+            })
+            .expect("scan");
+
+        assert!(outcome.limits.abandoned);
+        assert!(outcome.limits.truncated());
+        assert!(outcome.files_seen < 50, "it stopped early, as asked");
+        assert!(
+            monitor.baseline().len().expect("len") > 0,
+            "what it did record still counts: the next run starts further along"
+        );
+    }
+
+    /// An abandoned scan must not read as mass deletion, for the same reason a
+    /// bounded one must not: we stopped looking, the files did not vanish.
+    #[test]
+    fn an_abandoned_scan_does_not_report_deletions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..20 {
+            write(&dir.path().join(format!("file{index}")), "x");
+        }
+        let mut monitor = monitor(dir.path());
+        monitor.rescan(FimDetection::BaselineRescan).expect("scan");
+
+        let mut remaining = 3;
+        let outcome = monitor
+            .rescan_until(FimDetection::BaselineRescan, &mut || {
+                remaining -= 1;
+                remaining > 0
+            })
+            .expect("scan");
+        assert!(outcome
+            .events
+            .iter()
+            .all(|event| event.change != FileChange::Deleted));
+    }
+
     #[test]
     fn a_truncated_walk_does_not_report_deletions() {
         let dir = tempfile::tempdir().expect("tempdir");
