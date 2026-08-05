@@ -20,6 +20,7 @@ pub mod flow;
 pub mod normalize;
 pub mod policy;
 pub mod range_buffer;
+pub mod stream;
 
 pub use flow::{EndReason, EndedFlow, Endpoint, Flow, FlowCounters, FlowId, FlowKey, FlowTable};
 pub use range_buffer::{RangeBuffer, WriteOutcome};

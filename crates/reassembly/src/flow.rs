@@ -29,6 +29,9 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
+use cybersentinel_common::config::{OverlapPolicy, ReassemblyConfig};
+
+use crate::stream::{flags, StreamCounters, StreamPair, StreamReady, TcpSegment};
 use crate::Limits;
 
 /// A flow identifier.
@@ -101,7 +104,11 @@ pub struct DirectionCounters {
 }
 
 /// A tracked conversation.
-#[derive(Debug, Clone)]
+///
+/// Deliberately **not** `Clone`: a flow owns its reassembly buffers, and a
+/// stray clone would duplicate up to the per-flow byte cap. Flows are moved out
+/// of the table when they end, never copied out of it.
+#[derive(Debug)]
 pub struct Flow {
     /// Stable identifier.
     pub id: FlowId,
@@ -123,20 +130,27 @@ pub struct Flow {
     fin_from_initiator: bool,
     /// Whether a FIN has been seen from the responder.
     fin_from_responder: bool,
-    /// Whether a RST has been seen.
+    /// Whether a RST the destination would have acted on has been seen.
     saw_reset: bool,
+    /// TCP reassembly state. `None` for anything that is not TCP.
+    streams: Option<StreamPair>,
 }
 
 impl Flow {
-    /// The 5-tuple oriented from the initiator, as events report it.
+    /// The endpoint that did not open the conversation.
     #[must_use]
-    pub fn oriented_tuple(&self) -> (Endpoint, Endpoint) {
-        let responder = if self.initiator == self.key.first {
+    pub fn responder(&self) -> Endpoint {
+        if self.initiator == self.key.first {
             self.key.second
         } else {
             self.key.first
-        };
-        (self.initiator, responder)
+        }
+    }
+
+    /// The 5-tuple oriented from the initiator, as events report it.
+    #[must_use]
+    pub fn oriented_tuple(&self) -> (Endpoint, Endpoint) {
+        (self.initiator, self.responder())
     }
 
     /// How long the flow lasted.
@@ -151,6 +165,18 @@ impl Flow {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.saw_reset || (self.fin_from_initiator && self.fin_from_responder)
+    }
+
+    /// Reassembly counters for this flow, if it is TCP.
+    #[must_use]
+    pub fn stream_counters(&self) -> Option<StreamCounters> {
+        self.streams.as_ref().map(StreamPair::counters)
+    }
+
+    /// Bytes this flow currently holds awaiting reassembly.
+    #[must_use]
+    pub fn buffered_bytes(&self) -> usize {
+        self.streams.as_ref().map_or(0, StreamPair::buffered_bytes)
     }
 
     /// The union of TCP flags, in the conventional short form.
@@ -192,12 +218,17 @@ pub enum EndReason {
 }
 
 /// A flow that has left the table and is ready to be reported.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EndedFlow {
     /// The flow as it was.
     pub flow: Flow,
     /// Why it ended.
     pub reason: EndReason,
+    /// Stream bytes that became deliverable as the flow ended.
+    ///
+    /// The tail of a conversation still has to be matched against, so what was
+    /// contiguous at the end is delivered rather than dropped with the flow.
+    pub final_ready: StreamReady,
 }
 
 /// What a packet did to the table.
@@ -222,15 +253,43 @@ pub struct FlowCounters {
     pub timed_out: u64,
     /// Flows evicted under memory pressure. **A coverage signal.**
     pub evicted: u64,
+    /// Resets ignored because the destination would not have acted on them.
+    ///
+    /// Non-zero means somebody sent a reset the sensor decided was forged —
+    /// either a broken middlebox or an attempt to make the sensor stop watching
+    /// a live connection.
+    pub resets_ignored: u64,
 }
 
 const TCP_PROTOCOL: u8 = 6;
+
+/// The IP protocol number for TCP.
+/// Everything the flow table needs to know about one packet.
+#[derive(Debug, Clone, Copy)]
+pub struct PacketSummary<'a> {
+    /// IP protocol number.
+    pub protocol: u8,
+    /// Source endpoint.
+    pub source: Endpoint,
+    /// Destination endpoint.
+    pub destination: Endpoint,
+    /// Capture timestamp.
+    pub timestamp: SystemTime,
+    /// Whole captured frame length, for flow byte counts.
+    pub frame_len: usize,
+    /// The TCP segment, for protocols that have one.
+    pub tcp: Option<TcpSegment<'a>>,
+}
 
 /// A bounded table of live flows.
 #[derive(Debug)]
 pub struct FlowTable {
     flows: HashMap<FlowKey, Flow>,
     limits: Limits,
+    reassembly: ReassemblyConfig,
+    /// Running total of bytes held in reassembly buffers, maintained
+    /// incrementally so the global cap costs nothing per packet.
+    stream_bytes: usize,
     counters: FlowCounters,
     /// Flows that have ended and not yet been reported.
     ended: Vec<EndedFlow>,
@@ -254,9 +313,17 @@ impl FlowTable {
     /// Build a table under `limits`.
     #[must_use]
     pub fn new(limits: Limits) -> Self {
+        Self::with_reassembly(limits, ReassemblyConfig::default())
+    }
+
+    /// Build a table with explicit reassembly limits.
+    #[must_use]
+    pub fn with_reassembly(limits: Limits, reassembly: ReassemblyConfig) -> Self {
         Self {
             flows: HashMap::new(),
             limits,
+            reassembly,
+            stream_bytes: 0,
             counters: FlowCounters::default(),
             ended: Vec::new(),
             last_sweep: None,
@@ -302,70 +369,100 @@ impl FlowTable {
     /// otherwise.
     pub fn observe(
         &mut self,
-        protocol: u8,
-        source: Endpoint,
-        destination: Endpoint,
-        timestamp: SystemTime,
-        frame_len: usize,
-        tcp_flags: Option<u8>,
+        packet: &PacketSummary<'_>,
+        policy: &dyn Fn(IpAddr) -> OverlapPolicy,
+        ready: &mut StreamReady,
     ) -> Observed {
-        self.maybe_sweep(timestamp);
+        self.maybe_sweep(packet.timestamp);
 
-        let key = FlowKey::new(protocol, source, destination);
+        let key = FlowKey::new(packet.protocol, packet.source, packet.destination);
         let is_new = !self.flows.contains_key(&key);
         if is_new {
-            self.make_room(timestamp);
+            self.make_room(packet.timestamp);
         }
 
         let counters = &mut self.counters;
+        let reassembly = &self.reassembly;
         let flow = self.flows.entry(key).or_insert_with(|| {
             counters.created += 1;
             Flow {
-                id: FlowId(derive_flow_id(&key, timestamp)),
+                id: FlowId(derive_flow_id(&key, packet.timestamp)),
                 key,
-                initiator: source,
-                start: timestamp,
-                last_seen: timestamp,
+                initiator: packet.source,
+                start: packet.timestamp,
+                last_seen: packet.timestamp,
                 to_server: DirectionCounters::default(),
                 to_client: DirectionCounters::default(),
                 tcp_flags_seen: 0,
                 fin_from_initiator: false,
                 fin_from_responder: false,
                 saw_reset: false,
+                streams: (packet.protocol == TCP_PROTOCOL).then(|| StreamPair::new(reassembly)),
             }
         });
 
-        let to_server = source == flow.initiator;
+        let to_server = packet.source == flow.initiator;
         let direction = if to_server {
             &mut flow.to_server
         } else {
             &mut flow.to_client
         };
         direction.packets += 1;
-        direction.bytes += frame_len as u64;
+        direction.bytes += packet.frame_len as u64;
 
         // Capture timestamps are not guaranteed monotonic (multiple queues, a
         // stepped clock), so never let `last_seen` go backwards — a flow that
         // appears to end before it started would produce nonsense durations.
-        if timestamp > flow.last_seen {
-            flow.last_seen = timestamp;
+        if packet.timestamp > flow.last_seen {
+            flow.last_seen = packet.timestamp;
         }
 
-        if let Some(flags) = tcp_flags {
-            flow.tcp_flags_seen |= flags;
-            const FIN: u8 = 0b0000_0001;
-            const RST: u8 = 0b0000_0100;
-            if flags & FIN != 0 {
+        let buffered_before = flow.buffered_bytes();
+
+        if let Some(segment) = &packet.tcp {
+            flow.tcp_flags_seen |= segment.flags;
+
+            if segment.has(flags::FIN) {
                 if to_server {
                     flow.fin_from_initiator = true;
                 } else {
                     flow.fin_from_responder = true;
                 }
             }
-            if flags & RST != 0 {
+
+            // Each direction is resolved by the policy of the host *receiving*
+            // it — two stacks, two answers. Resolved before borrowing the
+            // stream pair, which needs the flow mutably.
+            let policy_to_server = policy(flow.responder().0);
+            let policy_to_client = policy(flow.initiator.0);
+
+            if let Some(streams) = &mut flow.streams {
+                streams.push(
+                    to_server,
+                    segment,
+                    policy_to_server,
+                    policy_to_client,
+                    ready,
+                );
+
+                // A reset only ends the connection if the destination would
+                // have acted on it. Believing a forged one stops the sensor
+                // watching a live conversation, which is the whole point of the
+                // technique.
+                if segment.has(flags::RST) {
+                    if streams.rst_should_close(to_server, segment.sequence) {
+                        flow.saw_reset = true;
+                    } else {
+                        self.counters.resets_ignored += 1;
+                    }
+                }
+            } else if segment.has(flags::RST) {
                 flow.saw_reset = true;
             }
         }
+
+        let buffered_after = flow.buffered_bytes();
+        self.stream_bytes = self.stream_bytes + buffered_after - buffered_before;
 
         let observed = Observed {
             flow_id: flow.id,
@@ -376,14 +473,29 @@ impl FlowTable {
         if flow.is_closed() {
             if let Some(flow) = self.flows.remove(&key) {
                 self.counters.closed += 1;
-                self.ended.push(EndedFlow {
-                    flow,
-                    reason: EndReason::Closed,
-                });
+                self.end_flow(flow, EndReason::Closed);
             }
         }
 
         observed
+    }
+
+    /// Move a flow out of the table, flushing whatever it can still deliver.
+    fn end_flow(&mut self, mut flow: Flow, reason: EndReason) {
+        // Read the byte total *before* flushing: flushing empties the buffers,
+        // so measuring afterwards would always subtract zero and the global
+        // counter would ratchet upwards for ever.
+        let released = flow.buffered_bytes();
+        let mut final_ready = StreamReady::default();
+        if let Some(streams) = &mut flow.streams {
+            streams.flush(&mut final_ready);
+        }
+        self.stream_bytes = self.stream_bytes.saturating_sub(released);
+        self.ended.push(EndedFlow {
+            flow,
+            reason,
+            final_ready,
+        });
     }
 
     /// Expire flows idle past the timeout, if a sweep is due.
@@ -403,32 +515,34 @@ impl FlowTable {
     pub fn sweep(&mut self, now: SystemTime) {
         self.last_sweep = Some(now);
         let timeout = self.limits.flow_timeout;
-        let ended = &mut self.ended;
-        let counters = &mut self.counters;
 
-        self.flows.retain(|_, flow| {
-            let idle = now.duration_since(flow.last_seen).unwrap_or_default();
-            if idle < timeout {
-                return true;
+        // Collect then remove, rather than `retain` with a clone: a flow owns
+        // its reassembly buffers and copying them out would double the memory
+        // this whole design exists to bound.
+        let expired: Vec<FlowKey> = self
+            .flows
+            .iter()
+            .filter(|(_, flow)| now.duration_since(flow.last_seen).unwrap_or_default() >= timeout)
+            .map(|(key, _)| *key)
+            .collect();
+
+        for key in expired {
+            if let Some(flow) = self.flows.remove(&key) {
+                self.counters.timed_out += 1;
+                self.end_flow(flow, EndReason::TimedOut);
             }
-            counters.timed_out += 1;
-            ended.push(EndedFlow {
-                flow: flow.clone(),
-                reason: EndReason::TimedOut,
-            });
-            false
-        });
+        }
     }
 
     /// Make space for one more flow, evicting a batch if the table is full.
     fn make_room(&mut self, now: SystemTime) {
-        if self.flows.len() < self.limits.max_flows {
+        if self.within_limits() {
             return;
         }
 
         // A timeout sweep may free everything needed without losing a live flow.
         self.sweep(now);
-        if self.flows.len() < self.limits.max_flows {
+        if self.within_limits() {
             return;
         }
 
@@ -445,28 +559,40 @@ impl FlowTable {
         for (_, key) in by_age.into_iter().take(batch) {
             if let Some(flow) = self.flows.remove(&key) {
                 self.counters.evicted += 1;
-                self.ended.push(EndedFlow {
-                    flow,
-                    reason: EndReason::Evicted,
-                });
+                self.end_flow(flow, EndReason::Evicted);
             }
         }
 
         tracing::warn!(
             evicted = batch,
+            flows = self.flows.len(),
             capacity = self.limits.max_flows,
+            stream_bytes = self.stream_bytes,
             "flow table is full; evicting live flows — visibility is being lost"
         );
     }
 
+    /// Whether the table is inside both its flow count and byte budgets.
+    ///
+    /// Two separate ceilings: an attacker can exhaust either a few flows each
+    /// holding a lot, or many flows each holding a little.
+    fn within_limits(&self) -> bool {
+        self.flows.len() < self.limits.max_flows
+            && self.stream_bytes < self.reassembly.max_stream_bytes_total
+    }
+
     /// End every remaining flow, for shutdown or end of capture.
     pub fn flush(&mut self) {
-        for (_, flow) in self.flows.drain() {
-            self.ended.push(EndedFlow {
-                flow,
-                reason: EndReason::SensorStopped,
-            });
+        let flows: Vec<Flow> = self.flows.drain().map(|(_, flow)| flow).collect();
+        for flow in flows {
+            self.end_flow(flow, EndReason::SensorStopped);
         }
+    }
+
+    /// Bytes held across every flow's reassembly buffers.
+    #[must_use]
+    pub fn buffered_bytes(&self) -> usize {
+        self.stream_bytes
     }
 }
 
@@ -514,6 +640,57 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    /// Phase 1's call shape, kept for the tests that predate stream
+    /// reassembly: a control packet with no payload.
+    fn observe(
+        table: &mut FlowTable,
+        protocol: u8,
+        source: Endpoint,
+        destination: Endpoint,
+        timestamp: SystemTime,
+        frame_len: usize,
+        tcp_flags: Option<u8>,
+    ) -> Observed {
+        observe_segment(
+            table,
+            protocol,
+            source,
+            destination,
+            timestamp,
+            frame_len,
+            tcp_flags.map(|flags| TcpSegment {
+                sequence: 0,
+                acknowledgment: 0,
+                flags,
+                payload: b"",
+            }),
+        )
+    }
+
+    fn observe_segment(
+        table: &mut FlowTable,
+        protocol: u8,
+        source: Endpoint,
+        destination: Endpoint,
+        timestamp: SystemTime,
+        frame_len: usize,
+        tcp: Option<TcpSegment<'_>>,
+    ) -> Observed {
+        let mut ready = StreamReady::default();
+        table.observe(
+            &PacketSummary {
+                protocol,
+                source,
+                destination,
+                timestamp,
+                frame_len,
+                tcp,
+            },
+            &|_| OverlapPolicy::First,
+            &mut ready,
+        )
+    }
+
     const TCP: u8 = 6;
     const UDP: u8 = 17;
     const SYN: u8 = 0b0000_0010;
@@ -543,8 +720,8 @@ mod tests {
         let client = endpoint(1, 51_000);
         let server = endpoint(2, 80);
 
-        let first = table.observe(TCP, client, server, at(0), 74, Some(SYN));
-        let reply = table.observe(TCP, server, client, at(1), 74, Some(SYN | ACK));
+        let first = observe(&mut table, TCP, client, server, at(0), 74, Some(SYN));
+        let reply = observe(&mut table, TCP, server, client, at(1), 74, Some(SYN | ACK));
 
         assert_eq!(
             first.flow_id, reply.flow_id,
@@ -564,8 +741,24 @@ mod tests {
     #[test]
     fn a_different_port_is_a_different_flow() {
         let mut table = table(100, 300);
-        let a = table.observe(TCP, endpoint(1, 51_000), endpoint(2, 80), at(0), 74, None);
-        let b = table.observe(TCP, endpoint(1, 51_001), endpoint(2, 80), at(0), 74, None);
+        let a = observe(
+            &mut table,
+            TCP,
+            endpoint(1, 51_000),
+            endpoint(2, 80),
+            at(0),
+            74,
+            None,
+        );
+        let b = observe(
+            &mut table,
+            TCP,
+            endpoint(1, 51_001),
+            endpoint(2, 80),
+            at(0),
+            74,
+            None,
+        );
         assert_ne!(a.flow_id, b.flow_id);
         assert_eq!(table.len(), 2);
     }
@@ -573,8 +766,24 @@ mod tests {
     #[test]
     fn the_same_ports_on_a_different_protocol_are_different_flows() {
         let mut table = table(100, 300);
-        let tcp = table.observe(TCP, endpoint(1, 5_000), endpoint(2, 53), at(0), 74, None);
-        let udp = table.observe(UDP, endpoint(1, 5_000), endpoint(2, 53), at(0), 74, None);
+        let tcp = observe(
+            &mut table,
+            TCP,
+            endpoint(1, 5_000),
+            endpoint(2, 53),
+            at(0),
+            74,
+            None,
+        );
+        let udp = observe(
+            &mut table,
+            UDP,
+            endpoint(1, 5_000),
+            endpoint(2, 53),
+            at(0),
+            74,
+            None,
+        );
         assert_ne!(tcp.flow_id, udp.flow_id);
     }
 
@@ -584,9 +793,9 @@ mod tests {
         let client = endpoint(1, 51_000);
         let server = endpoint(2, 80);
 
-        table.observe(TCP, client, server, at(0), 100, None);
-        table.observe(TCP, client, server, at(1), 200, None);
-        table.observe(TCP, server, client, at(2), 1_500, None);
+        observe(&mut table, TCP, client, server, at(0), 100, None);
+        observe(&mut table, TCP, client, server, at(1), 200, None);
+        observe(&mut table, TCP, server, client, at(2), 1_500, None);
         table.flush();
 
         let ended = &table.ended_mut()[0];
@@ -603,12 +812,12 @@ mod tests {
         let client = endpoint(1, 51_000);
         let server = endpoint(2, 80);
 
-        table.observe(TCP, client, server, at(0), 74, Some(SYN));
-        table.observe(TCP, server, client, at(1), 74, Some(SYN | ACK));
-        table.observe(TCP, client, server, at(2), 74, Some(FIN | ACK));
+        observe(&mut table, TCP, client, server, at(0), 74, Some(SYN));
+        observe(&mut table, TCP, server, client, at(1), 74, Some(SYN | ACK));
+        observe(&mut table, TCP, client, server, at(2), 74, Some(FIN | ACK));
         assert_eq!(table.len(), 1, "one FIN is not a teardown");
 
-        table.observe(TCP, server, client, at(3), 74, Some(FIN | ACK));
+        observe(&mut table, TCP, server, client, at(3), 74, Some(FIN | ACK));
         assert_eq!(table.len(), 0, "FIN in both directions ends the flow");
 
         let ended = table.ended_mut();
@@ -619,32 +828,131 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_closes_the_flow_immediately() {
+    fn an_in_window_reset_closes_the_flow() {
         let mut table = table(100, 300);
-        table.observe(
+        let client = endpoint(1, 51_000);
+        let server = endpoint(2, 80);
+
+        // A full handshake, so both sequence spaces are anchored and a reset
+        // can be judged against them.
+        observe_segment(
+            &mut table,
             TCP,
-            endpoint(1, 51_000),
-            endpoint(2, 80),
+            client,
+            server,
             at(0),
             74,
-            Some(SYN),
+            Some(TcpSegment {
+                sequence: 1_000,
+                acknowledgment: 0,
+                flags: SYN,
+                payload: b"",
+            }),
         );
-        table.observe(
+        observe_segment(
+            &mut table,
             TCP,
-            endpoint(2, 80),
-            endpoint(1, 51_000),
+            server,
+            client,
             at(1),
             74,
-            Some(RST),
+            Some(TcpSegment {
+                sequence: 5_000,
+                acknowledgment: 1_001,
+                flags: SYN | ACK,
+                payload: b"",
+            }),
         );
-        assert_eq!(table.len(), 0);
+        observe_segment(
+            &mut table,
+            TCP,
+            server,
+            client,
+            at(2),
+            74,
+            Some(TcpSegment {
+                sequence: 5_001,
+                acknowledgment: 1_001,
+                flags: RST,
+                payload: b"",
+            }),
+        );
+
+        assert_eq!(
+            table.len(),
+            0,
+            "a reset the host would act on ends the flow"
+        );
         assert_eq!(table.ended_mut()[0].reason, EndReason::Closed);
+    }
+
+    /// The RST-evasion case: a blind reset with a guessed sequence number must
+    /// not make the sensor stop watching a connection the host keeps serving.
+    #[test]
+    fn an_out_of_window_reset_does_not_close_the_flow() {
+        let mut table = table(100, 300);
+        let client = endpoint(1, 51_000);
+        let server = endpoint(2, 80);
+
+        observe_segment(
+            &mut table,
+            TCP,
+            client,
+            server,
+            at(0),
+            74,
+            Some(TcpSegment {
+                sequence: 1_000,
+                acknowledgment: 0,
+                flags: SYN,
+                payload: b"",
+            }),
+        );
+        observe_segment(
+            &mut table,
+            TCP,
+            server,
+            client,
+            at(1),
+            74,
+            Some(TcpSegment {
+                sequence: 5_000,
+                acknowledgment: 1_001,
+                flags: SYN | ACK,
+                payload: b"",
+            }),
+        );
+        observe_segment(
+            &mut table,
+            TCP,
+            server,
+            client,
+            at(2),
+            74,
+            Some(TcpSegment {
+                sequence: 5_000_000,
+                acknowledgment: 0,
+                flags: RST,
+                payload: b"",
+            }),
+        );
+
+        assert_eq!(table.len(), 1, "the flow is still live and still watched");
+        assert_eq!(table.counters().resets_ignored, 1);
     }
 
     #[test]
     fn udp_flows_report_no_tcp_flags() {
         let mut table = table(100, 300);
-        table.observe(UDP, endpoint(1, 5_000), endpoint(2, 53), at(0), 74, None);
+        observe(
+            &mut table,
+            UDP,
+            endpoint(1, 5_000),
+            endpoint(2, 53),
+            at(0),
+            74,
+            None,
+        );
         table.flush();
         assert!(table.ended_mut()[0].flow.tcp_flags_string().is_none());
     }
@@ -652,7 +960,15 @@ mod tests {
     #[test]
     fn idle_flows_time_out() {
         let mut table = table(100, 60);
-        table.observe(TCP, endpoint(1, 1), endpoint(2, 2), at(0), 74, None);
+        observe(
+            &mut table,
+            TCP,
+            endpoint(1, 1),
+            endpoint(2, 2),
+            at(0),
+            74,
+            None,
+        );
 
         table.sweep(at(30));
         assert_eq!(table.len(), 1, "still within the timeout");
@@ -667,7 +983,15 @@ mod tests {
     fn a_busy_flow_is_not_timed_out() {
         let mut table = table(100, 60);
         for second in 0..200 {
-            table.observe(TCP, endpoint(1, 1), endpoint(2, 2), at(second), 74, None);
+            observe(
+                &mut table,
+                TCP,
+                endpoint(1, 1),
+                endpoint(2, 2),
+                at(second),
+                74,
+                None,
+            );
         }
         assert_eq!(table.len(), 1, "traffic keeps the flow alive across sweeps");
         assert_eq!(table.counters().timed_out, 0);
@@ -682,7 +1006,15 @@ mod tests {
 
         for i in 0..10_000u32 {
             let source = (IpAddr::V4(Ipv4Addr::from(i.to_be_bytes())), 1_234);
-            table.observe(TCP, source, endpoint(2, 80), at(0), 74, Some(SYN));
+            observe(
+                &mut table,
+                TCP,
+                source,
+                endpoint(2, 80),
+                at(0),
+                74,
+                Some(SYN),
+            );
             assert!(
                 table.len() <= CAP,
                 "table grew to {} past the cap",
@@ -703,7 +1035,8 @@ mod tests {
 
         // Ten flows, each last seen at a distinct time.
         for i in 0..10u8 {
-            table.observe(
+            observe(
+                &mut table,
                 TCP,
                 endpoint(i, 1_000),
                 endpoint(200, 80),
@@ -715,7 +1048,8 @@ mod tests {
         table.ended_mut().clear();
 
         // Refresh the oldest so it is no longer the eviction candidate.
-        table.observe(
+        observe(
+            &mut table,
             TCP,
             endpoint(0, 1_000),
             endpoint(200, 80),
@@ -726,7 +1060,8 @@ mod tests {
         table.ended_mut().clear();
 
         // One more flow forces an eviction batch.
-        table.observe(
+        observe(
+            &mut table,
             TCP,
             endpoint(99, 1_000),
             endpoint(200, 80),
@@ -753,13 +1088,22 @@ mod tests {
     fn timeouts_are_preferred_over_evicting_live_flows() {
         let mut table = table(4, 60);
         for i in 0..4u8 {
-            table.observe(TCP, endpoint(i, 1_000), endpoint(200, 80), at(0), 74, None);
+            observe(
+                &mut table,
+                TCP,
+                endpoint(i, 1_000),
+                endpoint(200, 80),
+                at(0),
+                74,
+                None,
+            );
         }
         table.ended_mut().clear();
 
         // Long after the timeout, a new flow arrives. The four idle flows
         // should be swept, not evicted: eviction is the lossy path.
-        table.observe(
+        observe(
+            &mut table,
             TCP,
             endpoint(50, 1_000),
             endpoint(200, 80),
@@ -780,7 +1124,15 @@ mod tests {
     fn flush_ends_every_remaining_flow() {
         let mut table = table(100, 300);
         for i in 0..5u8 {
-            table.observe(TCP, endpoint(i, 1_000), endpoint(200, 80), at(0), 74, None);
+            observe(
+                &mut table,
+                TCP,
+                endpoint(i, 1_000),
+                endpoint(200, 80),
+                at(0),
+                74,
+                None,
+            );
         }
         table.flush();
 
@@ -798,7 +1150,8 @@ mod tests {
         // the same file twice would produce incomparable events.
         let mut first = table(100, 300);
         let mut second = table(100, 300);
-        let a = first.observe(
+        let a = observe(
+            &mut first,
             TCP,
             endpoint(1, 51_000),
             endpoint(2, 80),
@@ -806,7 +1159,8 @@ mod tests {
             74,
             None,
         );
-        let b = second.observe(
+        let b = observe(
+            &mut second,
             TCP,
             endpoint(1, 51_000),
             endpoint(2, 80),
@@ -821,7 +1175,8 @@ mod tests {
     #[test]
     fn flows_starting_at_different_times_get_different_ids() {
         let mut table = table(100, 300);
-        let a = table.observe(
+        let a = observe(
+            &mut table,
             TCP,
             endpoint(1, 51_000),
             endpoint(2, 80),
@@ -830,7 +1185,8 @@ mod tests {
             Some(RST),
         );
         table.ended_mut().clear();
-        let b = table.observe(
+        let b = observe(
+            &mut table,
             TCP,
             endpoint(1, 51_000),
             endpoint(2, 80),
@@ -849,7 +1205,15 @@ mod tests {
         let mut table = table(100, 300);
         // Deliberately open from the higher-sorting endpoint, so the canonical
         // key order and the initiator disagree.
-        table.observe(TCP, endpoint(9, 51_000), endpoint(1, 80), at(0), 74, None);
+        observe(
+            &mut table,
+            TCP,
+            endpoint(9, 51_000),
+            endpoint(1, 80),
+            at(0),
+            74,
+            None,
+        );
         table.flush();
 
         let (initiator, responder) = table.ended_mut()[0].flow.oriented_tuple();
@@ -857,11 +1221,237 @@ mod tests {
         assert_eq!(responder, endpoint(1, 80));
     }
 
+    /// Reassembly reaching the caller through the table, which is how the
+    /// pipeline will consume it.
+    #[test]
+    fn stream_bytes_surface_through_the_flow_table() {
+        let mut table = table(100, 300);
+        let client = endpoint(1, 51_000);
+        let server = endpoint(2, 80);
+        let mut ready = StreamReady::default();
+        let mut delivered = Vec::new();
+
+        let send = |table: &mut FlowTable,
+                    source,
+                    destination,
+                    segment,
+                    ready: &mut StreamReady,
+                    delivered: &mut Vec<u8>| {
+            ready.clear();
+            table.observe(
+                &PacketSummary {
+                    protocol: TCP,
+                    source,
+                    destination,
+                    timestamp: at(0),
+                    frame_len: 74,
+                    tcp: Some(segment),
+                },
+                &|_| OverlapPolicy::First,
+                ready,
+            );
+            delivered.extend_from_slice(&ready.to_server);
+        };
+
+        send(
+            &mut table,
+            client,
+            server,
+            TcpSegment {
+                sequence: 1_000,
+                acknowledgment: 0,
+                flags: SYN,
+                payload: b"",
+            },
+            &mut ready,
+            &mut delivered,
+        );
+        send(
+            &mut table,
+            server,
+            client,
+            TcpSegment {
+                sequence: 5_000,
+                acknowledgment: 1_001,
+                flags: SYN | ACK,
+                payload: b"",
+            },
+            &mut ready,
+            &mut delivered,
+        );
+        send(
+            &mut table,
+            client,
+            server,
+            TcpSegment {
+                sequence: 1_001,
+                acknowledgment: 5_001,
+                flags: ACK,
+                payload: b"GET /etc",
+            },
+            &mut ready,
+            &mut delivered,
+        );
+        send(
+            &mut table,
+            client,
+            server,
+            TcpSegment {
+                sequence: 1_009,
+                acknowledgment: 5_001,
+                flags: ACK,
+                payload: b"/passwd",
+            },
+            &mut ready,
+            &mut delivered,
+        );
+        // The server acknowledges, settling the request.
+        send(
+            &mut table,
+            server,
+            client,
+            TcpSegment {
+                sequence: 5_001,
+                acknowledgment: 1_016,
+                flags: ACK,
+                payload: b"",
+            },
+            &mut ready,
+            &mut delivered,
+        );
+
+        assert_eq!(delivered, b"GET /etc/passwd");
+    }
+
+    #[test]
+    fn a_flow_ending_delivers_whatever_was_still_contiguous() {
+        let mut table = table(100, 300);
+        let client = endpoint(1, 51_000);
+        let server = endpoint(2, 80);
+        let mut ready = StreamReady::default();
+
+        for segment in [
+            TcpSegment {
+                sequence: 1_000,
+                acknowledgment: 0,
+                flags: SYN,
+                payload: b"",
+            },
+            TcpSegment {
+                sequence: 1_001,
+                acknowledgment: 0,
+                flags: ACK,
+                payload: b"unacked tail",
+            },
+        ] {
+            table.observe(
+                &PacketSummary {
+                    protocol: TCP,
+                    source: client,
+                    destination: server,
+                    timestamp: at(0),
+                    frame_len: 74,
+                    tcp: Some(segment),
+                },
+                &|_| OverlapPolicy::First,
+                &mut ready,
+            );
+        }
+        assert!(ready.is_empty(), "nothing has acknowledged it yet");
+
+        table.flush();
+        assert_eq!(
+            table.ended_mut()[0].final_ready.to_server,
+            b"unacked tail",
+            "the tail of a conversation still has to be matched against"
+        );
+    }
+
+    /// The second ceiling: many flows each holding a little.
+    #[test]
+    fn the_global_stream_byte_cap_forces_eviction() {
+        let mut table = FlowTable::with_reassembly(
+            Limits {
+                max_flows: 10_000,
+                flow_timeout: Duration::from_secs(3_600),
+                ..Limits::default()
+            },
+            ReassemblyConfig {
+                max_stream_bytes_per_flow: 4_096,
+                max_stream_bytes_total: 32_768,
+                delivery_flush_bytes: 4_096,
+                ..ReassemblyConfig::default()
+            },
+        );
+        let mut ready = StreamReady::default();
+        let payload = [b'A'; 1_024];
+
+        for index in 0..200u16 {
+            let client = (
+                IpAddr::V4(Ipv4Addr::new(10, 0, (index >> 8) as u8, index as u8)),
+                4_000,
+            );
+            let server = endpoint(200, 80);
+            for segment in [
+                TcpSegment {
+                    sequence: 1_000,
+                    acknowledgment: 0,
+                    flags: SYN,
+                    payload: b"",
+                },
+                // Offset 1 leaves a hole at the front, so nothing can ever be
+                // delivered and the bytes just accumulate.
+                TcpSegment {
+                    sequence: 1_002,
+                    acknowledgment: 0,
+                    flags: ACK,
+                    payload: &payload,
+                },
+            ] {
+                table.observe(
+                    &PacketSummary {
+                        protocol: TCP,
+                        source: client,
+                        destination: server,
+                        timestamp: at(0),
+                        frame_len: 1_100,
+                        tcp: Some(segment),
+                    },
+                    &|_| OverlapPolicy::First,
+                    &mut ready,
+                );
+            }
+            table.ended_mut().clear();
+            assert!(
+                table.buffered_bytes() <= 32_768 + 1_024,
+                "held {} bytes against a 32768 cap",
+                table.buffered_bytes()
+            );
+        }
+        assert!(table.counters().evicted > 0, "evictions must be counted");
+    }
+
     #[test]
     fn a_backwards_timestamp_does_not_produce_a_negative_duration() {
         let mut table = table(100, 300);
-        table.observe(TCP, endpoint(1, 1), endpoint(2, 2), at(100), 74, None);
-        table.observe(TCP, endpoint(1, 1), endpoint(2, 2), at(50), 74, None);
+        observe(
+            &mut table,
+            TCP,
+            endpoint(1, 1),
+            endpoint(2, 2),
+            at(100),
+            74,
+            None,
+        );
+        observe(
+            &mut table,
+            TCP,
+            endpoint(1, 1),
+            endpoint(2, 2),
+            at(50),
+            74,
+            None,
+        );
         table.flush();
         assert_eq!(table.ended_mut()[0].flow.duration(), Duration::ZERO);
     }
