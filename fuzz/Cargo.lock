@@ -105,9 +105,19 @@ name = "cybersentinel-fuzz"
 version = "0.0.0"
 dependencies = [
  "cybersentinel-capture",
+ "cybersentinel-common",
  "cybersentinel-decode",
+ "cybersentinel-reassembly",
  "cybersentinel-rules",
  "libfuzzer-sys",
+]
+
+[[package]]
+name = "cybersentinel-reassembly"
+version = "0.1.0"
+dependencies = [
+ "cybersentinel-common",
+ "tracing",
 ]
 
 [[package]]

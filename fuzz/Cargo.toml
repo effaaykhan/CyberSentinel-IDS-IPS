@@ -15,7 +15,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 cybersentinel-capture = { path = "../crates/capture" }
+cybersentinel-common = { path = "../crates/common" }
 cybersentinel-decode = { path = "../crates/decode" }
+cybersentinel-reassembly = { path = "../crates/reassembly" }
 cybersentinel-rules = { path = "../crates/rules" }
 
 [profile.release]
@@ -51,6 +53,20 @@ bench = false
 [[bin]]
 name = "pcap_reader"
 path = "fuzz_targets/pcap_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reassembler"
+path = "fuzz_targets/reassembler.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "normalization"
+path = "fuzz_targets/normalization.rs"
 test = false
 doc = false
 bench = false
