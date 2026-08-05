@@ -62,6 +62,48 @@ flow:
   # One event per conversation is a lot of volume on a busy link.
   emit-events: true
 
+# IP defragmentation and TCP stream reassembly — the evasion-resistance core.
+#
+# When two copies of the same bytes arrive DISAGREEING, the sensor has to pick
+# one, and it must pick the same one the destination host will. Pick differently
+# and an attacker can put one payload in front of the sensor and another in
+# front of the host.
+reassembly:
+  # first | last. Which copy of overlapping, contradicting data wins.
+  #   first  Linux, most BSDs
+  #   last   older Windows stacks
+  # Configured, never fingerprinted: guessing a stack from its packets is itself
+  # evadable, and a wrong guess fails silently.
+  overlap-policy: first
+
+  # Per-network overrides, matched against the DESTINATION of the data — the
+  # host whose stack decides what the bytes mean. Longest prefix wins, so a /32
+  # beats a /24 whatever order they appear in. A bare address means one host.
+  host-policies: []
+  #   - network: 10.1.0.0/16
+  #     policy: last
+  #   - network: 192.168.5.10
+  #     policy: last
+
+  # --- bounds on fragment state ---------------------------------------------
+  max-fragment-sets: 4096
+  max-fragment-bytes-total: 33554432
+  # A datagram whose fragments never all arrive is either a broken path or an
+  # attempt to pin memory. Either way it is discarded, not held.
+  fragment-timeout-secs: 60
+
+  # --- bounds on stream state -----------------------------------------------
+  max-stream-bytes-per-flow: 1048576
+  max-stream-bytes-total: 268435456
+
+  # Reassembled bytes are normally held until the peer acknowledges them, which
+  # is what makes overlap policy meaningful: a contradicting retransmission
+  # always arrives before the ACK, so the policy still has both copies to choose
+  # between. Where the reverse direction is not visible — asymmetric routing, a
+  # one-way tap — no ACK ever arrives, and this is the fallback that keeps
+  # matching working.
+  delivery-flush-bytes: 65536
+
 rules:
   directory: rules
   files:

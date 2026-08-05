@@ -70,6 +70,15 @@ pub struct Decoded<'a> {
     pub transport: Option<Transport>,
     /// Byte range of the transport payload within [`Decoded::frame`].
     pub payload: Range<usize>,
+    /// Byte range of the **network** payload — everything after the IP header,
+    /// clipped to the IP length.
+    ///
+    /// This is what IP defragmentation reassembles, and it is deliberately not
+    /// the same as [`Decoded::payload`]: for the first fragment of a datagram
+    /// the transport header is itself part of the data being reassembled, so
+    /// handing over the post-transport payload would lose it and misalign every
+    /// later fragment.
+    pub network_payload: Range<usize>,
     /// Structural problems found while decoding.
     pub anomalies: AnomalySet,
 }
@@ -84,6 +93,7 @@ impl<'a> Decoded<'a> {
             network: None,
             transport: None,
             payload: 0..0,
+            network_payload: 0..0,
             anomalies: AnomalySet::default(),
         }
     }
@@ -98,6 +108,12 @@ impl<'a> Decoded<'a> {
     #[must_use]
     pub fn payload_bytes(&self) -> &'a [u8] {
         self.frame.get(self.payload.clone()).unwrap_or(&[])
+    }
+
+    /// The network payload bytes: everything after the IP header.
+    #[must_use]
+    pub fn network_payload_bytes(&self) -> &'a [u8] {
+        self.frame.get(self.network_payload.clone()).unwrap_or(&[])
     }
 
     /// Payload length in bytes.
@@ -342,6 +358,7 @@ fn decode_ipv4(decoded: &mut Decoded<'_>, slice: &[u8]) {
     let claimed_end = start.saturating_add(total_len.max(header_len));
     let end = claimed_end.min(decoded.frame.len());
     let transport_start = offset_of(decoded.frame, after_header);
+    decoded.network_payload = clamp_range(transport_start, end, decoded.frame.len());
 
     // A non-initial fragment carries no transport header — the ports live in
     // the first fragment only. Phase 2 reassembles; Phase 1 must not invent a
@@ -442,6 +459,7 @@ fn decode_ipv6(decoded: &mut Decoded<'_>, slice: &[u8]) {
         .saturating_add(payload_length);
     let end = claimed_end.min(decoded.frame.len());
     let transport_start = offset_of(decoded.frame, cursor);
+    decoded.network_payload = clamp_range(transport_start, end, decoded.frame.len());
 
     if is_fragment && fragment_offset != 0 {
         decoded.payload = clamp_range(transport_start, end, decoded.frame.len());

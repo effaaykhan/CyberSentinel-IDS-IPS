@@ -24,6 +24,19 @@ crates, where every parser is written to reject exactly this.
 
 `malformed.pcap` holds one frame per decoder anomaly. Every frame in it should
 produce at least one anomaly and none should crash or hang the decoder.
+
+`evasion.pcap` is the Phase 2 adversarial set: the same marker string delivered
+in ways designed to make a sensor and a host disagree about what was sent.
+Each conversation uses its own client port so it lands in its own flow.
+
+    40001  split across TCP segments, in order
+    40002  split across TCP segments, arriving out of order
+    40003  overlapping segments that CONTRADICT each other, so the reassembled
+           stream differs under `first` and `last` overlap policy
+    40004  data past the FIN, which the host has stopped reading
+    40005  an out-of-window RST followed by more data — the RST-evasion case
+    40006  a data segment split across IP fragments, arriving out of order,
+           with a first fragment too small to hold the whole TCP header
 """
 
 import struct
@@ -283,9 +296,204 @@ def build_malformed() -> list[tuple[float, bytes]]:
     return frames
 
 
+# ---------------------------------------------------------------------------
+# evasion.pcap
+# ---------------------------------------------------------------------------
+
+MARKER = b"ATTACK-PAYLOAD-MARKER"
+FRAGMENTED_MARKER = b"FRAGMENTED-ATTACK-MARKER"
+
+
+class Conversation:
+    """Builds one TCP conversation with correct sequence numbers."""
+
+    def __init__(self, frames, client_port, clock, client_isn=1000, server_isn=5000):
+        self.frames = frames
+        self.port = client_port
+        self.clock = clock
+        self.client_isn = client_isn
+        self.server_isn = server_isn
+        self.client_sent = 0
+        self.server_sent = 0
+
+    def _tick(self):
+        self.clock += 0.01
+        return self.clock
+
+    def _to_server(self, payload):
+        self.frames.append(
+            (self._tick(), ethernet(SERVER_MAC, CLIENT_MAC, ETHERTYPE_IPV4, payload))
+        )
+
+    def _to_client(self, payload):
+        self.frames.append(
+            (self._tick(), ethernet(CLIENT_MAC, SERVER_MAC, ETHERTYPE_IPV4, payload))
+        )
+
+    def handshake(self):
+        self._to_server(
+            ipv4(CLIENT_V4, SERVER_V4, 6, tcp(self.port, 80, self.client_isn, 0, SYN))
+        )
+        self._to_client(
+            ipv4(
+                SERVER_V4,
+                CLIENT_V4,
+                6,
+                tcp(80, self.port, self.server_isn, self.client_isn + 1, SYN | ACK),
+            )
+        )
+        self._to_server(
+            ipv4(
+                CLIENT_V4,
+                SERVER_V4,
+                6,
+                tcp(self.port, 80, self.client_isn + 1, self.server_isn + 1, ACK),
+            )
+        )
+
+    def client_data(self, offset, payload, flags=PSH | ACK):
+        """Client payload placed `offset` bytes into the client's stream."""
+        self._to_server(
+            ipv4(
+                CLIENT_V4,
+                SERVER_V4,
+                6,
+                tcp(
+                    self.port,
+                    80,
+                    self.client_isn + 1 + offset,
+                    self.server_isn + 1,
+                    flags,
+                    payload,
+                ),
+            )
+        )
+
+    def client_fin(self, offset):
+        self._to_server(
+            ipv4(
+                CLIENT_V4,
+                SERVER_V4,
+                6,
+                tcp(self.port, 80, self.client_isn + 1 + offset, self.server_isn + 1, FIN | ACK),
+            )
+        )
+
+    def forged_reset(self, offset):
+        """A reset with a sequence number nowhere near the window."""
+        self._to_client(
+            ipv4(
+                SERVER_V4,
+                CLIENT_V4,
+                6,
+                tcp(80, self.port, self.server_isn + 1 + offset, 0, RST),
+            )
+        )
+
+    def server_acks(self, bytes_received):
+        self._to_client(
+            ipv4(
+                SERVER_V4,
+                CLIENT_V4,
+                6,
+                tcp(
+                    80,
+                    self.port,
+                    self.server_isn + 1,
+                    self.client_isn + 1 + bytes_received,
+                    ACK,
+                ),
+            )
+        )
+
+    def fragmented_client_data(self, offset, payload, order):
+        """One data segment carried in 8-byte-aligned IP fragments."""
+        segment = tcp(
+            self.port,
+            80,
+            self.client_isn + 1 + offset,
+            self.server_isn + 1,
+            PSH | ACK,
+            payload,
+        )
+        # Fragment the whole TCP segment, header included, on 8-byte
+        # boundaries. A 16-byte chunk means the first fragment cannot hold the
+        # whole 20-byte TCP header — RFC 1858's tiny-fragment attack, and a
+        # case the decoder should flag while reassembly still succeeds.
+        chunk = 16
+        pieces = [segment[i : i + chunk] for i in range(0, len(segment), chunk)]
+        for index in order:
+            more = index != len(pieces) - 1
+            self._to_server(
+                ipv4(
+                    CLIENT_V4,
+                    SERVER_V4,
+                    6,
+                    pieces[index],
+                    ident=0x4242,
+                    flags_offset=(0x2000 if more else 0) | (index * chunk // 8),
+                    total_len=20 + len(pieces[index]),
+                )
+            )
+
+
+def build_evasion() -> list[tuple[float, bytes]]:
+    frames: list[tuple[float, bytes]] = []
+
+    # --- 40001: split across segments, in order ----------------------------
+    conversation = Conversation(frames, 40001, 0.0)
+    conversation.handshake()
+    for index in range(0, len(MARKER), 6):
+        conversation.client_data(index, MARKER[index : index + 6])
+    conversation.server_acks(len(MARKER))
+
+    # --- 40002: the same, arriving out of order ----------------------------
+    conversation = Conversation(frames, 40002, 1.0)
+    conversation.handshake()
+    pieces = [(index, MARKER[index : index + 6]) for index in range(0, len(MARKER), 6)]
+    for index in (2, 0, 3, 1):
+        offset, payload = pieces[index]
+        conversation.client_data(offset, payload)
+    conversation.server_acks(len(MARKER))
+
+    # --- 40003: overlapping segments that contradict each other ------------
+    # Under `first` the stream reads XXXXXXXX-TAIL; under `last`, ATTACKED-TAIL.
+    conversation = Conversation(frames, 40003, 2.0)
+    conversation.handshake()
+    conversation.client_data(0, b"XXXXXXXX")
+    conversation.client_data(0, b"ATTACKED")
+    conversation.client_data(8, b"-TAIL")
+    conversation.server_acks(13)
+
+    # --- 40004: data past the FIN ------------------------------------------
+    conversation = Conversation(frames, 40004, 3.0)
+    conversation.handshake()
+    conversation.client_data(0, b"GOOD")
+    conversation.client_fin(4)
+    conversation.client_data(4, b"EVIL-PAST-FIN")
+    conversation.server_acks(4)
+
+    # --- 40005: an out-of-window reset, then more data ---------------------
+    conversation = Conversation(frames, 40005, 4.0)
+    conversation.handshake()
+    conversation.client_data(0, b"BEFORE-")
+    conversation.forged_reset(900_000)
+    conversation.client_data(7, b"AFTER-RESET")
+    conversation.server_acks(18)
+
+    # --- 40006: a data segment split across IP fragments -------------------
+    conversation = Conversation(frames, 40006, 5.0)
+    conversation.handshake()
+    conversation.fragmented_client_data(0, FRAGMENTED_MARKER, order=(2, 0, 1))
+    conversation.server_acks(len(FRAGMENTED_MARKER))
+
+    return frames
+
+
 def main() -> None:
     write_pcap(HERE / "normal.pcap", build_normal())
     write_pcap(HERE / "malformed.pcap", build_malformed())
+    write_pcap(HERE / "evasion.pcap", build_evasion())
 
 
 if __name__ == "__main__":

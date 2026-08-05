@@ -53,6 +53,16 @@ pub mod flags {
 /// Maximum holes tracked per direction.
 const MAX_HOLES_PER_STREAM: usize = 256;
 
+/// How far past what we have seen a reset's sequence number may be and still be
+/// believed.
+///
+/// One un-scaled TCP receive window. The point is to tolerate the sensor having
+/// missed up to a window of data while refusing a blind guess: an attacker who
+/// cannot see the connection has to hit a 64 KiB target in a 4 GiB space.
+/// Sizing this off the reassembly buffer instead — which is megabytes — would
+/// hand them a target thousands of times larger.
+const RST_SEQUENCE_SLACK: u64 = 65_535;
+
 /// One TCP segment offered to the reassembler.
 #[derive(Debug, Clone, Copy)]
 pub struct TcpSegment<'a> {
@@ -133,7 +143,8 @@ pub struct StreamCounters {
 }
 
 impl StreamCounters {
-    fn merge(&mut self, other: Self) {
+    /// Fold another set of counters into this one.
+    pub fn merge(&mut self, other: Self) {
         self.segments += other.segments;
         self.bytes_accepted += other.bytes_accepted;
         self.bytes_delivered += other.bytes_delivered;
@@ -329,7 +340,7 @@ impl Stream {
             return false;
         }
         let offset = self.absolute(sequence);
-        offset >= 0 && (offset as u64) <= self.buffer.covered_end() + self.byte_limit as u64
+        offset >= 0 && (offset as u64) <= self.buffer.covered_end() + RST_SEQUENCE_SLACK
     }
 
     fn discard(&mut self) {

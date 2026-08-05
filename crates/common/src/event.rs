@@ -392,6 +392,8 @@ pub struct StatsEvent {
     pub decode: DecodeStats,
     /// Flow-table counters.
     pub flows: FlowStats,
+    /// Defragmentation and stream-reassembly counters.
+    pub reassembly: ReassemblyStats,
     /// Detection-engine counters.
     pub engine: EngineStats,
 }
@@ -495,6 +497,52 @@ pub struct FlowStats {
     pub evicted: u64,
     /// Maximum flows the table will hold.
     pub capacity: u64,
+}
+
+/// Counters for IP defragmentation and TCP stream reassembly.
+///
+/// The `conflict` counters are the ones to alarm on: they mean two copies of
+/// the same bytes arrived **disagreeing**, and the sensor had to break the tie
+/// with the configured overlap policy. That is either a badly broken stack or
+/// somebody trying to show the sensor and the host different things.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReassemblyStats {
+    /// Whether reassembly is running.
+    pub enabled: bool,
+    /// IP fragments seen.
+    pub fragments: u64,
+    /// Datagrams fully reassembled from fragments.
+    pub datagrams_reassembled: u64,
+    /// Fragment reassemblies in progress.
+    pub fragment_sets_active: u64,
+    /// Incomplete datagrams discarded on timeout.
+    pub fragment_timeouts: u64,
+    /// Incomplete datagrams evicted under memory pressure. **A coverage
+    /// signal** — an attack may have been inside one.
+    pub fragment_evictions: u64,
+    /// Fragment bytes that arrived twice and disagreed.
+    pub fragment_conflicts: u64,
+    /// Bytes currently held in TCP reassembly buffers.
+    pub stream_bytes_buffered: u64,
+    /// Stream bytes handed to detection.
+    pub stream_bytes_delivered: u64,
+    /// Stream bytes that arrived twice and disagreed.
+    pub stream_conflicts: u64,
+    /// Stream bytes addressed outside any plausible receive window.
+    pub stream_out_of_window: u64,
+    /// Stream bytes offered after a FIN closed that direction.
+    pub stream_after_fin: u64,
+    /// Stream bytes delivered without an acknowledgement, because the buffer
+    /// filled. Expected on a one-way tap; unexpected otherwise.
+    pub stream_flushed_unacked: u64,
+    /// Buffered stream bytes dropped because a flow ended with a hole in it.
+    pub stream_dropped_incomplete: u64,
+    /// Resets ignored as ones the destination would not have acted on.
+    ///
+    /// Non-zero means somebody sent a reset the sensor judged forged — a
+    /// broken middlebox, or an attempt to stop the sensor watching a live
+    /// connection.
+    pub resets_ignored: u64,
 }
 
 /// Counters for the detection engine.

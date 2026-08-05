@@ -42,6 +42,23 @@ flow:
   timeout-secs: 300
   emit-events: true
 
+# The evasion-resistance core. See config/config.yaml in the source tree for the
+# full commentary.
+reassembly:
+  # first | last — which copy of overlapping, contradicting data wins. Set this
+  # to match the stacks on the network being watched.
+  overlap-policy: first
+  # Per-destination overrides; longest prefix wins.
+  host-policies: []
+  #   - network: 10.1.0.0/16
+  #     policy: last
+  max-fragment-sets: 4096
+  max-fragment-bytes-total: 33554432
+  fragment-timeout-secs: 60
+  max-stream-bytes-per-flow: 1048576
+  max-stream-bytes-total: 268435456
+  delivery-flush-bytes: 65536
+
 rules:
   directory: /etc/cybersentinel/rules
   files:

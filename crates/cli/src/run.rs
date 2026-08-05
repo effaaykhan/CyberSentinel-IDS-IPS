@@ -9,11 +9,11 @@ use anyhow::{Context, Result};
 use cybersentinel_capture::{Captured, PacketSource, PcapReplay};
 use cybersentinel_common::config::Config;
 use cybersentinel_common::event::{
-    CaptureStats, DecodeStats, EngineStats, EventStats, FlowStats, Payload, RuleStats, StatsEvent,
+    CaptureStats, DecodeStats, EngineStats, EventStats, FlowStats, Payload, ReassemblyStats,
+    RuleStats, StatsEvent,
 };
 use cybersentinel_common::eventlog::{EventEmitter, EventPipeline, EventSink};
 use cybersentinel_common::sensor;
-use cybersentinel_reassembly::{FlowTable, Limits};
 use cybersentinel_rules::{LoadReport, RuleSet};
 use cybersentinel_storage::{FileEventSink, StdoutEventSink};
 
@@ -58,6 +58,15 @@ pub struct RunArgs {
     /// Override logging.level from the config file.
     #[arg(long, value_name = "LEVEL")]
     pub log_level: Option<String>,
+
+    /// Write reassembled TCP stream content into this directory.
+    ///
+    /// A debugging aid, off unless asked for. Reassembled streams are bulk
+    /// payload — credentials, personal data, whatever the traffic carried — so
+    /// putting them on disk has to be a deliberate choice. Alert-triggered
+    /// evidence capture is a later phase and is a different thing.
+    #[arg(long, value_name = "DIR")]
+    pub dump_streams: Option<PathBuf>,
 }
 
 /// Where frames come from.
@@ -113,6 +122,17 @@ pub fn run(args: &RunArgs) -> Result<()> {
     );
     for warning in config.warnings() {
         tracing::warn!("{warning}");
+    }
+
+    if let Some(directory) = &args.dump_streams {
+        std::fs::create_dir_all(directory).with_context(|| {
+            format!("creating the stream dump directory {}", directory.display())
+        })?;
+        tracing::warn!(
+            path = %directory.display(),
+            "--dump-streams is on: reassembled payload will be written to disk in the clear. \
+             This is captured traffic and should be treated as personal data."
+        );
     }
 
     let sensor_info = sensor::resolve(&config).context("resolving the sensor identity")?;
@@ -249,7 +269,14 @@ fn main_loop(
     // and so a quiet link still produces a heartbeat.
     let stats_thread = spawn_stats_thread(config, emitter, report, started, &snapshot, &shutdown);
 
-    let outcome = run_packet_loop(config, emitter, source, &snapshot, &shutdown);
+    let outcome = run_packet_loop(
+        config,
+        emitter,
+        source,
+        &snapshot,
+        &shutdown,
+        args.dump_streams.as_ref(),
+    );
 
     // Stop the stats thread and emit one final stats event with the closing
     // counters — in particular whether anything was dropped.
@@ -270,17 +297,15 @@ fn run_packet_loop(
     source: &mut Source,
     snapshot: &SharedSnapshot,
     shutdown: &Arc<AtomicBool>,
+    dump_streams: Option<&PathBuf>,
 ) -> Result<()> {
     let mut pipeline = PacketPipeline::new(
         emitter.clone(),
-        FlowTable::new(Limits {
-            max_flows: config.flow.max_flows,
-            flow_timeout: Duration::from_secs(config.flow.timeout_secs),
-            ..Limits::default()
-        }),
+        config,
         PipelineOptions {
             emit_anomaly_events: config.decode.emit_anomaly_events,
             emit_flow_events: config.flow.emit_events,
+            dump_streams_to: dump_streams.cloned(),
         },
         source.name(),
     );
@@ -480,6 +505,23 @@ fn emit_stats(
             timed_out: pipeline.flows.timed_out,
             evicted: pipeline.flows.evicted,
             capacity: pipeline.flow_capacity,
+        },
+        reassembly: ReassemblyStats {
+            enabled: capturing,
+            fragments: pipeline.defrag.fragments,
+            datagrams_reassembled: pipeline.defrag.completed,
+            fragment_sets_active: pipeline.active_fragment_sets,
+            fragment_timeouts: pipeline.defrag.timed_out,
+            fragment_evictions: pipeline.defrag.evicted,
+            fragment_conflicts: pipeline.defrag.conflicting_overlaps,
+            stream_bytes_buffered: pipeline.stream_bytes_buffered,
+            stream_bytes_delivered: pipeline.streams.bytes_delivered,
+            stream_conflicts: pipeline.streams.conflicting_overlaps,
+            stream_out_of_window: pipeline.streams.out_of_window,
+            stream_after_fin: pipeline.streams.after_fin,
+            stream_flushed_unacked: pipeline.streams.flushed_unacked,
+            stream_dropped_incomplete: pipeline.streams.dropped_incomplete,
+            resets_ignored: pipeline.flows.resets_ignored,
         },
         // Detection lands in Phase 3, and says so rather than being absent.
         engine: EngineStats::default(),

@@ -290,6 +290,8 @@ pub struct FlowTable {
     /// Running total of bytes held in reassembly buffers, maintained
     /// incrementally so the global cap costs nothing per packet.
     stream_bytes: usize,
+    /// Stream counters carried over from flows that have already ended.
+    finished_stream_counters: StreamCounters,
     counters: FlowCounters,
     /// Flows that have ended and not yet been reported.
     ended: Vec<EndedFlow>,
@@ -324,6 +326,7 @@ impl FlowTable {
             limits,
             reassembly,
             stream_bytes: 0,
+            finished_stream_counters: StreamCounters::default(),
             counters: FlowCounters::default(),
             ended: Vec::new(),
             last_sweep: None,
@@ -490,6 +493,9 @@ impl FlowTable {
         if let Some(streams) = &mut flow.streams {
             streams.flush(&mut final_ready);
         }
+        if let Some(counters) = flow.stream_counters() {
+            self.finished_stream_counters.merge(counters);
+        }
         self.stream_bytes = self.stream_bytes.saturating_sub(released);
         self.ended.push(EndedFlow {
             flow,
@@ -593,6 +599,22 @@ impl FlowTable {
     #[must_use]
     pub fn buffered_bytes(&self) -> usize {
         self.stream_bytes
+    }
+
+    /// Stream-reassembly totals across live and finished flows.
+    ///
+    /// Summed on demand rather than maintained per packet: it is read once per
+    /// `stats` interval, and paying O(flows) then is cheaper than paying
+    /// anything at all on the fast path.
+    #[must_use]
+    pub fn stream_counters(&self) -> StreamCounters {
+        let mut totals = self.finished_stream_counters;
+        for flow in self.flows.values() {
+            if let Some(counters) = flow.stream_counters() {
+                totals.merge(counters);
+            }
+        }
+        totals
     }
 }
 

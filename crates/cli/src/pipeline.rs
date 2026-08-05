@@ -18,17 +18,26 @@
 //! That ceiling matters: an attacker choosing what to send should not be able
 //! to choose how many events the sensor emits per packet.
 
+use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use cybersentinel_capture::{CaptureCounters, RawPacket};
+use cybersentinel_common::config::Config;
 use cybersentinel_common::event::{
     AnomalyEvent, AnomalyRecord, FlowEndReason, FlowEvent, NetTuple, Payload, Protocol,
 };
 use cybersentinel_common::eventlog::EventEmitter;
 use cybersentinel_common::Timestamp;
-use cybersentinel_decode::{DecodeCounters, Decoded, Transport};
-use cybersentinel_reassembly::flow::{EndReason, EndedFlow, Endpoint, FlowCounters, FlowTable};
+use cybersentinel_decode::{DecodeCounters, Decoded, Network, Transport};
+use cybersentinel_reassembly::defrag::{DefragCounters, Defragmenter, FragmentView, Reassembled};
+use cybersentinel_reassembly::flow::{
+    EndReason, EndedFlow, FlowCounters, FlowTable, PacketSummary,
+};
+use cybersentinel_reassembly::policy::PolicyResolver;
+use cybersentinel_reassembly::stream::{StreamCounters, StreamReady, TcpSegment};
+use cybersentinel_reassembly::Limits;
 
 /// A read of the pipeline's counters, published for the stats thread.
 #[derive(Debug, Clone, Default)]
@@ -45,6 +54,14 @@ pub struct PipelineSnapshot {
     pub active_flows: u64,
     /// Flow-table capacity.
     pub flow_capacity: u64,
+    /// IP defragmentation counters.
+    pub defrag: DefragCounters,
+    /// Fragment reassemblies in progress.
+    pub active_fragment_sets: u64,
+    /// TCP stream reassembly counters.
+    pub streams: StreamCounters,
+    /// Bytes held in stream reassembly buffers.
+    pub stream_bytes_buffered: u64,
     /// Whether a replayed capture file was torn.
     pub capture_truncated: bool,
 }
@@ -53,37 +70,63 @@ pub struct PipelineSnapshot {
 pub type SharedSnapshot = Arc<Mutex<PipelineSnapshot>>;
 
 /// What the pipeline emits.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PipelineOptions {
     /// Emit an `anomaly` event per malformed packet.
     pub emit_anomaly_events: bool,
     /// Emit a `flow` event when a flow ends.
     pub emit_flow_events: bool,
+    /// Write reassembled stream content to this directory.
+    ///
+    /// **Off unless explicitly asked for, and a debugging aid only.**
+    /// Reassembled streams are bulk payload — credentials, personal data,
+    /// whatever the traffic carried — so writing them to disk is a decision an
+    /// operator has to make deliberately. Alert-triggered evidence capture is a
+    /// later phase and is a different thing entirely.
+    pub dump_streams_to: Option<PathBuf>,
 }
 
-/// Decode and flow-track packets, emitting events.
+/// Decode, defragment, reassemble, and flow-track packets, emitting events.
 #[derive(Debug)]
 pub struct PacketPipeline {
     emitter: EventEmitter,
     flows: FlowTable,
+    defrag: Defragmenter,
+    policy: PolicyResolver,
     decode: DecodeCounters,
+    /// Reused across packets so delivery costs no allocation.
+    ready: StreamReady,
+    stream_bytes_delivered: u64,
     options: PipelineOptions,
     source: String,
 }
 
 impl PacketPipeline {
-    /// Build a pipeline writing into `emitter`.
+    /// Build a pipeline from the loaded config.
     #[must_use]
     pub fn new(
         emitter: EventEmitter,
-        flows: FlowTable,
+        config: &Config,
         options: PipelineOptions,
         source: impl Into<String>,
     ) -> Self {
+        let limits = Limits {
+            max_flows: config.flow.max_flows,
+            flow_timeout: std::time::Duration::from_secs(config.flow.timeout_secs),
+            max_fragment_sets: config.reassembly.max_fragment_sets,
+            fragment_timeout: std::time::Duration::from_secs(
+                config.reassembly.fragment_timeout_secs,
+            ),
+            ..Limits::default()
+        };
         Self {
             emitter,
-            flows,
+            flows: FlowTable::with_reassembly(limits, config.reassembly.clone()),
+            defrag: Defragmenter::new(&config.reassembly),
+            policy: PolicyResolver::from_config(&config.reassembly),
             decode: DecodeCounters::default(),
+            ready: StreamReady::default(),
+            stream_bytes_delivered: 0,
             options,
             source: source.into(),
         }
@@ -94,7 +137,7 @@ impl PacketPipeline {
         let decoded = cybersentinel_decode::decode(packet.data, packet.original_len);
         self.decode.record(&decoded);
 
-        let flow_id = self.track_flow(&decoded, packet.timestamp);
+        let flow_id = self.track(&decoded, packet.timestamp);
 
         if self.options.emit_anomaly_events && !decoded.anomalies.is_empty() {
             self.emit_anomaly(packet, &decoded, flow_id);
@@ -103,44 +146,151 @@ impl PacketPipeline {
         self.drain_ended_flows();
     }
 
-    /// Attribute a packet to a flow, returning the flow id if it has one.
-    ///
-    /// ICMP and bare-IP packets have no ports; they are tracked with port 0 so
-    /// they still correlate as conversations between two hosts.
-    fn track_flow(&mut self, decoded: &Decoded<'_>, timestamp: SystemTime) -> Option<u64> {
+    /// Attribute a packet to a flow, reassembling on the way.
+    fn track(&mut self, decoded: &Decoded<'_>, timestamp: SystemTime) -> Option<u64> {
         let network = decoded.network.as_ref()?;
 
-        let source: Endpoint = (
-            network.source(),
-            decoded
-                .transport
-                .as_ref()
-                .and_then(Transport::source_port)
-                .unwrap_or(0),
-        );
-        let destination: Endpoint = (
-            network.destination(),
-            decoded
-                .transport
-                .as_ref()
-                .and_then(Transport::destination_port)
-                .unwrap_or(0),
-        );
+        if network.is_fragment() {
+            // A fragment is counted against its flow, but its transport header
+            // is deliberately *not* fed to stream reassembly: the reassembled
+            // datagram carries it, and doing both would double-count the bytes
+            // and corrupt the stream.
+            let flow_id = self.observe(&PacketSummary {
+                protocol: network.protocol(),
+                source: (network.source(), 0),
+                destination: (network.destination(), 0),
+                timestamp,
+                frame_len: decoded.frame.len(),
+                tcp: None,
+            });
 
-        let tcp_flags = match &decoded.transport {
-            Some(Transport::Tcp(tcp)) => Some(tcp.flags.bits()),
-            _ => None,
+            if let Some(reassembled) = self.defragment(network, decoded, timestamp) {
+                self.on_reassembled(&reassembled, timestamp);
+            }
+            return Some(flow_id);
+        }
+
+        Some(
+            self.observe(&PacketSummary {
+                protocol: network.protocol(),
+                source: (
+                    network.source(),
+                    decoded
+                        .transport
+                        .as_ref()
+                        .and_then(Transport::source_port)
+                        .unwrap_or(0),
+                ),
+                destination: (
+                    network.destination(),
+                    decoded
+                        .transport
+                        .as_ref()
+                        .and_then(Transport::destination_port)
+                        .unwrap_or(0),
+                ),
+                timestamp,
+                frame_len: decoded.frame.len(),
+                tcp: tcp_segment(decoded.transport.as_ref(), decoded.payload_bytes()),
+            }),
+        )
+    }
+
+    /// Offer a fragment to the defragmenter.
+    fn defragment(
+        &mut self,
+        network: &Network,
+        decoded: &Decoded<'_>,
+        timestamp: SystemTime,
+    ) -> Option<Reassembled> {
+        let (identification, offset, more_fragments) = match network {
+            Network::Ipv4(ip) => (
+                u32::from(ip.identification),
+                ip.fragment_offset,
+                ip.more_fragments,
+            ),
+            Network::Ipv6(ip) => (ip.identification, ip.fragment_offset, ip.more_fragments),
         };
 
-        let observed = self.flows.observe(
-            network.protocol(),
-            source,
-            destination,
+        // Overlaps are resolved the way the *destination* stack would.
+        let policy = self.policy.for_destination(network.destination());
+
+        self.defrag.push(
+            &FragmentView {
+                source: network.source(),
+                destination: network.destination(),
+                identification,
+                protocol: network.protocol(),
+                offset,
+                more_fragments,
+                // The IP payload, not the transport payload: the first
+                // fragment's transport header is part of what is being
+                // reassembled.
+                payload: decoded.network_payload_bytes(),
+            },
             timestamp,
-            decoded.frame.len(),
-            tcp_flags,
-        );
-        Some(observed.flow_id.get())
+            policy,
+        )
+    }
+
+    /// Feed a datagram that has just been reassembled back into the pipeline.
+    fn on_reassembled(&mut self, reassembled: &Reassembled, timestamp: SystemTime) {
+        let decoded =
+            cybersentinel_decode::decode_transport_bytes(&reassembled.data, reassembled.protocol);
+
+        self.observe(&PacketSummary {
+            protocol: reassembled.protocol,
+            source: (
+                reassembled.source,
+                decoded
+                    .transport
+                    .as_ref()
+                    .and_then(Transport::source_port)
+                    .unwrap_or(0),
+            ),
+            destination: (
+                reassembled.destination,
+                decoded
+                    .transport
+                    .as_ref()
+                    .and_then(Transport::destination_port)
+                    .unwrap_or(0),
+            ),
+            timestamp,
+            // The datagram's own length, not a frame length: it never was one
+            // frame.
+            frame_len: reassembled.data.len(),
+            tcp: tcp_segment(decoded.transport.as_ref(), decoded.payload_bytes()),
+        });
+    }
+
+    /// Hand a packet to the flow table and consume whatever it delivered.
+    fn observe(&mut self, packet: &PacketSummary<'_>) -> u64 {
+        self.ready.clear();
+
+        // Bound the borrows: the policy resolver, the flow table and the
+        // delivery buffer are three disjoint fields of `self`.
+        let policy = &self.policy;
+        let resolve = |address: IpAddr| policy.for_destination(address);
+        let observed = self.flows.observe(packet, &resolve, &mut self.ready);
+
+        self.consume_ready(observed.flow_id.get());
+        observed.flow_id.get()
+    }
+
+    /// Account for — and optionally dump — bytes that reassembly delivered.
+    ///
+    /// From Phase 3 this is where the detection engine is handed the stream.
+    fn consume_ready(&mut self, flow_id: u64) {
+        if self.ready.is_empty() {
+            return;
+        }
+        self.stream_bytes_delivered += self.ready.len() as u64;
+
+        if let Some(directory) = &self.options.dump_streams_to {
+            dump_stream(directory, flow_id, true, &self.ready.to_server);
+            dump_stream(directory, flow_id, false, &self.ready.to_client);
+        }
     }
 
     fn emit_anomaly(&self, packet: &RawPacket<'_>, decoded: &Decoded<'_>, flow_id: Option<u64>) {
@@ -182,6 +332,7 @@ impl PacketPipeline {
         if self.flows.ended_mut().is_empty() {
             return;
         }
+        self.take_final_deliveries();
         if !self.options.emit_flow_events {
             self.flows.ended_mut().clear();
             return;
@@ -192,6 +343,25 @@ impl PacketPipeline {
         let ended: Vec<EndedFlow> = self.flows.ended_mut().drain(..).collect();
         for entry in ended {
             self.emit_flow(&entry);
+        }
+    }
+
+    /// Deliver and account for the tail of every flow that has ended.
+    fn take_final_deliveries(&mut self) {
+        let tails: Vec<(u64, StreamReady)> = self
+            .flows
+            .ended_mut()
+            .iter_mut()
+            .map(|ended| (ended.flow.id.get(), std::mem::take(&mut ended.final_ready)))
+            .filter(|(_, ready)| !ready.is_empty())
+            .collect();
+
+        for (flow_id, ready) in tails {
+            self.stream_bytes_delivered += ready.len() as u64;
+            if let Some(directory) = &self.options.dump_streams_to {
+                dump_stream(directory, flow_id, true, &ready.to_server);
+                dump_stream(directory, flow_id, false, &ready.to_client);
+            }
         }
     }
 
@@ -240,6 +410,8 @@ impl PacketPipeline {
 
     /// Publish counters for the stats thread.
     pub fn publish(&mut self, slot: &SharedSnapshot, capture: CaptureCounters) {
+        let mut streams = self.flows.stream_counters();
+        streams.bytes_delivered = self.stream_bytes_delivered;
         let snapshot = PipelineSnapshot {
             source: self.source.clone(),
             capture,
@@ -247,6 +419,10 @@ impl PacketPipeline {
             flows: self.flows.counters(),
             active_flows: self.flows.len() as u64,
             flow_capacity: self.flows.capacity() as u64,
+            defrag: self.defrag.counters(),
+            active_fragment_sets: self.defrag.active_sets() as u64,
+            streams,
+            stream_bytes_buffered: self.flows.buffered_bytes() as u64,
             capture_truncated: false,
         };
         if let Ok(mut guard) = slot.lock() {
@@ -254,6 +430,43 @@ impl PacketPipeline {
             *guard = snapshot;
             guard.capture_truncated = truncated;
         }
+    }
+}
+
+/// Build a reassembly segment from a decoded TCP header.
+fn tcp_segment<'a>(transport: Option<&Transport>, payload: &'a [u8]) -> Option<TcpSegment<'a>> {
+    match transport {
+        Some(Transport::Tcp(tcp)) => Some(TcpSegment {
+            sequence: tcp.sequence_number,
+            acknowledgment: tcp.acknowledgment_number,
+            flags: tcp.flags.bits(),
+            payload,
+        }),
+        _ => None,
+    }
+}
+
+/// Append reassembled stream content to a per-flow file.
+///
+/// Debugging only. Opens per write rather than holding descriptors, because an
+/// unbounded map of open files would be its own denial of service — and this
+/// path is not meant to be fast, it is meant to be rare.
+fn dump_stream(directory: &std::path::Path, flow_id: u64, to_server: bool, bytes: &[u8]) {
+    use std::io::Write;
+
+    if bytes.is_empty() {
+        return;
+    }
+    let direction = if to_server { "to-server" } else { "to-client" };
+    let path = directory.join(format!("{flow_id}-{direction}.bin"));
+
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(bytes));
+    if let Err(error) = result {
+        tracing::warn!(path = %path.display(), %error, "could not write the stream dump");
     }
 }
 
@@ -282,7 +495,6 @@ mod tests {
     use super::*;
     use cybersentinel_common::event::SensorInfo;
     use cybersentinel_common::eventlog::{EventPipeline, EventSink};
-    use cybersentinel_reassembly::Limits;
     use std::io;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
@@ -327,13 +539,11 @@ mod tests {
                 },
                 Arc::clone(&log),
             );
-            let flows = FlowTable::new(Limits {
-                max_flows: 128,
-                flow_timeout: Duration::from_secs(60),
-                ..Limits::default()
-            });
+            let mut config = Config::default();
+            config.flow.max_flows = 128;
+            config.flow.timeout_secs = 60;
             Self {
-                pipeline: PacketPipeline::new(emitter, flows, options, "test.pcap"),
+                pipeline: PacketPipeline::new(emitter, &config, options, "test.pcap"),
                 events,
                 log,
             }
@@ -364,6 +574,7 @@ mod tests {
         PipelineOptions {
             emit_anomaly_events: true,
             emit_flow_events: true,
+            dump_streams_to: None,
         }
     }
 
@@ -525,7 +736,7 @@ mod tests {
     fn anomaly_events_can_be_turned_off_without_losing_the_counters() {
         let mut harness = Harness::new(PipelineOptions {
             emit_anomaly_events: false,
-            emit_flow_events: true,
+            ..default_options()
         });
         let mut frame = tcp_frame(51_000, 80, SYN, b"", false);
         frame[24] ^= 0xff;
@@ -539,8 +750,8 @@ mod tests {
     #[test]
     fn flow_events_can_be_turned_off() {
         let mut harness = Harness::new(PipelineOptions {
-            emit_anomaly_events: true,
             emit_flow_events: false,
+            ..default_options()
         });
         harness.feed(&tcp_frame(51_000, 80, SYN, b"", false), 10);
         let events = harness.finish();
