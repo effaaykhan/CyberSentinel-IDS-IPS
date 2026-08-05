@@ -342,8 +342,9 @@ jobs:
           set -euo pipefail
           version=0.13.0
           curl -sSL "https://ziglang.org/download/$version/zig-linux-x86_64-$version.tar.xz" \
-            | tar -xJ -C /opt
-          echo "/opt/zig-linux-x86_64-$version" >> "$GITHUB_PATH"
+            | tar -xJ -C "$HOME"
+          echo "$HOME/zig-linux-x86_64-$version" >> "$GITHUB_PATH"
+          "$HOME/zig-linux-x86_64-$version/zig" version
 
       # One script builds both formats and asserts the two invariants that
       # matter: the glibc ceiling held, and the binary still links libpcap. A
@@ -446,8 +447,21 @@ jobs:
           set -euo pipefail
           iface=$(ip -o -4 route show default | awk '{print $5}' | head -1)
           echo "capturing on $iface"
-          sudo sed -i "0,/^  enabled: false/s//  enabled: true/" /etc/cybersentinel/config.yaml
-          sudo sed -i "s/^  interfaces: \[\]/  interfaces: [$iface]/" /etc/cybersentinel/config.yaml
+          # Anchored to the capture: block. "The first enabled: false in the
+          # file" would silently start editing the wrong section the moment one
+          # is added above it.
+          sudo python3 - "$iface" <<'PY'
+          import re, sys
+          path = "/etc/cybersentinel/config.yaml"
+          text = open(path).read()
+          block = re.search(r"^capture:\n(?:[ \t].*\n|\n)*", text, re.M)
+          assert block, "no capture: section in the installed config"
+          patched = block.group(0)
+          patched = patched.replace("  enabled: false", "  enabled: true", 1)
+          patched = patched.replace("  interfaces: []", f"  interfaces: [{sys.argv[1]}]", 1)
+          assert "enabled: true" in patched and sys.argv[1] in patched, patched
+          open(path, "w").write(text[:block.start()] + patched + text[block.end():])
+          PY
           sudo sed -n '/^capture:/,/^decode:/p' /etc/cybersentinel/config.yaml
 
           sudo systemctl start cybersentinel
