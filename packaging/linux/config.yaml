@@ -112,3 +112,34 @@ logging:
 stats:
   enabled: true
   interval-secs: 60
+
+# ---------------------------------------------------------------------------
+# Host-based monitoring. Needs CAP_DAC_READ_SEARCH retained; the service unit
+# grants it as an ambient capability. See §8 of CLAUDE.md.
+# ---------------------------------------------------------------------------
+hids:
+  enabled: true
+  fim:
+    enabled: true
+    paths:
+      - /etc
+      - /usr/bin
+      - /usr/sbin
+      - /bin
+      - /sbin
+    baseline: fim-baseline.db
+    rescan-interval-secs: 3600
+  auth:
+    enabled: true
+    journald: true
+    files:
+      - /var/log/auth.log
+      - /var/log/secure
+  process:
+    enabled: true
+    interval-secs: 5
+
+correlation:
+  enabled: true
+  window-secs: 120
+  cooldown-secs: 300

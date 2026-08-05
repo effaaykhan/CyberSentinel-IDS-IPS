@@ -163,3 +163,71 @@ logging:
 stats:
   enabled: true
   interval-secs: 30
+
+# ---------------------------------------------------------------------------
+# Host-based monitoring (Phase 4).
+#
+# Needs CAP_DAC_READ_SEARCH to read and hash files it does not own; see §8 of
+# CLAUDE.md for the full capability set and the reasoning behind each entry.
+# ---------------------------------------------------------------------------
+hids:
+  enabled: true
+
+  fim:
+    enabled: true
+    # The whole scope of file integrity monitoring. Keep it short: every
+    # watched directory consumes one of the kernel's finite max_user_watches,
+    # and a sensor that exhausts them degrades the host it exists to protect.
+    paths:
+      - /etc
+      - /usr/bin
+      - /usr/sbin
+      - /bin
+      - /sbin
+    # Relative to paths.data-dir.
+    baseline: fim-baseline.db
+    # Detection latency, not a performance knob. The rescan is what catches
+    # changes made while the sensor was down, and changes the kernel dropped
+    # when its watch queue overflowed. Raising it widens the window in which a
+    # change can go unnoticed.
+    rescan-interval-secs: 3600
+    # Larger files are tracked by size and metadata only. A same-length edit to
+    # one is genuinely missed; the absent sha256 on the event is what says so.
+    max-file-bytes: 67108864
+    max-depth: 16
+    max-entries: 50000
+
+  auth:
+    enabled: true
+    # Preferred over a log file: journald records carry the service as a
+    # structured field, so a message cannot claim to have come from sshd.
+    journald: true
+    # A file that is not there is not an error, so listing both of the common
+    # names is the portable default.
+    files:
+      - /var/log/auth.log
+      - /var/log/secure
+
+  process:
+    enabled: true
+    proc-root: /proc
+    # A poller cannot see a process that starts and exits between sweeps.
+    # Shorter is more thorough and more expensive.
+    interval-secs: 5
+    max-processes: 16384
+    max-sockets: 8192
+
+# ---------------------------------------------------------------------------
+# Joining host and network evidence into one incident.
+#
+# An incident requires contributors from BOTH halves of the sensor. Two network
+# alerts agreeing with each other is repetition, not corroboration.
+# ---------------------------------------------------------------------------
+correlation:
+  enabled: true
+  window-secs: 120
+  # The quiet period after an incident, so sustained activity is one incident
+  # rather than a stream of them.
+  cooldown-secs: 300
+  max-hosts: 1024
+  max-per-host: 256

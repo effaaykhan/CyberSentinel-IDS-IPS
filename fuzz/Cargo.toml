@@ -18,6 +18,7 @@ cybersentinel-capture = { path = "../crates/capture" }
 cybersentinel-applayer = { path = "../crates/applayer" }
 cybersentinel-common = { path = "../crates/common" }
 cybersentinel-engine = { path = "../crates/engine" }
+cybersentinel-hids = { path = "../crates/hids" }
 cybersentinel-decode = { path = "../crates/decode" }
 cybersentinel-reassembly = { path = "../crates/reassembly" }
 cybersentinel-rules = { path = "../crates/rules" }
@@ -83,6 +84,20 @@ bench = false
 [[bin]]
 name = "rule_engine"
 path = "fuzz_targets/rule_engine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_log"
+path = "fuzz_targets/auth_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proc_reader"
+path = "fuzz_targets/proc_reader.rs"
 test = false
 doc = false
 bench = false

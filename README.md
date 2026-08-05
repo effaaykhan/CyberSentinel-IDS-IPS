@@ -22,11 +22,17 @@ The design document it implements:
 
 ---
 
-## Status: Phase 3 complete — the NIDS milestone
+## Status: Phase 4 complete — both halves of the sensor
 
-**The sensor detects.** Rules written in CyberSentinel's own format are
-compiled, matched against reassembled and normalized traffic, and produce
-`alert` events. The network half of the pipeline is complete end to end.
+**The sensor detects on the host and on the wire, and joins the two.** Rules
+written in CyberSentinel's own format are compiled and matched against
+reassembled network traffic *and* against file changes, authentication records,
+and process activity — and when both halves see the same thing, it is reported
+as one incident rather than two log lines.
+
+What remains for the Linux MVP is packaging: an `.rpm`, a musl static build,
+and a systemd unit wiring the capabilities documented in
+[`CLAUDE.md`](CLAUDE.md) §8.
 
 What works today:
 
@@ -52,6 +58,26 @@ What works today:
 * **an HTTP parser** filling the `http.uri`, `http.header`, `http.user_agent`,
   `http.method` and `http.host` sticky buffers — with the URI **normalized**, so
   one rule matches every spelling of the same request;
+* **file integrity monitoring** — real-time inotify watching over a configured
+  set of critical paths, paired with a **periodic baseline rescan** whose hashes
+  live in SQLite. The rescan is not a nicety: watching alone misses everything
+  changed while the sensor was down, everything the kernel dropped on queue
+  overflow, and everything under a path whose watch could not be established —
+  and all three look exactly like a filesystem nobody touched. Queue overflow
+  forces an immediate rescan, is counted, and is **reported**;
+* **authentication log monitoring** — journald (preferred, because its records
+  carry the service as a structured field) and syslog files, parsed on the
+  assumption that every field is hostile, because a username is whatever
+  somebody typed at a login prompt;
+* **process and listening-socket monitoring** from `/proc`, where a new listener
+  appearing is the signal that matters;
+* **host rules** in the same `.rules` files, on the same engine, matching
+  `file.path`, `file.change`, `auth.outcome`, `auth.user`, `process.name` and
+  more — with the same thresholds and the same alert pipeline;
+* **host↔network correlation** — a file change and a network alert on the same
+  host inside the window become one `incident` with both as contributors. An
+  incident requires evidence from *both* halves: two network alerts agreeing
+  with each other is repetition, not corroboration;
 * `cybersentinel validate-rules`, which exits non-zero on a broken or
   over-budget rule so a pipeline can gate on rule quality;
 * matrix CI on Linux, Windows, and macOS that replays the fixtures, runs the
@@ -145,12 +171,24 @@ stream you can pipe straight into a consumer:
 cargo run -q -p cybersentinel -- run --config config/config.yaml 2>/dev/null | jq .
 ```
 
-That load report is the honest one: the shipped rules all use match conditions
-the engine cannot evaluate until Phase 3, so they load, are counted, and **do
-not fire**. A rule is never evaluated with its conditions ignored — that would
-widen the signature instead of narrowing it.
-
 Drop `--once` to run until Ctrl-C.
+
+## Host monitoring
+
+Host monitoring is on by default and needs no capture source: a sensor doing
+file integrity and authentication monitoring alone is a normal install, not a
+degraded one. `hids.fim.paths` in `config.yaml` is the whole scope — keep it
+short, because every watched directory consumes one of the kernel's finite
+`max_user_watches`, and a sensor that exhausts them degrades the host it exists
+to protect.
+
+Reading and hashing files it does not own — `/etc/shadow` is mode 0640 — means
+the sensor **retains** `CAP_DAC_READ_SEARCH` where the network path drops
+everything. The full capability set, and why each entry is or is not in it, is
+in [`CLAUDE.md`](CLAUDE.md) §8. Notably absent: `CAP_SYS_PTRACE`. It would let
+the sensor attribute a listening socket to another user's process, and it would
+also let it ptrace anything on the box; the socket is reported either way, with
+the owner shown as `unknown`.
 
 ## Live capture
 
@@ -189,11 +227,15 @@ first. See [`packaging/linux/README.md`](packaging/linux/README.md).
 | `crates/common` | event schema, config loader, event pipeline, sensor identity |
 | `crates/capture` | `PacketSource`: libpcap live capture and in-tree pcap replay |
 | `crates/decode` | L2–L4 decoding and decoder anomalies |
-| `crates/reassembly` | bounded flow table; stream reassembly in Phase 2 |
+| `crates/reassembly` | IP defragmentation, ACK-gated TCP reassembly, normalization |
 | `crates/rules` | `.rules` parser, rule model, loader |
+| `crates/applayer` | the HTTP parser and its sticky buffers |
+| `crates/engine` | rule compilation, the packet path, and the direct host evaluator |
+| `crates/hids` | file integrity, authentication logs, `/proc` monitoring |
+| `crates/correlation` | joining host and network evidence into incidents |
 | `crates/storage` | stdout and file event sinks |
 | `crates/cli` | the `cybersentinel` binary |
-| `crates/{applayer,engine,hids,correlation,alerting}` | later pipeline stages, as compiling stubs |
+| `crates/alerting` | later delivery stages, as a compiling stub |
 | `rules/` | the default ruleset |
 | `config/` | `config.yaml` for running from the repo |
 | `packaging/` | per-OS installers |

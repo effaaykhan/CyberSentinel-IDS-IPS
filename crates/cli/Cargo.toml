@@ -19,6 +19,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+caps.workspace = true
 cybersentinel-capture.workspace = true
 cybersentinel-common.workspace = true
 cybersentinel-decode.workspace = true

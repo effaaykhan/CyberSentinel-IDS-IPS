@@ -50,6 +50,20 @@ const HOST_POLL: Duration = Duration::from_millis(200);
 /// How long shutdown waits for the host sensors to hand over what they found.
 const HOST_DRAIN: Duration = Duration::from_secs(5);
 
+/// The one capability host monitoring keeps.
+///
+/// `CAP_DAC_READ_SEARCH` bypasses file-read and directory-search permission
+/// checks, which is exactly what hashing `/etc/shadow` and reading
+/// `/var/log/secure` need — and nothing more. Notably **not**
+/// `CAP_SYS_PTRACE`: attributing a listening socket to another user's process
+/// would need it, and the price is the ability to ptrace anything on the box.
+/// A sensor holding that is a sensor worth compromising.
+#[cfg(target_os = "linux")]
+const HOST_READ_CAPABILITY: caps::Capability = caps::Capability::CAP_DAC_READ_SEARCH;
+#[cfg(not(target_os = "linux"))]
+const HOST_READ_CAPABILITY: cybersentinel_capture::privileges::Capability =
+    cybersentinel_capture::privileges::Capability::CapDacReadSearch;
+
 /// Arguments to `cybersentinel run`.
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
@@ -179,7 +193,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
     if matches!(source, Source::None) {
         tracing::info!("no capture source configured; running as a heartbeat only");
     } else {
-        drop_privileges();
+        drop_privileges(&config);
     }
 
     let sinks = build_sinks(&config)?;
@@ -264,20 +278,39 @@ fn open_live(_config: &Config) -> Result<Source> {
 
 /// Drop capture privileges now that the handle is open.
 ///
+/// The network path needs nothing after the handle exists, so it keeps nothing.
+/// Host monitoring is different: it goes on reading and hashing files it does
+/// not own for as long as it runs, so `CAP_DAC_READ_SEARCH` is **retained**
+/// when it is enabled. That is the smallest set that lets FIM hash
+/// `/etc/shadow` and the log reader follow `/var/log/secure`; everything else
+/// still goes. `CLAUDE.md` documents the full set and the reasoning.
+///
 /// Deliberately non-fatal: a monitoring tool that refuses to monitor is not the
 /// safer outcome. The residual privilege is made loud instead.
-fn drop_privileges() {
-    let report = cybersentinel_capture::privileges::drop_after_capture_open();
+fn drop_privileges(config: &Config) {
+    let report = if config.hids.enabled {
+        cybersentinel_capture::privileges::drop_after_capture_open_retaining(&[
+            HOST_READ_CAPABILITY,
+        ])
+    } else {
+        cybersentinel_capture::privileges::drop_after_capture_open()
+    };
+
     if report.is_overprivileged() {
         tracing::warn!(
             uid = report.uid,
             capabilities_dropped = report.capabilities_dropped,
-            "running as root: capabilities were dropped, but uid 0 remains. Run under the \
-             shipped systemd unit, which uses DynamicUser with only CAP_NET_RAW and \
-             CAP_NET_ADMIN as ambient capabilities."
+            retained = report.retained,
+            "running as root: capabilities were narrowed, but uid 0 remains. Run under the \
+             shipped systemd unit, which uses a dedicated user with only the ambient \
+             capabilities documented in CLAUDE.md."
         );
     } else if report.supported && report.capabilities_dropped {
-        tracing::info!(uid = report.uid, "capture privileges dropped");
+        tracing::info!(
+            uid = report.uid,
+            retained = report.retained,
+            "capture privileges dropped"
+        );
     }
 }
 

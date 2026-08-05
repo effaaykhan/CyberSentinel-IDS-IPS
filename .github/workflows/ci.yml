@@ -404,6 +404,11 @@ jobs:
           cargo fuzz run normalization -- -max_total_time=90 -print_final_stats=1
           cargo fuzz run http_parser   -- -max_total_time=90 -print_final_stats=1
           cargo fuzz run rule_engine   -- -max_total_time=150 -print_final_stats=1
+          # Phase 4's host-side parsers. Both read input an unprivileged local
+          # user can influence — a username lands in the auth log verbatim, and
+          # a process chooses its own name in /proc/<pid>/stat.
+          cargo fuzz run auth_log     -- -max_total_time=90 -print_final_stats=1
+          cargo fuzz run proc_reader  -- -max_total_time=90 -print_final_stats=1
 
       - name: Upload any crash artifacts
         if: failure()

@@ -18,9 +18,21 @@ RestartSec=5s
 # DynamicUser lets systemd allocate and own the service account, so the package
 # needs no useradd in a maintainer script and leaves no stale account behind on
 # removal.
+#
+# CAP_DAC_READ_SEARCH is different from the two above: the network path drops
+# its capabilities once the handle is open, but host monitoring goes on reading
+# and hashing files it does not own for as long as it runs. A baseline that
+# cannot read /etc/shadow is a baseline that silently omits the file most worth
+# watching. It is ambient as well as bounded because the sensor execs one child
+# — journalctl — which needs it to read /var/log/journal.
+#
+# Deliberately NOT here: CAP_SYS_PTRACE. It would let the sensor attribute a
+# listening socket to another user's process, and it would also let it ptrace
+# anything on the box. The socket is reported either way; the owner shows as
+# "unknown". See §8 of CLAUDE.md for the full set.
 DynamicUser=yes
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_READ_SEARCH
 NoNewPrivileges=yes
 
 # --- Self-protection (guide §6) --------------------------------------------
@@ -28,6 +40,8 @@ NoNewPrivileges=yes
 # event log has blinded it. Everything is read-only except the two directories
 # it owns.
 ProtectSystem=strict
+# Host monitoring reads /var/log and /etc; ProtectSystem=strict keeps them
+# read-only rather than hidden, which is exactly what FIM wants.
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

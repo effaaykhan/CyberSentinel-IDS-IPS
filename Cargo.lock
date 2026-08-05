@@ -221,6 +221,7 @@ name = "cybersentinel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "caps",
  "clap",
  "ctrlc",
  "cybersentinel-capture",

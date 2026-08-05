@@ -389,10 +389,72 @@ The sections that matter operationally:
 | `capture.buffer-size-bytes` | the first thing to raise when `stats.capture.drops` goes non-zero |
 | `flow.max-flows` | the hard bound on flow state; past it, live flows are evicted and counted |
 | `flow.emit-events` / `decode.emit-anomaly-events` | event volume. Turning either off keeps the counters in `stats` |
+| `hids.fim.paths` | **the whole scope of file integrity monitoring.** Deliberately a short list: every watched directory consumes one of the kernel's finite `max_user_watches`, and a sensor that exhausts them degrades the host it exists to protect |
+| `hids.fim.rescan-interval-secs` | detection *latency*, not a performance knob: the rescan is what catches changes made while the sensor was down and changes lost to a queue overflow |
+| `hids.fim.max-file-bytes` | files above it are tracked by size and metadata only. A same-length edit to one is genuinely missed, and the absent `sha256` on the event is what says so |
+| `hids.auth.journald` | prefer it over a log file. journald records carry the service as a *structured field*, so a message cannot claim to have come from `sshd` |
+| `hids.process.interval-secs` | a poller cannot see a process that starts and exits between sweeps. Shorter is more thorough and more expensive |
+| `hids.process.proc-root` | where `/proc` is. Configurable for containers given the host's `/proc` at another path |
+| `correlation.window-secs` | how far apart two events can be and still be one incident |
+| `correlation.cooldown-secs` | the quiet period after an incident, so sustained activity is one incident rather than a stream of them |
 
 ---
 
-## 8. Packaging
+## 8. Privileges: what the sensor keeps, and why
+
+The network path follows the classic pattern: open the capture socket, then
+drop everything. Once libpcap holds the handle, `CAP_NET_RAW` is pure attack
+surface — a flaw in the decoder or a rule parser is worth far less in a process
+that cannot open sockets.
+
+**Host monitoring breaks that pattern**, and the packaging pass has to account
+for it. The HIDS is not a one-shot open followed by a lifetime of parsing: it
+goes on reading and hashing files it does not own for as long as it runs. A
+baseline that cannot read `/etc/shadow` — mode 0640, `root:shadow` — is a
+baseline that silently omits the file most worth watching, and "silently omits"
+is the failure mode this whole project is built to avoid.
+
+### The set
+
+| Capability | Needed by | Kept? | Why |
+|---|---|---|---|
+| `CAP_NET_RAW` | opening the live capture handle | **dropped after open** | Nothing on the packet path needs it once libpcap holds the socket. |
+| `CAP_NET_ADMIN` | promiscuous mode, kernel BPF filter | **dropped after open** | Same. |
+| `CAP_DAC_READ_SEARCH` | FIM hashing, reading `/var/log/secure` and `/var/log/audit/`, `journalctl` reading `/var/log/journal` | **retained while `hids.enabled`** | Bypasses file-read and directory-search checks, and nothing else. The smallest capability that makes FIM and log reading actually cover what they claim to. |
+| `CAP_SYS_PTRACE` | `/proc/<pid>/exe` and `/proc/<pid>/fd` for **other users'** processes — i.e. attributing a listening socket to the process holding it | **never granted** | It permits ptracing any process on the box, which is full compromise. The socket is still reported; the owning process shows as `unknown`. Losing an attribution is worth far more than handing an attacker that capability. |
+| `CAP_AUDIT_READ` | reading the kernel audit netlink socket directly | **not used** | Phase 4 reads auditd's log *file*, which `CAP_DAC_READ_SEARCH` already covers. Revisit only if a netlink reader is added. |
+
+`CAP_DAC_READ_SEARCH` is placed in the **permitted, effective, inheritable and
+ambient** sets. The first two are for this process. The last two are for the
+one child it execs: `journalctl`. Without the ambient bit, a non-root sensor
+would hold the capability itself and then spawn a `journalctl` that cannot read
+the journal — which looks exactly like a host with no authentication activity.
+
+### For the packaging pass
+
+The systemd unit needs, at minimum:
+
+```ini
+[Service]
+User=cybersentinel
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+```
+
+`CAP_NET_RAW` and `CAP_NET_ADMIN` are in the ambient set because the process
+needs them at startup and drops them itself; the bounding set is what stops
+anything raising them back. Drop the two `NET` capabilities entirely on a
+HIDS-only install, and drop `CAP_DAC_READ_SEARCH` on a NIDS-only one — the
+sensor works with either half missing, and says so in `stats`.
+
+Running as **root** is supported and warned about loudly. Dropping capabilities
+is not the same as dropping root: uid 0 is still uid 0. Prefer a dedicated
+user with ambient capabilities.
+
+---
+
+## 9. Packaging
 
 Guide §5 treats packaging as a core workstream, and each OS phase ends in a
 signed, installable artifact. See `packaging/README.md` for the full matrix.
@@ -400,7 +462,7 @@ signed, installable artifact. See `packaging/README.md` for the full matrix.
 | Target | Artifact | Status |
 |---|---|---|
 | Linux `.deb` (cargo-deb, systemd) | built and installed in CI | **live** |
-| Linux `.rpm` / AppImage / musl static | — | Phase 4 |
+| Linux `.rpm` / AppImage / musl static | — | next: the packaging pass after Phase 4 |
 | Windows `.msi`/`.exe`, Service, Authenticode, bundled Npcap | scaffolding | Phase 5 |
 | macOS `.pkg`/`.dmg`, launchd, Developer ID + notarization | scaffolding | Phase 6 |
 
@@ -411,7 +473,7 @@ in a distributed product generally needs a commercial licence.
 
 ---
 
-## 9. Decisions taken, with their reasoning
+## 10. Decisions taken, with their reasoning
 
 Recorded so they can be revisited deliberately.
 
@@ -495,7 +557,7 @@ Recorded so they can be revisited deliberately.
 
 ---
 
-## 10. Phase plan and acceptance criteria
+## 11. Phase plan and acceptance criteria
 
 From guide §7. Each "done" is an acceptance test.
 
@@ -566,6 +628,27 @@ region plus an overlap as long as the longest pattern is re-scanned. `detect.
 inspection-window` is therefore the longest content match that can ever fire on
 a stream.
 
+### `/proc` polling rather than an audit or eBPF hook
+
+A poller misses processes that start and exit between sweeps, where a hook would
+not. In exchange it needs no kernel module, no `CAP_BPF`, no auditd
+configuration, and it cannot wedge the machine. Installing a sensor must never
+make the host worse; an audit-backed source can be added alongside in Phase 7.
+
+### journald read through `journalctl`, not `libsystemd`
+
+Linking would tie the binary to a library whose presence and version vary across
+distributions, against a promise of a standalone install with no prerequisites.
+A missing subprocess simply means that source is unavailable and the configured
+log files carry the load — which is what happens on a host without systemd
+anyway.
+
+### Correlation joins on the timestamp the event carries
+
+For a replay that is *capture* time, deliberately (§4). It follows that
+replaying a months-old capture will not correlate with host events happening
+now, and that is correct rather than a bug to widen the window around.
+
 ### Rule coverage is reported in four buckets
 
 `armed` / `awaiting support` / `failed to compile` / `skipped`. They are
@@ -577,13 +660,50 @@ whichever one someone needs to fix.
 rule is broken is a sensor watching nothing. `--strict` and `cybersentinel
 validate-rules` fail loudly instead, for CI and pre-deploy gates.
 
-### Phase 4 — HIDS core (Linux) → **first MVP**
-FIM via `notify` · auditd/journald · process monitoring · host rules · local
-host↔network correlation.
+### Phase 4 — HIDS core (Linux) ✅ → **first MVP**
+FIM via `notify` with a SQLite baseline · journald and syslog authentication
+logs · `/proc` process and listening-socket monitoring · host rules on the same
+engine · local host↔network correlation.
 
 **Done when:** a watched-file change, a failed-login burst, and a new listener
-each produce a host alert unified with network alerts. **MVP: an installable
-standalone Linux sensor doing NIDS + HIDS.**
+each produce a host alert unified with network alerts. `crates/cli/tests/host.rs`
+drives every one of those through the real binary, plus the two that matter
+most: a change made while nothing was watching, and a host event and a network
+alert becoming one incident.
+
+Still outstanding for the **MVP**: the packaging pass — `.rpm`, a musl static
+build, and a systemd unit wiring the capabilities in §8.
+
+### How host detection is put together
+
+**Host rules share the engine's foundations, not its packet pre-filter.** They
+reuse the rule model, the loader, the value-matching primitives, thresholds,
+flowbits and the alert pipeline. What they do *not* reuse is header grouping and
+aho-corasick — that is a packet-scale optimisation, and a host produces a
+handful of events a second, not a million packets. `engine::host` selects
+candidate rules by event kind and runs the primitives against named fields.
+
+**FIM has two detectors because one is not enough.** Real-time watching has
+three failure modes that all look identical from outside — like a filesystem
+nobody touched: the sensor was not running, the kernel queue overflowed, or the
+watch was never established. The periodic baseline rescan is what makes all
+three recoverable. Overflow additionally forces an immediate rescan, is counted,
+and is emitted as its own event.
+
+**FIM runs on its own thread.** Hashing `/etc` and `/usr/bin` takes real time;
+doing it on the capture thread would drop traffic and make startup look like a
+hang. Scans are abandonable so shutdown does not wait for one, and an abandoned
+scan reports itself as truncated — so it is never mistaken for mass deletion.
+
+**Log parsing assumes every field is hostile**, because a username is whatever
+somebody typed at a login prompt. Fields are extracted positionally and
+validated rather than scavenged; a login as `admin from 10.0.0.1` does not get
+to pick its own `source_address`. Control characters never reach an event, and
+what cannot be a real value is flagged rather than dropped.
+
+**Correlation requires both domains.** Two network alerts agreeing with each
+other is repetition, not corroboration; raising an incident for it would launder
+one noisy rule into something resembling independent agreement.
 
 ### Phase 5 — Windows port + installer
 Npcap capture (bundled) · FIM via `ReadDirectoryChangesW`/USN · ETW/Event Log ·
@@ -608,7 +728,7 @@ room for both.
 
 ---
 
-## 11. Working on this
+## 12. Working on this
 
 ```sh
 cargo build --workspace
