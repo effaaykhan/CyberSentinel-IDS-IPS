@@ -436,13 +436,32 @@ jobs:
       # The proof that CLAUDE.md §8 is right rather than merely written down:
       # start the service and assert the capability model on the running
       # process. GitHub runners have systemd, so this is the real thing.
+      # The proof that CLAUDE.md §8 is right rather than merely written down.
+      # The shipped config has capture off by default, so turn it on here: the
+      # point of the check is that live capture still works *after* the sensor
+      # has dropped CAP_NET_RAW, and a skipped capture check would let a
+      # regression through.
       - name: Start the service and verify the capability model
         run: |
           set -euo pipefail
+          iface=$(ip -o -4 route show default | awk '{print $5}' | head -1)
+          echo "capturing on $iface"
+          sudo sed -i "0,/^  enabled: false/s//  enabled: true/" /etc/cybersentinel/config.yaml
+          sudo sed -i "s/^  interfaces: \[\]/  interfaces: [$iface]/" /etc/cybersentinel/config.yaml
+          sudo sed -n '/^capture:/,/^decode:/p' /etc/cybersentinel/config.yaml
+
           sudo systemctl start cybersentinel
-          sleep 20
+          # The first FIM baseline hashes /etc and /usr/bin; the shadow check
+          # needs it finished.
+          sleep 45
           sudo systemctl status cybersentinel --no-pager -n 20 || true
           sudo sh /usr/share/doc/cybersentinel/verify-install.sh
+
+      - name: Show the sensor's own view of itself
+        if: always()
+        run: |
+          sudo tail -3 /var/log/cybersentinel/events.json || true
+          sudo journalctl -u cybersentinel --no-pager -n 40 || true
 
       - name: Upload the packages
         uses: actions/upload-artifact@v4

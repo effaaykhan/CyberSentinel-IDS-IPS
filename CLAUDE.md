@@ -452,6 +452,34 @@ Running as **root** is supported and warned about loudly. Dropping capabilities
 is not the same as dropping root: uid 0 is still uid 0. Prefer a dedicated
 user with ambient capabilities.
 
+### The check that makes this true rather than merely written down
+
+`packaging/linux/verify-install.sh` ships in both packages and asserts all four
+claims against a **running** service: dedicated unprivileged user, a steady
+state of exactly `CAP_DAC_READ_SEARCH` in both the effective and permitted
+sets, live capture still working, and `/etc/shadow` hashed into the baseline.
+CI runs it after installing the package. Measured on a real host: uid 62394,
+`CapEff=0x4`, 4083 packets captured, and the recorded hash of `/etc/shadow`
+equal to the file — while the same uid without the capability gets `EPERM`
+reading it.
+
+Proving the drop without proving capture would be proving the sensor is safely
+useless, which is why the capture check is not optional.
+
+### The sandbox was built by measurement, not by checklist
+
+Every `Protect*`/`Restrict*`/`SystemCall*` directive in the unit was added one
+at a time and re-verified against a running sensor. Two plausible ones are
+**deliberately absent**, named in the unit with the reason:
+
+| Directive | What it breaks |
+|---|---|
+| `ProtectProc=invisible` | Process monitoring reports **nothing** — the only process the sensor can still see is its own. Service healthy, capture fine, FIM fine. |
+| `ProcSubset=pid` | Hides `/proc/net/tcp`, so listening-socket detection stops. A new backdoor on a port is the host signal that matters most. |
+
+Both fail the way this project cares about most: a detection feature switched
+off without anything failing.
+
 ---
 
 ## 9. Packaging
@@ -461,10 +489,22 @@ signed, installable artifact. See `packaging/README.md` for the full matrix.
 
 | Target | Artifact | Status |
 |---|---|---|
-| Linux `.deb` (cargo-deb, systemd) | built and installed in CI | **live** |
-| Linux `.rpm` / AppImage / musl static | — | next: the packaging pass after Phase 4 |
+| Linux `.deb` (cargo-deb, systemd) | built, installed, and verified running in CI | **live** |
+| Linux `.rpm` (cargo-generate-rpm, systemd) | built and verified in CI | **live** |
 | Windows `.msi`/`.exe`, Service, Authenticode, bundled Npcap | scaffolding | Phase 5 |
 | macOS `.pkg`/`.dmg`, launchd, Developer ID + notarization | scaffolding | Phase 6 |
+
+Both Linux formats come from **one** binary, pinned to **glibc 2.28** with
+`cargo-zigbuild` — RHEL 8+, Debian 10+, Ubuntu 20.04+, SLES 15 SP2+. It is
+still dynamically linked and still links libpcap, so live capture works in
+full. **No static musl build**: musl cannot link libpcap, and a sensor that
+cannot capture is not the sensor. `packaging/linux/build-packages.sh` asserts
+both invariants — the glibc ceiling and the libpcap link — because a dependency
+bump that quietly raised either would go unnoticed until an install failed.
+
+**AppImage is not planned.** It solves a desktop-application problem; a sensor
+is a system service that wants a service manager, a conffile, and a package
+database entry.
 
 Two things are flagged early because they have lead time and cost: **code
 signing** on Windows and macOS, and the **Npcap redistribution licence**
@@ -671,8 +711,21 @@ drives every one of those through the real binary, plus the two that matter
 most: a change made while nothing was watching, and a host event and a network
 alert becoming one incident.
 
-Still outstanding for the **MVP**: the packaging pass — `.rpm`, a musl static
-build, and a systemd unit wiring the capabilities in §8.
+**The Linux MVP is complete.** The packaging pass that finished it produced a
+`.deb` and an `.rpm` from one glibc-2.28-pinned binary, a hardened systemd unit
+built by measurement, and `verify-install.sh` asserting §8 against a running
+service (§9). It also turned up two defects that only a real install could
+show, both now fixed and both worth remembering:
+
+* **First start alerted on every file in the monitored tree** — 1651 `created`
+  events on an ordinary `/etc`. Whether a scan established the baseline or
+  compared against it was re-derived from `baseline.is_empty()` per scan, and
+  the real-time watcher, attached first, inserted a row before the first scan
+  ran. The flag is now snapshotted in `Monitor::new`, before anything can write.
+* **The `.deb` never registered its systemd unit.** cargo-deb's `systemd-units`
+  generates nothing unless `maintainer-scripts` is also set, so the unit file
+  shipped and nothing enabled it — the sensor did not come back after a reboot.
+  True since Phase 0, and invisible to a `dpkg-deb --contents` check.
 
 ### How host detection is put together
 
@@ -704,6 +757,16 @@ what cannot be a real value is flagged rather than dropped.
 **Correlation requires both domains.** Two network alerts agreeing with each
 other is repetition, not corroboration; raising an incident for it would launder
 one noisy rule into something resembling independent agreement.
+
+### The packaging pass — Linux MVP ✅
+`.deb` **and** `.rpm` from one glibc-2.28-pinned binary that still links
+libpcap · a systemd sandbox built directive by directive against a running
+sensor · `verify-install.sh` shipped in both packages and run by CI.
+
+**Done when:** both packages build and install, the service starts as a
+dedicated user holding only `CAP_DAC_READ_SEARCH`, live capture still works,
+and `/etc/shadow` is hashed into the baseline. All four are asserted by
+`verify-install.sh`, which CI runs against the installed service.
 
 ### Phase 5 — Windows port + installer
 Npcap capture (bundled) · FIM via `ReadDirectoryChangesW`/USN · ETW/Event Log ·

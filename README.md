@@ -30,9 +30,9 @@ reassembled network traffic *and* against file changes, authentication records,
 and process activity — and when both halves see the same thing, it is reported
 as one incident rather than two log lines.
 
-What remains for the Linux MVP is packaging: an `.rpm`, a musl static build,
-and a systemd unit wiring the capabilities documented in
-[`CLAUDE.md`](CLAUDE.md) §8.
+**The Linux MVP is complete**: a `.deb` and an `.rpm`, a hardened systemd
+service, and a check that verifies the privilege model on the installed sensor
+rather than asserting it in a document.
 
 What works today:
 
@@ -206,17 +206,41 @@ Then set `capture.enabled: true` in `config.yaml`.
 ## Install (Linux)
 
 ```sh
-cargo install cargo-deb
-cargo build --release -p cybersentinel
-cargo deb -p cybersentinel --no-build
-sudo dpkg --install target/debian/cybersentinel_*.deb
+sudo dpkg --install cybersentinel_*.deb     # Debian, Ubuntu
+sudo dnf install  cybersentinel-*.rpm       # RHEL, Fedora, SUSE
 
 sudoedit /etc/cybersentinel/config.yaml
 sudo systemctl start cybersentinel
 ```
 
 The unit is enabled but not started by the package: review the installed config
-first. See [`packaging/linux/README.md`](packaging/linux/README.md).
+first. A sensor should begin watching because you decided it should.
+
+**Supported distributions: glibc 2.28 and newer** — RHEL/Rocky/Alma 8+,
+Debian 10+, Ubuntu 20.04+, SLES 15 SP2+. Both packages come from one binary
+that still links libpcap, so live capture works everywhere; see
+[`packaging/linux/README.md`](packaging/linux/README.md) for why that is not a
+static build.
+
+To build them yourself:
+
+```sh
+cargo install cargo-deb cargo-generate-rpm cargo-zigbuild
+sh packaging/linux/build-packages.sh
+```
+
+### Verifying the install
+
+```sh
+sudo sh /usr/share/doc/cybersentinel/verify-install.sh
+```
+
+A privilege model nobody checks is a privilege model nobody knows is wrong, so
+the checks ship with the package. They assert, against the running service,
+that it runs as a dedicated unprivileged user, that it holds **exactly**
+`CAP_DAC_READ_SEARCH` at steady state, that live capture still works anyway —
+and that `/etc/shadow` is hashed into the file-integrity baseline, which is the
+whole reason that one capability is kept.
 
 ---
 
