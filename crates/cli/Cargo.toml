@@ -40,7 +40,14 @@ caps.workspace = true
 serde_json.workspace = true
 
 # ---------------------------------------------------------------------------
-# Linux packaging (`cargo deb -p cybersentinel`). See packaging/linux/README.md.
+# Linux packaging. Two formats, one set of installed files:
+#
+#   cargo deb          -p cybersentinel   # Debian, Ubuntu
+#   cargo generate-rpm -p crates/cli      # RHEL, Fedora, SUSE
+#
+# Both install the same binary, the same /etc/cybersentinel/config.yaml, the
+# same ruleset, and the same systemd unit — so a bug reproduced on one distro
+# family is reproducible on the other. See packaging/linux/README.md.
 # ---------------------------------------------------------------------------
 [package.metadata.deb]
 name = "cybersentinel"
@@ -54,6 +61,21 @@ Rules use CyberSentinel's own .rules format and events are emitted as \
 newline-delimited CyberSentinel event JSON."""
 section = "admin"
 priority = "optional"
+# Declared rather than left to dpkg-shlibdeps, and the reason is subtle enough
+# to be worth writing down.
+#
+# The portable build targets glibc 2.28 (see packaging/linux/README.md), where
+# libpthread and libdl were still separate libraries. Building it on a modern
+# host, shlibdeps sees NEEDED entries for libpthread.so.0 and libdl.so.2, maps
+# them to the merged libc6 that provides those sonames as stubs, and concludes
+# `libc6 (>= 2.34)`. That would refuse to install on exactly the older distros
+# the pinned build exists to reach — a portability build defeated by its own
+# packaging metadata.
+#
+# `libpcap0.8` rather than `libpcap0.8t64`: Ubuntu 24.04 renamed the package
+# for the time64 transition but has it Provides: libpcap0.8, so the old name
+# resolves on every Debian and Ubuntu still receiving updates.
+depends = "libc6 (>= 2.28), libpcap0.8"
 assets = [
     ["target/release/cybersentinel", "usr/bin/", "755"],
     ["../../packaging/linux/config.yaml", "etc/cybersentinel/config.yaml", "644"],
@@ -66,3 +88,42 @@ conf-files = ["/etc/cybersentinel/config.yaml", "/etc/cybersentinel/rules/cybers
 # is enabled but not started by the package: a sensor should be started once its
 # operator has reviewed the installed config.
 systemd-units = { unit-name = "cybersentinel", unit-scripts = "../../packaging/linux", enable = true, start = false }
+
+# ---------------------------------------------------------------------------
+# RPM packaging (`cargo generate-rpm -p crates/cli`).
+#
+# cargo-generate-rpm reads the built binary rather than invoking rpmbuild, so
+# the CI runner needs no RPM toolchain — only the same `cargo build --release`
+# the .deb uses. `--payload-compress none` is not set: the default is fine.
+# ---------------------------------------------------------------------------
+[package.metadata.generate-rpm]
+name = "cybersentinel"
+summary = "Standalone host and network intrusion detection sensor"
+license = "MIT OR Apache-2.0"
+url = "https://github.com/cybersentinel/cybersentinel-IPS"
+# Everything the .deb installs, in the same places.
+assets = [
+    { source = "target/release/cybersentinel", dest = "/usr/bin/cybersentinel", mode = "755" },
+    { source = "packaging/linux/config.yaml", dest = "/etc/cybersentinel/config.yaml", mode = "644", config = true },
+    { source = "rules/cybersentinel.rules", dest = "/etc/cybersentinel/rules/cybersentinel.rules", mode = "644", config = true },
+    { source = "packaging/linux/cybersentinel.service", dest = "/usr/lib/systemd/system/cybersentinel.service", mode = "644" },
+    { source = "packaging/linux/logrotate", dest = "/etc/logrotate.d/cybersentinel", mode = "644", config = true },
+    { source = "README.md", dest = "/usr/share/doc/cybersentinel/README.md", mode = "644", doc = true },
+]
+
+# systemd registration, matching what cargo-deb generates for the .deb. The
+# scriptlets are files rather than inline strings so they are reviewable, and
+# shared with anything else that needs them.
+post_install_script = "../../packaging/linux/rpm-post-install.sh"
+pre_uninstall_script = "../../packaging/linux/rpm-pre-uninstall.sh"
+post_uninstall_script = "../../packaging/linux/rpm-post-uninstall.sh"
+
+# Live capture links libpcap at runtime. Named explicitly rather than left to
+# auto-detection because a sensor installed without it starts, reports that
+# capture is unavailable, and monitors only the host — which is a coverage gap
+# an operator would have to notice for themselves.
+#
+# The package name differs across the RPM distros, so the dependency is on the
+# soname the linker actually recorded. Every one of them provides it.
+[package.metadata.generate-rpm.requires]
+"libpcap.so.0.8()(64bit)" = "*"
