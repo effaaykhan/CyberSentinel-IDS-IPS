@@ -5,10 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "CyberSentinel applayer stage"
+description = "CyberSentinel application-layer parsers: HTTP, then DNS and TLS"
 
 [lints]
 workspace = true
 
 [dependencies]
 cybersentinel-common.workspace = true
+cybersentinel-reassembly.workspace = true

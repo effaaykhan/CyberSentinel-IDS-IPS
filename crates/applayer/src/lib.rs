@@ -4,6 +4,10 @@
 //! buffers (`http.uri`, `http.header`, `http.user_agent`, ...) that rule
 //! options match against, so app-layer coverage is what gates rule coverage.
 
+pub mod http;
+
+pub use http::{HttpCounters, HttpParser, HttpRequest};
+
 /// Application protocols the sensor can parse, or intends to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]

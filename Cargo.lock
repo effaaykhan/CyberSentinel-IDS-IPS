@@ -219,6 +219,7 @@ name = "cybersentinel-applayer"
 version = "0.1.0"
 dependencies = [
  "cybersentinel-common",
+ "cybersentinel-reassembly",
 ]
 
 [[package]]
@@ -265,6 +266,7 @@ name = "cybersentinel-engine"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "cybersentinel-applayer",
  "cybersentinel-common",
  "cybersentinel-reassembly",
  "cybersentinel-rules",

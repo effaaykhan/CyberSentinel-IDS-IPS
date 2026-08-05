@@ -37,6 +37,11 @@ Each conversation uses its own client port so it lands in its own flow.
     40005  an out-of-window RST followed by more data — the RST-evasion case
     40006  a data segment split across IP fragments, arriving out of order,
            with a first fragment too small to hold the whole TCP header
+
+`http.pcap` is one conversation carrying the same file requested five different
+ways — plain, with a traversal, with a self-reference, percent-encoded, and
+double-encoded — each split across two TCP segments. A rule on the normalized
+`http.uri` must match all five.
 """
 
 import struct
@@ -490,10 +495,52 @@ def build_evasion() -> list[tuple[float, bytes]]:
     return frames
 
 
+# ---------------------------------------------------------------------------
+# http.pcap
+# ---------------------------------------------------------------------------
+
+# The same file, spelled five ways. A rule on the normalized URI must match all
+# of them; a sensor that matched only the first is looking at a different
+# request than the server serves.
+URI_SPELLINGS = [
+    "/etc/passwd",
+    "/foo/../etc/passwd",
+    "/etc/./passwd",
+    "/%65tc/%70asswd",
+    "/%252e%252e%252fetc/passwd",
+]
+
+
+def build_http() -> list[tuple[float, bytes]]:
+    frames: list[tuple[float, bytes]] = []
+    conversation = Conversation(frames, 50001, 0.0)
+    conversation.handshake()
+
+    offset = 0
+    for index, spelling in enumerate(URI_SPELLINGS):
+        request = (
+            f"GET {spelling} HTTP/1.1\r\n"
+            f"Host: victim.invalid\r\n"
+            f"User-Agent: sqlmap/1.7\r\n"
+            f"X-Request: {index}\r\n"
+            f"\r\n"
+        ).encode()
+        # Split each request across two segments, so reassembly is exercised
+        # as well as parsing.
+        half = len(request) // 2
+        conversation.client_data(offset, request[:half])
+        conversation.client_data(offset + half, request[half:])
+        offset += len(request)
+        conversation.server_acks(offset)
+
+    return frames
+
+
 def main() -> None:
     write_pcap(HERE / "normal.pcap", build_normal())
     write_pcap(HERE / "malformed.pcap", build_malformed())
     write_pcap(HERE / "evasion.pcap", build_evasion())
+    write_pcap(HERE / "http.pcap", build_http())
 
 
 if __name__ == "__main__":

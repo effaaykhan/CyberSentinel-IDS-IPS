@@ -282,6 +282,12 @@ pub fn build_engine(config: &Config, rules: &RuleSet) -> (Engine, CompileReport)
         max_flowbits_per_flow: config.detect.max_flowbits_per_flow,
         inspection_window: config.detect.inspection_window,
         max_threshold_entries: config.detect.max_threshold_entries,
+        normalize: cybersentinel_reassembly::normalize::NormalizeOptions {
+            decode_rounds: config.normalize.decode_rounds,
+            collapse_path: config.normalize.collapse_path,
+            backslash_is_separator: config.normalize.backslash_is_separator,
+        },
+        ..EngineLimits::default()
     };
     Engine::new(rules.rules().iter(), &vars, limits)
 }

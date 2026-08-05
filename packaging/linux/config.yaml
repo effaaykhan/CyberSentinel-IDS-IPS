@@ -59,6 +59,33 @@ reassembly:
   max-stream-bytes-total: 268435456
   delivery-flush-bytes: 65536
 
+# URI and path normalization. Like the overlap policy, these are statements
+# about what the SERVER will make of a request: a sensor that reads it
+# differently is looking at something the server never saw.
+normalize:
+  # Percent-decoding passes. Two catches ordinary double encoding. Capped
+  # rather than repeated to a fixed point, because an input can always be
+  # encoded one level deeper than any limit.
+  decode-rounds: 2
+  collapse-path: true
+  # Set true where the servers being watched are Windows-hosted.
+  backslash-is-separator: false
+
+# The detection engine.
+detect:
+  enabled: true
+  # Linear-time matching does not make COMPILATION free. A rule whose pcre
+  # needs more than this is refused at load and reported, rather than costing
+  # megabytes per rule.
+  regex-size-limit: 1048576
+  regex-dfa-size-limit: 1048576
+  max-flow-states: 65536
+  max-flowbits-per-flow: 64
+  # The longest content match that can ever fire on a stream: a pattern that
+  # never sits in the window whole cannot be found.
+  inspection-window: 65536
+  max-threshold-entries: 65536
+
 rules:
   directory: /etc/cybersentinel/rules
   files:

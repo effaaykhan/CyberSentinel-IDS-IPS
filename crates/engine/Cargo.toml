@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 aho-corasick.workspace = true
+cybersentinel-applayer.workspace = true
 cybersentinel-common.workspace = true
 cybersentinel-reassembly.workspace = true
 cybersentinel-rules.workspace = true

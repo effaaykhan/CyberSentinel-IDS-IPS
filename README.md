@@ -22,11 +22,11 @@ The design document it implements:
 
 ---
 
-## Status: Phase 2 complete
+## Status: Phase 3 complete — the NIDS milestone
 
-The sensor now reconstructs the byte stream a server would actually see —
-defragmenting, reassembling, and normalizing — but **it does not detect anything
-yet**: the rule engine lands in Phase 3.
+**The sensor detects.** Rules written in CyberSentinel's own format are
+compiled, matched against reassembled and normalized traffic, and produce
+`alert` events. The network half of the pipeline is complete end to end.
 
 What works today:
 
@@ -45,8 +45,15 @@ What works today:
 * **flow tracking** with hard caps and idle timeouts, emitting `flow` events;
 * **real counters** — kernel drops, decode classification, flow evictions,
   reassembly conflicts, ignored resets — in every `stats` event;
-* the `config.yaml` loader and the `.rules` parser (headers and metadata in
-  full; match conditions recognised but not yet evaluated);
+* **a detection engine** — rules compiled once, an Aho-Corasick pre-filter over
+  every rule's fast pattern, then full evaluation of `content` and its
+  modifiers, `pcre`, `flow`, `flowbits`, `byte_test`, `byte_jump`, `dsize` and
+  `threshold`;
+* **an HTTP parser** filling the `http.uri`, `http.header`, `http.user_agent`,
+  `http.method` and `http.host` sticky buffers — with the URI **normalized**, so
+  one rule matches every spelling of the same request;
+* `cybersentinel validate-rules`, which exits non-zero on a broken or
+  over-budget rule so a pipeline can gate on rule quality;
 * matrix CI on Linux, Windows, and macOS that replays the fixtures, runs the
   evasion suite under both overlap policies, fuzzes every parser, and builds,
   installs, and runs a Linux `.deb`.

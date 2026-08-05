@@ -14,7 +14,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
+use cybersentinel_applayer::HttpParser;
 use cybersentinel_common::event::NetTuple;
+use cybersentinel_reassembly::normalize::NormalizeOptions;
 use cybersentinel_rules::{Buffer, Rule, ThresholdKind, Track};
 
 use crate::compile::{CompileLimits, CompileReport, CompiledRuleset};
@@ -37,6 +39,10 @@ pub struct EngineLimits {
     pub inspection_window: usize,
     /// Threshold counters held at once.
     pub max_threshold_entries: usize,
+    /// How URIs are canonicalised before matching.
+    pub normalize: NormalizeOptions,
+    /// Largest HTTP request head buffered per flow.
+    pub max_http_head: usize,
 }
 
 impl Default for EngineLimits {
@@ -47,6 +53,8 @@ impl Default for EngineLimits {
             max_flowbits_per_flow: 64,
             inspection_window: 64 << 10,
             max_threshold_entries: 65_536,
+            normalize: NormalizeOptions::default(),
+            max_http_head: cybersentinel_applayer::http::DEFAULT_MAX_HEAD,
         }
     }
 }
@@ -133,6 +141,9 @@ struct FlowState {
     to_server: InspectionBuffer,
     to_client: InspectionBuffer,
     last_seen: SystemTime,
+    /// Request parser for the client-to-server direction, once any armed rule
+    /// asks for an HTTP buffer.
+    http: Option<HttpParser>,
 }
 
 impl Default for FlowState {
@@ -142,6 +153,7 @@ impl Default for FlowState {
             to_server: InspectionBuffer::default(),
             to_client: InspectionBuffer::default(),
             last_seen: SystemTime::UNIX_EPOCH,
+            http: None,
         }
     }
 }
@@ -296,6 +308,59 @@ impl Engine {
             timestamp,
             alerts,
         );
+
+        if to_server && self.needs_http() {
+            self.inspect_http(flow_id, tuple, delivered, timestamp, alerts);
+        }
+    }
+
+    /// Feed client-to-server bytes to the HTTP parser and inspect each request
+    /// head it completes.
+    fn inspect_http(
+        &mut self,
+        flow_id: u64,
+        tuple: NetTuple,
+        delivered: &[u8],
+        timestamp: SystemTime,
+        alerts: &mut Vec<AlertRecord>,
+    ) {
+        let options = self.limits.normalize;
+        let max_head = self.limits.max_http_head;
+        let Some(state) = self.states.get_mut(&flow_id) else {
+            return;
+        };
+        let parser = state.http.get_or_insert_with(|| HttpParser::new(max_head));
+        let requests = parser.push(delivered, &options);
+
+        for request in requests {
+            let buffers = Buffers {
+                payload: &[],
+                http_uri: Some(&request.uri),
+                http_header: Some(&request.headers),
+                http_user_agent: request.user_agent.as_deref(),
+                http_method: Some(&request.method),
+                http_host: request.host.as_deref(),
+                normalization: request.normalization,
+            };
+            // Every HTTP buffer is offered to the pre-filter, since a rule's
+            // fast pattern may sit in any of them.
+            self.inspect_buffers(
+                flow_id,
+                tuple,
+                true,
+                true,
+                buffers,
+                &[
+                    Buffer::HttpUri,
+                    Buffer::HttpHeader,
+                    Buffer::HttpUserAgent,
+                    Buffer::HttpMethod,
+                    Buffer::HttpHost,
+                ],
+                timestamp,
+                alerts,
+            );
+        }
     }
 
     /// Inspect a set of buffers directly. Used by the app-layer parser once it
@@ -312,13 +377,43 @@ impl Engine {
         timestamp: SystemTime,
         alerts: &mut Vec<AlertRecord>,
     ) {
-        let haystack = buffers.get(prefilter_buffer).unwrap_or(&[]);
+        self.inspect_buffers(
+            flow_id,
+            tuple,
+            to_server,
+            established,
+            buffers,
+            &[prefilter_buffer],
+            timestamp,
+            alerts,
+        );
+    }
+
+    /// Inspect, pre-filtering across several buffers at once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inspect_buffers(
+        &mut self,
+        flow_id: u64,
+        tuple: NetTuple,
+        to_server: bool,
+        established: bool,
+        buffers: Buffers<'_>,
+        prefilter_buffers: &[Buffer],
+        timestamp: SystemTime,
+        alerts: &mut Vec<AlertRecord>,
+    ) {
+        let haystacks: Vec<(Buffer, &[u8])> = prefilter_buffers
+            .iter()
+            .filter_map(|buffer| buffers.get(*buffer).map(|bytes| (*buffer, bytes)))
+            .collect();
         self.counters.inspections += 1;
-        self.counters.bytes_inspected += haystack.len() as u64;
+        self.counters.bytes_inspected += haystacks
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>();
 
         let mut candidates = Vec::new();
-        self.ruleset
-            .candidates(prefilter_buffer, haystack, &mut candidates);
+        self.ruleset.candidates_in(&haystacks, &mut candidates);
         self.counters.candidates += candidates.len() as u64;
         if candidates.is_empty() {
             return;

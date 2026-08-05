@@ -330,9 +330,21 @@ impl CompiledRuleset {
     /// `out` is cleared and filled with rule indices; duplicates are removed so
     /// a rule whose pattern appears twice is only evaluated once.
     pub fn candidates(&self, buffer: Buffer, haystack: &[u8], out: &mut Vec<usize>) {
+        self.candidates_in(&[(buffer, haystack)], out);
+    }
+
+    /// Rules worth evaluating across several buffers at once.
+    ///
+    /// One HTTP transaction fills the URI, the headers and more, and a rule's
+    /// fast pattern may sit in any of them. Scanning each and taking the union
+    /// means every rule is found — and, because the result is deduplicated,
+    /// each is still evaluated exactly once.
+    pub fn candidates_in(&self, buffers: &[(Buffer, &[u8])], out: &mut Vec<usize>) {
         out.clear();
-        if let Some(prefilter) = self.prefilters.get(&buffer) {
-            prefilter.candidates(haystack, out);
+        for (buffer, haystack) in buffers {
+            if let Some(prefilter) = self.prefilters.get(buffer) {
+                prefilter.candidates(haystack, out);
+            }
         }
         out.extend_from_slice(&self.always);
         out.sort_unstable();

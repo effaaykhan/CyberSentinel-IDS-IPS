@@ -1,0 +1,14 @@
+# HTTP detection fixtures for the Phase 3 end-to-end tests, matched against
+# tests/fixtures/pcap/http.pcap.
+
+# The same file, five spellings. This must fire on all of them: the URI buffer
+# holds what the server will resolve, not what arrived on the wire.
+alert http any any -> any any (msg:"CYBERSENTINEL TEST normalized uri"; http.uri; content:"/etc/passwd"; nocase; classtype:web-application-attack; sid:9100001; rev:1;)
+
+# Double encoding is unusual enough to be worth alerting on by itself.
+alert http any any -> any any (msg:"CYBERSENTINEL TEST double encoded uri"; http.uri; normalized:double_encoded; sid:9100002; rev:1;)
+
+# The other sticky buffers.
+alert http any any -> any any (msg:"CYBERSENTINEL TEST scanner user agent"; http.user_agent; content:"sqlmap"; nocase; sid:9100003; rev:1;)
+alert http any any -> any any (msg:"CYBERSENTINEL TEST host header"; http.header; content:"Host: victim.invalid"; sid:9100004; rev:1;)
+alert http any any -> any any (msg:"CYBERSENTINEL TEST method"; http.method; content:"GET"; sid:9100005; rev:1;)

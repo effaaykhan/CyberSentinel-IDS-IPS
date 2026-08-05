@@ -1,0 +1,29 @@
+# Detection fixtures for the Phase 3 end-to-end tests.
+#
+# One rule per delivery in evasion.pcap. Each marker is a string that ONLY
+# correct reassembly produces: split across segments, split across fragments,
+# resolved through an overlap policy, or preserved across a forged reset. A rule
+# firing here means the whole chain — capture, decode, defragment, reassemble,
+# normalize, match — agreed with what the destination host would have seen.
+
+# 40001 and 40002: the same marker, delivered in order and out of order.
+alert tcp any any -> any any (msg:"CYBERSENTINEL TEST segmented marker"; content:"ATTACK-PAYLOAD-MARKER"; classtype:trojan-activity; sid:9000001; rev:1;)
+
+# 40003: only produced when overlapping data is resolved LAST-wins.
+alert tcp any any -> any any (msg:"CYBERSENTINEL TEST overlap resolved last"; content:"ATTACKED-TAIL"; sid:9000002; rev:1;)
+
+# 40003 again: only produced when it is resolved FIRST-wins.
+alert tcp any any -> any any (msg:"CYBERSENTINEL TEST overlap resolved first"; content:"XXXXXXXX-TAIL"; sid:9000003; rev:1;)
+
+# 40004: the data the host actually read, before it closed the direction.
+alert tcp any any -> any any (msg:"CYBERSENTINEL TEST pre-FIN data"; content:"GOOD"; sid:9000004; rev:1;)
+
+# 40004 injection: this is past the FIN and the host never reads it. If this
+# ever fires, the sensor is inspecting bytes the server discarded.
+alert tcp any any -> any any (msg:"CYBERSENTINEL TEST must-not-fire post-FIN injection"; content:"EVIL-PAST-FIN"; sid:9000005; rev:1;)
+
+# 40005: only contiguous if the forged reset did NOT tear the flow down.
+alert tcp any any -> any any (msg:"CYBERSENTINEL TEST survived forged reset"; content:"BEFORE-AFTER-RESET"; sid:9000006; rev:1;)
+
+# 40006: only produced by reassembling the IP fragments.
+alert tcp any any -> any any (msg:"CYBERSENTINEL TEST defragmented marker"; content:"FRAGMENTED-ATTACK-MARKER"; sid:9000007; rev:1;)

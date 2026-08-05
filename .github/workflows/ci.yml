@@ -210,6 +210,74 @@ jobs:
 
           echo "evasion suite OK"
 
+      # The Phase 3 acceptance criteria: rules compile, and a rule fires on
+      # every delivery in the evasion capture. A regression here is silent by
+      # nature — the sensor keeps running and simply stops detecting.
+      - name: Smoke test — rule validation and detection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The shipped ruleset must be loadable. It is allowed to contain
+          # rules awaiting engine support; it is not allowed to contain broken
+          # ones, which is what a non-zero exit here would mean.
+          cargo run --quiet -p cybersentinel -- \
+            validate-rules --config config/config.yaml
+
+          rm -rf detect-state && mkdir -p detect-state
+          cp tests/fixtures/rules/detection.rules detect-state/
+          cp tests/fixtures/rules/http.rules detect-state/
+          cat > detect.yaml <<YAML
+          paths:
+            data-dir: detect-state
+            log-dir: detect-state
+          rules:
+            directory: detect-state
+            files: [detection.rules]
+          outputs:
+            stdout:
+              enabled: true
+            file:
+              enabled: false
+          logging:
+            level: warn
+          reassembly:
+            overlap-policy: last
+          YAML
+
+          cargo run --quiet -p cybersentinel -- run \
+            --config detect.yaml --replay tests/fixtures/pcap/evasion.pcap > alerts.json
+
+          echo "--- alerts ---"; grep '"event_type":"alert"' alerts.json || true
+
+          # One rule per delivery: segmented (twice), overlap-last, pre-FIN,
+          # survived-reset, defragmented.
+          for sid in 9000001 9000002 9000004 9000006 9000007; do
+            grep -q "\"sid\":${sid}," alerts.json \
+              || { echo "rule ${sid} did not fire"; exit 1; }
+          done
+          test "$(grep -c '"sid":9000001,' alerts.json)" -eq 2 \
+            || { echo "expected both segmented deliveries to fire"; exit 1; }
+
+          # And the two that must not.
+          if grep -q '"sid":9000005,' alerts.json; then
+            echo "data past the FIN reached detection"; exit 1
+          fi
+          if grep -q '"sid":9000003,' alerts.json; then
+            echo "the superseded overlap copy reached detection"; exit 1
+          fi
+
+          # HTTP: one rule, five spellings of the same request.
+          sed -i 's/files: \[detection.rules\]/files: [http.rules]/' detect.yaml
+          cargo run --quiet -p cybersentinel -- run \
+            --config detect.yaml --replay tests/fixtures/pcap/http.pcap > http-alerts.json
+          test "$(grep -c '"sid":9100001,' http-alerts.json)" -eq 5 \
+            || { echo "the URI rule did not match every spelling"; exit 1; }
+          test "$(grep -c '"sid":9100002,' http-alerts.json)" -eq 1 \
+            || { echo "the double-encoding rule fired wrongly"; exit 1; }
+
+          echo "detection OK"
+
       - name: Verify --version
         run: cargo run --quiet -p cybersentinel -- --version
 
@@ -334,6 +402,8 @@ jobs:
           cargo fuzz run pcap_reader -- -max_total_time=90 -print_final_stats=1
           cargo fuzz run reassembler   -- -max_total_time=150 -print_final_stats=1
           cargo fuzz run normalization -- -max_total_time=90 -print_final_stats=1
+          cargo fuzz run http_parser   -- -max_total_time=90 -print_final_stats=1
+          cargo fuzz run rule_engine   -- -max_total_time=150 -print_final_stats=1
 
       - name: Upload any crash artifacts
         if: failure()

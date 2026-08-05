@@ -58,9 +58,9 @@ crates/
   capture/       PacketSource: pcap replay (live) + libpcap live capture
   decode/        L2–L4 decode, decoder anomalies            (live)
   reassembly/    flow table, IP defrag, TCP reassembly, normalization (live)
-  applayer/      HTTP → DNS → TLS parsers, sticky buffers   (Phase 3, 8)
-  rules/         .rules parser + rule model + loader        (parser stub live)
-  engine/        rule grouping, aho-corasick MPM, evaluation(Phase 3)
+  applayer/      HTTP request parser + sticky buffers (live) · DNS, TLS (Phase 8)
+  rules/         .rules parser, rule model, loader          (live)
+  engine/        var resolution, compilation, MPM, evaluation, alerts (live)
   hids/          fim/ logs/ process/ platform/{linux,windows,macos}  (Phase 4–6)
   correlation/   dedupe, host↔network correlation           (Phase 4, 7)
   storage/       event sinks (live), flow store, PCAP ring
@@ -94,8 +94,9 @@ post-hoc log joining.
 **Phase 0 built the ends**: config and rule loading at the front, the event
 schema and output path at the back. **Phase 1 filled in capture, decode, and
 flow tracking**. **Phase 2 added defragmentation, stream reassembly, and
-normalization**, so packets now become the byte stream a server would actually
-see. Detection (Phase 3) is the last stage missing.
+normalization**, so packets became the byte stream a server would actually see.
+**Phase 3 added the detection engine and the HTTP parser**: the pipeline is now
+complete end to end for the network side, and rules fire.
 
 ### Capture sources
 
@@ -431,6 +432,15 @@ Recorded so they can be revisited deliberately.
 | A non-initial IP fragment gets no transport header | Its bytes are payload; reading ports out of them attributes the packet to a port nobody used | Never |
 | Flow ids from FNV-1a, not `DefaultHasher` | `DefaultHasher` is randomly seeded per process, so replaying one capture twice would produce incomparable events | Never |
 | One `anomaly` event per packet, not per anomaly | Bounds the events an attacker can cause per packet | Never |
+| Variable resolution fails loudly | An address set silently too broad fires on traffic nobody meant; too narrow and it fires on nothing and nobody notices | Never |
+| `![a,!b]` is refused, not approximated | An approximate address set matches the wrong traffic without saying so | Only with an exact representation |
+| Regex budget applied at **compile** time | Linear-time matching does not make compilation free; a pathological expression costs megabytes of program | — |
+| A rule over budget is skipped, not accepted | A rule nobody can afford to load must not load | Never |
+| Evaluation fails closed on anything unanswerable | A rule firing on traffic nobody wrote it for is how analysts learn to ignore alerts | Never |
+| A negated content is never a fast pattern | The pre-filter selects packets that *contain* the pattern; a rule needing its absence would never be considered | Never |
+| Longest pattern chosen when none is marked | A longer needle appears in less traffic, so it rejects more rules per scan | — |
+| Normalization runs on the URI **path** only | `..` inside a query parameter is not a traversal | — |
+| A bare-LF request terminator is accepted | Lenient servers answer them; insisting on CRLF would miss requests somebody served | — |
 | **Overlap policy configured, not fingerprinted** | A fingerprint an attacker can influence lets them choose the sensor's policy | Never |
 | **Delivery gated on the peer's ACK** | It is the only way `last` policy can be implemented at all; the choice must still be open when it is made | If a phase needs lower matching latency than an RTT — then the trade has to be made explicitly |
 | Reassembled content is never an event | It is bulk payload and PII; alert-triggered evidence capture is a different, later thing | Never |
@@ -443,15 +453,21 @@ Recorded so they can be revisited deliberately.
 
 ### Open questions for the next phases
 
-1. **`serde_yaml` is unmaintained.** Version 0.9.34 is published as
+1. **`endswith`, `detection_filter`, and `%uXXXX` remain unimplemented.**
+   Recognised and reported, never silently ignored. `%uXXXX` in particular is a
+   real IIS-era evasion that needs a UTF-16 decision.
+2. **HTTP responses and bodies are not parsed.** Request heads only, which is
+   what the `http.*` buffers need; response inspection follows with the rules
+   that want it.
+3. **`serde_yaml` is unmaintained.** Version 0.9.34 is published as
    `0.9.34+deprecated`; the crate was archived by its author. It works and only
    ever parses a local, trusted config file, but "unmaintained YAML parser" in a
    security tool deserves a deliberate answer. Options: keep it, move to a
    maintained fork (`serde_yaml_ng`), or move to `saphyr`. **Not changed
    unilaterally — the guide names `serde_yaml`.**
-2. **`regex` vs `pcre2`** — **decided: `regex`**, for its linear-time guarantees.
-   The rule model must therefore not be designed around PCRE-only features.
-   Unused until Phase 3.
+4. **`regex` vs `pcre2`** — **decided and shipped: `regex`**, for its
+   linear-time guarantee. The rule model has no PCRE-only features, and `pcre`
+   flags are limited to `i`, `s`, `m`, and `R`.
 3. **WiX vs Inno** for the Windows installer — see
    `packaging/windows/README.md`.
 4. **Clock skew.** Guide §6 says "UTC + NTP". Timestamps are UTC; nothing checks
@@ -516,7 +532,7 @@ tiny-fragment cases.
 correctly · overlapping-segment and encoded-URI cases resolve correctly · the
 reassembler fuzz target runs clean · state is provably bounded.
 
-### Phase 3 — Native rule engine → **NIDS milestone**
+### Phase 3 — Native rule engine ✅ → **NIDS milestone**
 Full `.rules` parsing of the §6 subset · rule grouping by header ·
 `aho-corasick` MPM on `fast_pattern` · full evaluation · HTTP app-layer parser
 locating the URI and feeding sticky buffers through the Phase 2 normalization
@@ -526,6 +542,40 @@ stream that `StreamReady` already delivers.
 **Done when:** a known signature in replayed traffic produces a correct alert ·
 the loader reports supported vs. skipped · the rule-parser fuzz target runs
 clean.
+
+### How detection is put together
+
+Rules are **compiled once** at load: headers resolved from `vars`, regexes built
+under a size budget. Every rule's `fast_pattern` goes into a shared
+Aho-Corasick automaton **per buffer**, so one scan finds the few rules worth
+evaluating. Rules with no usable pattern — header-only, or only negated content
+— cannot be pre-filtered and are evaluated on every packet, which is why the
+count is reported.
+
+Evaluation walks options in written order with a per-buffer cursor, and **fails
+closed everywhere**: an unfilled buffer, a `byte_test` reading past the end, a
+`byte_jump` landing outside the buffer all mean *no match*. A rule on `http.uri`
+must not match non-HTTP traffic just because there is no URI to contradict it.
+
+`flowbits` side effects are collected during evaluation and applied only once
+the whole rule matched, so a partial match leaves no state behind.
+
+Stream matching uses a bounded **inspection window** per direction: patterns
+must be contiguous but deliveries are not, so bytes accumulate and only the new
+region plus an overlap as long as the longest pattern is re-scanned. `detect.
+inspection-window` is therefore the longest content match that can ever fire on
+a stream.
+
+### Rule coverage is reported in four buckets
+
+`armed` / `awaiting support` / `failed to compile` / `skipped`. They are
+different problems belonging to different people — the project's, the rule
+author's, and whoever edited the file. Collapsing them into one number hides
+whichever one someone needs to fix.
+
+**Load-and-report is the default**: a sensor that will not start because one
+rule is broken is a sensor watching nothing. `--strict` and `cybersentinel
+validate-rules` fail loudly instead, for CI and pre-deploy gates.
 
 ### Phase 4 — HIDS core (Linux) → **first MVP**
 FIM via `notify` · auditd/journald · process monitoring · host rules · local

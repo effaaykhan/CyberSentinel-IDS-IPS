@@ -15,7 +15,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 cybersentinel-capture = { path = "../crates/capture" }
+cybersentinel-applayer = { path = "../crates/applayer" }
 cybersentinel-common = { path = "../crates/common" }
+cybersentinel-engine = { path = "../crates/engine" }
 cybersentinel-decode = { path = "../crates/decode" }
 cybersentinel-reassembly = { path = "../crates/reassembly" }
 cybersentinel-rules = { path = "../crates/rules" }
@@ -67,6 +69,20 @@ bench = false
 [[bin]]
 name = "normalization"
 path = "fuzz_targets/normalization.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_parser"
+path = "fuzz_targets/http_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rule_engine"
+path = "fuzz_targets/rule_engine.rs"
 test = false
 doc = false
 bench = false
