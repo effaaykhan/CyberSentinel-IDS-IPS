@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 cybersentinel-common.workspace = true
+time.workspace = true

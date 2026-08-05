@@ -279,6 +279,7 @@ name = "cybersentinel-correlation"
 version = "0.1.0"
 dependencies = [
  "cybersentinel-common",
+ "time",
 ]
 
 [[package]]
