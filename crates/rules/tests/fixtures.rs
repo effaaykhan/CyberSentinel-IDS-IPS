@@ -19,10 +19,10 @@ fn mixed_fixture_loads_the_good_rules_and_accounts_for_the_rest() {
     let (set, report) = RuleSet::load_files(&[fixture("mixed.rules")]);
 
     assert_eq!(report.files.len(), 1);
-    assert_eq!(report.loaded, 4, "{}", report.summary());
-    assert_eq!(report.evaluable, 2, "{}", report.summary());
-    assert_eq!(report.non_evaluable(), 2, "{}", report.summary());
-    assert_eq!(set.len(), 4);
+    assert_eq!(report.loaded, 5, "{}", report.summary());
+    assert_eq!(report.evaluable, 4, "{}", report.summary());
+    assert_eq!(report.non_evaluable(), 1, "{}", report.summary());
+    assert_eq!(set.len(), 5);
 
     // Every skip names a reason and a line, so the log points at the problem.
     assert_eq!(report.skipped.len(), 5, "{:#?}", report.skipped);
@@ -69,7 +69,11 @@ fn continuation_lines_produce_one_rule() {
 fn only_evaluable_rules_are_offered_to_the_engine() {
     let (set, _) = RuleSet::load_files(&[fixture("mixed.rules")]);
     let sids: Vec<u32> = set.evaluable().map(|rule| rule.sid).collect();
-    assert_eq!(sids, vec![900_001, 900_002]);
+    assert_eq!(
+        sids,
+        vec![900_001, 900_002, 900_010, 900_011],
+        "the Phase 3 subset is evaluable; only the `endswith` rule is not"
+    );
 }
 
 /// The default ruleset ships with the product; it must parse cleanly, or every

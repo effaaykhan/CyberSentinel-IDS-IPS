@@ -16,6 +16,10 @@ use crate::model::{
     Action, AddressSpec, AddressValue, Direction, MetadataEntry, PortSpec, PortValue, Protocol,
     Rule, RuleHeader,
 };
+use crate::options::{
+    Buffer, ByteJump, ByteTest, ContentMatch, DsizeMatch, Endian, FlowBitsOp, FlowMatch,
+    NormalizationCondition, NumericOp, PcreMatch, RuleOption, Threshold, ThresholdKind, Track,
+};
 
 /// Option keywords this format defines but this build cannot yet evaluate.
 ///
@@ -24,37 +28,11 @@ use crate::model::{
 /// as a typo and the rule is skipped. Keywords move out of this list as their
 /// implementing phase lands.
 pub const RECOGNISED_UNIMPLEMENTED_OPTIONS: &[&str] = &[
-    // Content matching (Phase 3)
-    "content",
-    "nocase",
-    "offset",
-    "depth",
-    "distance",
-    "within",
-    "fast_pattern",
-    "startswith",
+    // Content matching not yet implemented (Phase 8)
     "endswith",
-    // Flow state (Phase 3)
-    "flow",
-    "flowbits",
-    // Expressions (Phase 3)
-    "pcre",
-    "byte_test",
-    "byte_jump",
-    "dsize",
-    // Rate limiting (Phase 3)
-    "threshold",
+    // Rate limiting (Phase 8)
     "detection_filter",
-    // Sticky buffers (Phase 3)
-    "http.uri",
-    "http.header",
-    "http.user_agent",
-    "http.method",
-    "http.host",
-    // Non-matching annotations (Phase 3)
-    "reference",
-    "priority",
-    "gid",
+    // Annotations with no effect on matching (Phase 8)
     "target",
     // Host-rule keywords (Phase 4)
     "file.path",
@@ -378,6 +356,8 @@ fn validate_var_name(name: &str) -> Result<(), String> {
 struct RawOption {
     name: String,
     value: Option<String>,
+    /// The value was prefixed with `!`, as in `content:!"evil"`.
+    negated: bool,
 }
 
 /// Split an option block into options.
@@ -432,14 +412,25 @@ fn parse_options(body: &str) -> Result<Vec<RawOption>, ParseError> {
             continue;
         }
 
-        let (name, value) = match split_name_value(chunk) {
-            Some((name, value)) => (name, Some(unescape(value.trim())?)),
+        let (name, raw_value) = match split_name_value(chunk) {
+            Some((name, value)) => (name, Some(value.trim())),
             None => (chunk, None),
+        };
+
+        // Negation is stripped before unquoting so `content:!"evil"` reads as a
+        // negated `evil` rather than as a value that happens to start with `!`.
+        let (negated, raw_value) = match raw_value {
+            Some(value) => match value.strip_prefix('!') {
+                Some(rest) => (true, Some(rest.trim())),
+                None => (false, Some(value)),
+            },
+            None => (false, None),
         };
 
         options.push(RawOption {
             name: name.trim().to_ascii_lowercase(),
-            value,
+            value: raw_value.map(unescape).transpose()?,
+            negated,
         });
     }
 
@@ -506,20 +497,37 @@ fn unescape(value: &str) -> Result<String, ParseError> {
 // assembly
 // ---------------------------------------------------------------------------
 
-/// Fold the parsed options into a [`Rule`], separating the ones Phase 0
+/// Fold the parsed options into a [`Rule`], separating the ones this build
 /// interprets from the ones it only recognises.
 fn build_rule(header: RuleHeader, options: Vec<RawOption>, raw: &str) -> Result<Rule, ParseError> {
     let mut sid = None;
     let mut rev = None;
     let mut msg = None;
     let mut classtype = None;
+    let mut priority = None;
+    let mut gid = None;
+    let mut threshold = None;
     let mut metadata = Vec::new();
+    let mut references = Vec::new();
+    let mut matches: Vec<RuleOption> = Vec::new();
     let mut unsupported: Vec<String> = Vec::new();
     let mut seen_unsupported = BTreeSet::new();
+    let mut no_alert = false;
+
+    // A sticky-buffer keyword applies to everything after it until the next
+    // one, which is what lets a single rule look at the URI and then the
+    // headers.
+    let mut buffer = Buffer::Payload;
 
     for option in options {
-        let RawOption { name, value } = option;
+        let RawOption {
+            name,
+            value,
+            negated,
+        } = option;
+
         match name.as_str() {
+            // --- metadata -------------------------------------------------
             "sid" => {
                 reject_duplicate(&sid, "sid")?;
                 sid = Some(parse_u32_option(&name, value.as_deref())?);
@@ -528,14 +536,23 @@ fn build_rule(header: RuleHeader, options: Vec<RawOption>, raw: &str) -> Result<
                 reject_duplicate(&rev, "rev")?;
                 rev = Some(parse_u32_option(&name, value.as_deref())?);
             }
+            "gid" => {
+                reject_duplicate(&gid, "gid")?;
+                gid = Some(parse_u32_option(&name, value.as_deref())?);
+            }
+            "priority" => {
+                reject_duplicate(&priority, "priority")?;
+                let level = parse_u32_option(&name, value.as_deref())?;
+                if !(1..=255).contains(&level) {
+                    return Err(invalid(&name, "priority must be between 1 and 255"));
+                }
+                priority = Some(level as u8);
+            }
             "msg" => {
                 reject_duplicate(&msg, "msg")?;
                 let text = require_value(&name, value)?;
                 if text.trim().is_empty() {
-                    return Err(ParseError::InvalidOptionValue {
-                        option: name,
-                        reason: "msg must not be empty".to_string(),
-                    });
+                    return Err(invalid(&name, "msg must not be empty"));
                 }
                 msg = Some(text);
             }
@@ -543,9 +560,76 @@ fn build_rule(header: RuleHeader, options: Vec<RawOption>, raw: &str) -> Result<
                 reject_duplicate(&classtype, "classtype")?;
                 classtype = Some(require_value(&name, value)?);
             }
-            "metadata" => {
-                metadata.extend(parse_metadata(&require_value(&name, value)?));
+            "metadata" => metadata.extend(parse_metadata(&require_value(&name, value)?)),
+            "reference" => references.push(require_value(&name, value)?),
+
+            // --- sticky buffers -------------------------------------------
+            keyword if Buffer::from_keyword(keyword).is_some() => {
+                if value.is_some() {
+                    return Err(invalid(&name, "a sticky-buffer keyword takes no value"));
+                }
+                buffer = Buffer::from_keyword(keyword).unwrap_or_default();
             }
+
+            // --- matching --------------------------------------------------
+            "content" => {
+                let pattern = parse_content_pattern(&require_value(&name, value)?)
+                    .map_err(|reason| invalid(&name, &reason))?;
+                if pattern.is_empty() {
+                    return Err(invalid(&name, "content must not be empty"));
+                }
+                let mut content = ContentMatch::new(pattern);
+                content.buffer = buffer;
+                content.negated = negated;
+                matches.push(RuleOption::Content(content));
+            }
+            "nocase" | "fast_pattern" | "startswith" | "offset" | "depth" | "distance"
+            | "within" => {
+                apply_content_modifier(&mut matches, &name, value.as_deref())?;
+            }
+            "pcre" => {
+                let mut pcre = parse_pcre(&require_value(&name, value)?)
+                    .map_err(|reason| invalid(&name, &reason))?;
+                pcre.buffer = buffer;
+                pcre.negated = negated;
+                matches.push(RuleOption::Pcre(pcre));
+            }
+            "flow" => matches.push(RuleOption::Flow(
+                parse_flow(&require_value(&name, value)?).map_err(|r| invalid(&name, &r))?,
+            )),
+            "flowbits" => {
+                let op = parse_flowbits(&require_value(&name, value)?)
+                    .map_err(|reason| invalid(&name, &reason))?;
+                if matches!(op, FlowBitsOp::NoAlert) {
+                    no_alert = true;
+                } else {
+                    matches.push(RuleOption::FlowBits(op));
+                }
+            }
+            "byte_test" => matches.push(RuleOption::ByteTest(
+                parse_byte_test(&require_value(&name, value)?).map_err(|r| invalid(&name, &r))?,
+            )),
+            "byte_jump" => matches.push(RuleOption::ByteJump(
+                parse_byte_jump(&require_value(&name, value)?).map_err(|r| invalid(&name, &r))?,
+            )),
+            "dsize" => matches.push(RuleOption::Dsize(
+                parse_dsize(&require_value(&name, value)?).map_err(|r| invalid(&name, &r))?,
+            )),
+            "normalized" => {
+                let text = require_value(&name, value)?;
+                let condition = NormalizationCondition::parse(&text)
+                    .ok_or_else(|| invalid(&name, &format!("unknown condition {text:?}")))?;
+                matches.push(RuleOption::Normalized(condition));
+            }
+            "threshold" => {
+                reject_duplicate(&threshold, "threshold")?;
+                threshold = Some(
+                    parse_threshold(&require_value(&name, value)?)
+                        .map_err(|reason| invalid(&name, &reason))?,
+                );
+            }
+
+            // --- recognised, not yet implemented ---------------------------
             other if RECOGNISED_UNIMPLEMENTED_OPTIONS.contains(&other) => {
                 if seen_unsupported.insert(other.to_string()) {
                     unsupported.push(other.to_string());
@@ -559,12 +643,353 @@ fn build_rule(header: RuleHeader, options: Vec<RawOption>, raw: &str) -> Result<
         header,
         sid: sid.ok_or(ParseError::MissingSid)?,
         rev: rev.unwrap_or(1),
+        gid,
+        priority,
         msg: msg.ok_or(ParseError::MissingMsg)?,
         classtype,
         metadata,
+        references,
+        options: matches,
+        threshold,
+        no_alert,
         unsupported_options: unsupported,
         raw: raw.to_string(),
         origin: None,
+    })
+}
+
+fn invalid(option: &str, reason: &str) -> ParseError {
+    ParseError::InvalidOptionValue {
+        option: option.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+/// Apply a modifier to the most recent `content`.
+///
+/// Modifiers are separate options that attach backwards, so one arriving with
+/// no content in front of it is a rule that does not mean what its author
+/// thought — an error, not something to ignore.
+fn apply_content_modifier(
+    matches: &mut [RuleOption],
+    name: &str,
+    value: Option<&str>,
+) -> Result<(), ParseError> {
+    let Some(RuleOption::Content(content)) = matches.last_mut() else {
+        return Err(invalid(name, "no preceding content for this modifier"));
+    };
+
+    let number = |what: &str| -> Result<i64, ParseError> {
+        value
+            .ok_or_else(|| ParseError::MissingOptionValue(name.to_string()))?
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| invalid(name, &format!("{what} must be a number")))
+    };
+
+    match name {
+        "nocase" => content.nocase = true,
+        "fast_pattern" => content.fast_pattern = true,
+        "startswith" => {
+            // Exactly "at the very start": offset 0, and no further than the
+            // pattern's own length.
+            content.offset = Some(0);
+            content.depth = Some(u32::try_from(content.pattern.len()).unwrap_or(u32::MAX));
+        }
+        "offset" => content.offset = Some(u32::try_from(number("offset")?).unwrap_or(0)),
+        "depth" => content.depth = Some(u32::try_from(number("depth")?).unwrap_or(0)),
+        "distance" => content.distance = Some(i32::try_from(number("distance")?).unwrap_or(0)),
+        "within" => content.within = Some(u32::try_from(number("within")?).unwrap_or(0)),
+        other => return Err(ParseError::UnknownOption(other.to_string())),
+    }
+    Ok(())
+}
+
+/// Parse a content pattern, resolving `|48 54 54 50|` hex sections.
+///
+/// Binary protocols need bytes that cannot be written literally, and a rule
+/// author writing `|0d 0a|` means CRLF rather than those six characters.
+fn parse_content_pattern(text: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut in_hex = false;
+    let mut nibbles = String::new();
+
+    for character in text.chars() {
+        if character == '|' {
+            if in_hex && !nibbles.is_empty() {
+                return Err("a hex section ended mid-byte".to_string());
+            }
+            in_hex = !in_hex;
+            continue;
+        }
+        if !in_hex {
+            // Non-ASCII in a content pattern is almost always a mistake — a
+            // smart quote pasted from a document — and silently encoding it as
+            // UTF-8 would produce a pattern that never matches.
+            if !character.is_ascii() {
+                return Err(format!(
+                    "non-ASCII character {character:?} in a pattern; use a |hex| section"
+                ));
+            }
+            out.push(character as u8);
+            continue;
+        }
+        if character.is_ascii_whitespace() {
+            continue;
+        }
+        if !character.is_ascii_hexdigit() {
+            return Err(format!("{character:?} is not a hex digit"));
+        }
+        nibbles.push(character);
+        if nibbles.len() == 2 {
+            let byte = u8::from_str_radix(&nibbles, 16).map_err(|error| error.to_string())?;
+            out.push(byte);
+            nibbles.clear();
+        }
+    }
+
+    if in_hex {
+        return Err("unterminated hex section".to_string());
+    }
+    Ok(out)
+}
+
+/// Parse `/expression/flags`.
+fn parse_pcre(text: &str) -> Result<PcreMatch, String> {
+    let text = text.trim();
+    let body = text
+        .strip_prefix('/')
+        .ok_or_else(|| "a pcre must be delimited with /".to_string())?;
+    let close = body
+        .rfind('/')
+        .ok_or_else(|| "a pcre must be delimited with /".to_string())?;
+    let (source, flags) = body.split_at(close);
+    if source.is_empty() {
+        return Err("empty expression".to_string());
+    }
+
+    let mut pcre = PcreMatch {
+        source: source.to_string(),
+        buffer: Buffer::Payload,
+        negated: false,
+        case_insensitive: false,
+        dot_matches_newline: false,
+        multi_line: false,
+        relative: false,
+    };
+    for flag in flags.trim_start_matches('/').chars() {
+        match flag {
+            'i' => pcre.case_insensitive = true,
+            's' => pcre.dot_matches_newline = true,
+            'm' => pcre.multi_line = true,
+            'R' => pcre.relative = true,
+            other => return Err(format!("unknown pcre flag {other:?}")),
+        }
+    }
+    Ok(pcre)
+}
+
+fn parse_flow(text: &str) -> Result<FlowMatch, String> {
+    let mut flow = FlowMatch::default();
+    for part in text.split(',') {
+        match part.trim() {
+            "established" => flow.established = Some(true),
+            "not_established" | "stateless" => flow.established = Some(false),
+            "to_server" | "from_client" => flow.to_server = Some(true),
+            "to_client" | "from_server" => flow.to_server = Some(false),
+            other => return Err(format!("unknown flow option {other:?}")),
+        }
+    }
+    Ok(flow)
+}
+
+fn parse_flowbits(text: &str) -> Result<FlowBitsOp, String> {
+    let mut parts = text.splitn(2, ',');
+    let command = parts.next().unwrap_or("").trim();
+    let name = parts.next().map(str::trim).unwrap_or("");
+
+    let named = |op: fn(String) -> FlowBitsOp| -> Result<FlowBitsOp, String> {
+        if name.is_empty() {
+            return Err(format!("flowbits:{command} needs a bit name"));
+        }
+        Ok(op(name.to_string()))
+    };
+
+    match command {
+        "set" => named(FlowBitsOp::Set),
+        "unset" => named(FlowBitsOp::Unset),
+        "toggle" => named(FlowBitsOp::Toggle),
+        "isset" => named(FlowBitsOp::IsSet),
+        "isnotset" => named(FlowBitsOp::IsNotSet),
+        "noalert" => Ok(FlowBitsOp::NoAlert),
+        other => Err(format!("unknown flowbits command {other:?}")),
+    }
+}
+
+fn parse_byte_test(text: &str) -> Result<ByteTest, String> {
+    let parts: Vec<&str> = text.split(',').map(str::trim).collect();
+    if parts.len() < 4 {
+        return Err("byte_test needs at least bytes, operator, value, offset".to_string());
+    }
+
+    let bytes: u8 = parts[0].parse().map_err(|_| "bytes must be a number")?;
+    if !(1..=8).contains(&bytes) {
+        return Err("byte_test can read between 1 and 8 bytes".to_string());
+    }
+    let (operator, negated) = match parts[1].strip_prefix('!') {
+        Some(rest) => (rest.trim(), true),
+        None => (parts[1], false),
+    };
+    let op = NumericOp::parse(operator).ok_or_else(|| format!("unknown operator {operator:?}"))?;
+    let value: u64 = parts[2].parse().map_err(|_| "value must be a number")?;
+    let offset: i32 = parts[3].parse().map_err(|_| "offset must be a number")?;
+
+    let mut test = ByteTest {
+        bytes,
+        op,
+        value,
+        offset,
+        relative: false,
+        endian: Endian::Big,
+        negated,
+    };
+    for modifier in &parts[4..] {
+        match *modifier {
+            "relative" => test.relative = true,
+            "big" => test.endian = Endian::Big,
+            "little" => test.endian = Endian::Little,
+            "" => {}
+            other => return Err(format!("unsupported byte_test modifier {other:?}")),
+        }
+    }
+    Ok(test)
+}
+
+fn parse_byte_jump(text: &str) -> Result<ByteJump, String> {
+    let parts: Vec<&str> = text.split(',').map(str::trim).collect();
+    if parts.len() < 2 {
+        return Err("byte_jump needs at least bytes and offset".to_string());
+    }
+
+    let bytes: u8 = parts[0].parse().map_err(|_| "bytes must be a number")?;
+    if !(1..=8).contains(&bytes) {
+        return Err("byte_jump can read between 1 and 8 bytes".to_string());
+    }
+    let offset: i32 = parts[1].parse().map_err(|_| "offset must be a number")?;
+
+    let mut jump = ByteJump {
+        bytes,
+        offset,
+        relative: false,
+        multiplier: 1,
+        endian: Endian::Big,
+        post_offset: 0,
+    };
+    let mut index = 2;
+    while index < parts.len() {
+        match parts[index] {
+            "relative" => jump.relative = true,
+            "big" => jump.endian = Endian::Big,
+            "little" => jump.endian = Endian::Little,
+            "" => {}
+            other => {
+                let mut words = other.split_whitespace();
+                match (words.next(), words.next()) {
+                    (Some("multiplier"), Some(value)) => {
+                        jump.multiplier =
+                            value.parse().map_err(|_| "multiplier must be a number")?;
+                    }
+                    (Some("post_offset"), Some(value)) => {
+                        jump.post_offset =
+                            value.parse().map_err(|_| "post_offset must be a number")?;
+                    }
+                    _ => return Err(format!("unsupported byte_jump modifier {other:?}")),
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(jump)
+}
+
+fn parse_dsize(text: &str) -> Result<DsizeMatch, String> {
+    let text = text.trim();
+    if let Some((low, high)) = text.split_once("<>") {
+        return Ok(DsizeMatch {
+            op: NumericOp::Greater,
+            value: low
+                .trim()
+                .parse()
+                .map_err(|_| "dsize bounds must be numbers")?,
+            upper: Some(
+                high.trim()
+                    .parse()
+                    .map_err(|_| "dsize bounds must be numbers")?,
+            ),
+        });
+    }
+
+    let split = text
+        .find(|c: char| c.is_ascii_digit())
+        .ok_or_else(|| "dsize needs a number".to_string())?;
+    let (operator, value) = text.split_at(split);
+    let op = if operator.trim().is_empty() {
+        NumericOp::Equal
+    } else {
+        NumericOp::parse(operator).ok_or_else(|| format!("unknown operator {operator:?}"))?
+    };
+    Ok(DsizeMatch {
+        op,
+        value: value.trim().parse().map_err(|_| "dsize must be a number")?,
+        upper: None,
+    })
+}
+
+fn parse_threshold(text: &str) -> Result<Threshold, String> {
+    let mut kind = None;
+    let mut track = None;
+    let mut count = None;
+    let mut seconds = None;
+
+    for part in text.split(',') {
+        let mut words = part.split_whitespace();
+        match (words.next(), words.next()) {
+            (Some("type"), Some(value)) => {
+                kind = Some(match value {
+                    "threshold" => ThresholdKind::Threshold,
+                    "limit" => ThresholdKind::Limit,
+                    "both" => ThresholdKind::Both,
+                    other => return Err(format!("unknown threshold type {other:?}")),
+                });
+            }
+            (Some("track"), Some(value)) => {
+                track = Some(match value {
+                    "by_src" => Track::BySource,
+                    "by_dst" => Track::ByDestination,
+                    "by_rule" => Track::ByRule,
+                    other => return Err(format!("unknown threshold track {other:?}")),
+                });
+            }
+            (Some("count"), Some(value)) => {
+                count = Some(value.parse().map_err(|_| "count must be a number")?);
+            }
+            (Some("seconds"), Some(value)) => {
+                seconds = Some(value.parse().map_err(|_| "seconds must be a number")?);
+            }
+            (Some(""), _) | (None, _) => {}
+            (Some(other), _) => return Err(format!("unknown threshold field {other:?}")),
+        }
+    }
+
+    let count = count.ok_or("threshold needs a count")?;
+    if count == 0 {
+        return Err("threshold count must be at least 1".to_string());
+    }
+    Ok(Threshold {
+        kind: kind.ok_or("threshold needs a type")?,
+        track: track.ok_or("threshold needs a track")?,
+        count,
+        seconds: seconds.ok_or("threshold needs a seconds window")?,
     })
 }
 
@@ -584,10 +1009,7 @@ fn parse_u32_option(name: &str, value: Option<&str>) -> Result<u32, ParseError> 
     value
         .trim()
         .parse()
-        .map_err(|_| ParseError::InvalidOptionValue {
-            option: name.to_string(),
-            reason: format!("{:?} is not a number in 0..=4294967295", value.trim()),
-        })
+        .map_err(|_| invalid(name, &format!("{:?} is not a number", value.trim())))
 }
 
 /// Parse `metadata:key value, key2 value2`.
@@ -614,6 +1036,7 @@ fn parse_metadata(value: &str) -> Vec<MetadataEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::options::{DsizeMatch, FlowMatch};
 
     const MINIMAL: &str = r#"alert tcp any any -> any any (msg:"minimal"; sid:1;)"#;
 
@@ -701,37 +1124,291 @@ mod tests {
     }
 
     #[test]
-    fn regex_escapes_are_left_alone() {
-        // `\d` must survive into Phase 3's regex compiler unchanged.
+    fn regex_escapes_reach_the_expression_unchanged() {
         let rule =
-            parse_rule(r#"alert tcp any any -> any any (msg:"m"; pcre:"/\d+/"; sid:6;)"#).unwrap();
-        assert_eq!(rule.unsupported_options, vec!["pcre".to_string()]);
-        assert!(rule.raw.contains(r"\d+"));
+            parse_rule(r#"alert tcp any any -> any any (msg:"m"; pcre:"/\d+/i"; sid:6;)"#).unwrap();
+        let Some(RuleOption::Pcre(pcre)) = rule.options.first() else {
+            panic!("expected a pcre option, got {:?}", rule.options);
+        };
+        assert_eq!(pcre.source, r"\d+");
+        assert!(pcre.case_insensitive);
+        assert!(rule.is_evaluable());
     }
 
     #[test]
-    fn a_valueless_option_is_accepted() {
+    fn a_sticky_buffer_applies_to_the_matches_that_follow_it() {
         let rule = parse_rule(
-            r#"alert http any any -> any any (msg:"m"; http.uri; content:"x"; nocase; sid:7;)"#,
+            r#"alert http any any -> any any (msg:"m"; http.uri; content:"x"; nocase; content:"y"; http.header; content:"z"; sid:7;)"#,
         )
         .unwrap();
+        assert!(rule.is_evaluable());
+
+        let buffers: Vec<Buffer> = rule.options.iter().filter_map(RuleOption::buffer).collect();
         assert_eq!(
-            rule.unsupported_options,
-            vec!["http.uri", "content", "nocase"]
+            buffers,
+            vec![Buffer::HttpUri, Buffer::HttpUri, Buffer::HttpHeader],
+            "the buffer persists until another keyword changes it"
         );
-        assert!(
-            !rule.is_evaluable(),
-            "match conditions are not implemented yet"
-        );
+
+        let Some(RuleOption::Content(first)) = rule.options.first() else {
+            panic!("expected content");
+        };
+        assert!(first.nocase, "nocase attaches to the content before it");
+        assert!(rule.needs_http());
     }
 
     #[test]
     fn repeated_unsupported_options_are_listed_once() {
         let rule = parse_rule(
-            r#"alert tcp any any -> any any (msg:"m"; content:"a"; content:"b"; sid:8;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; content:"a"; endswith; content:"b"; endswith; sid:8;)"#,
         )
         .unwrap();
-        assert_eq!(rule.unsupported_options, vec!["content".to_string()]);
+        assert_eq!(rule.unsupported_options, vec!["endswith".to_string()]);
+        assert!(!rule.is_evaluable());
+    }
+
+    // -----------------------------------------------------------------------
+    // match conditions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_content_with_its_modifiers() {
+        let rule = parse_rule(
+            r#"alert tcp any any -> any any (msg:"m"; content:"GET"; offset:0; depth:3; content:"HTTP"; distance:1; within:20; fast_pattern; sid:1;)"#,
+        )
+        .unwrap();
+
+        let Some(RuleOption::Content(first)) = rule.options.first() else {
+            panic!("expected content");
+        };
+        assert_eq!(first.pattern, b"GET");
+        assert_eq!(first.offset, Some(0));
+        assert_eq!(first.depth, Some(3));
+        assert!(!first.is_relative());
+
+        let Some(RuleOption::Content(second)) = rule.options.get(1) else {
+            panic!("expected a second content");
+        };
+        assert_eq!(second.distance, Some(1));
+        assert_eq!(second.within, Some(20));
+        assert!(second.is_relative());
+        assert!(second.fast_pattern);
+    }
+
+    #[test]
+    fn parses_hex_sections_in_content() {
+        let rule = parse_rule(
+            r#"alert tcp any any -> any any (msg:"m"; content:"GET|20 2f|HTTP|0d0a|"; sid:1;)"#,
+        )
+        .unwrap();
+        let Some(RuleOption::Content(content)) = rule.options.first() else {
+            panic!("expected content");
+        };
+        assert_eq!(content.pattern, b"GET /HTTP\r\n");
+    }
+
+    #[test]
+    fn rejects_malformed_hex_sections() {
+        for text in [
+            r#"alert tcp any any -> any any (msg:"m"; content:"|41"; sid:1;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; content:"|4|"; sid:1;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; content:"|zz|"; sid:1;)"#,
+        ] {
+            assert!(
+                parse_rule(text).is_err(),
+                "should have been rejected: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negated_content_is_recognised_as_such() {
+        let rule =
+            parse_rule(r#"alert tcp any any -> any any (msg:"m"; content:!"benign"; sid:1;)"#)
+                .unwrap();
+        let Some(RuleOption::Content(content)) = rule.options.first() else {
+            panic!("expected content");
+        };
+        assert!(content.negated);
+        assert_eq!(content.pattern, b"benign");
+        assert!(!content.usable_as_fast_pattern());
+    }
+
+    #[test]
+    fn startswith_anchors_the_pattern_to_the_start() {
+        let rule = parse_rule(
+            r#"alert tcp any any -> any any (msg:"m"; content:"GET"; startswith; sid:1;)"#,
+        )
+        .unwrap();
+        let Some(RuleOption::Content(content)) = rule.options.first() else {
+            panic!("expected content");
+        };
+        assert_eq!(content.offset, Some(0));
+        assert_eq!(content.depth, Some(3));
+    }
+
+    #[test]
+    fn a_modifier_with_no_content_before_it_is_an_error() {
+        // Silently ignoring it would leave a rule that does not mean what its
+        // author wrote.
+        let error =
+            parse_rule(r#"alert tcp any any -> any any (msg:"m"; nocase; sid:1;)"#).unwrap_err();
+        assert!(
+            error.to_string().contains("no preceding content"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parses_flow_and_flowbits() {
+        let rule = parse_rule(
+            r#"alert tcp any any -> any any (msg:"m"; flow:established,to_server; flowbits:isset,logged_in; flowbits:set,seen; sid:1;)"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            rule.options.first(),
+            Some(RuleOption::Flow(FlowMatch {
+                established: Some(true),
+                to_server: Some(true)
+            }))
+        ));
+        assert!(matches!(
+            rule.options.get(1),
+            Some(RuleOption::FlowBits(FlowBitsOp::IsSet(_)))
+        ));
+    }
+
+    #[test]
+    fn flowbits_noalert_marks_the_rule_rather_than_adding_a_condition() {
+        let rule = parse_rule(
+            r#"alert tcp any any -> any any (msg:"m"; flowbits:set,seen; flowbits:noalert; sid:1;)"#,
+        )
+        .unwrap();
+        assert!(rule.no_alert);
+        assert_eq!(rule.options.len(), 1, "noalert is not a match condition");
+    }
+
+    #[test]
+    fn parses_byte_test_and_byte_jump() {
+        let rule = parse_rule(
+            r#"alert tcp any any -> any any (msg:"m"; byte_test:2,>,1000,0,relative,little; byte_jump:4,0,relative,multiplier 2,post_offset -4; sid:1;)"#,
+        )
+        .unwrap();
+
+        let Some(RuleOption::ByteTest(test)) = rule.options.first() else {
+            panic!("expected byte_test");
+        };
+        assert_eq!(test.bytes, 2);
+        assert_eq!(test.op, NumericOp::Greater);
+        assert_eq!(test.value, 1_000);
+        assert!(test.relative);
+        assert_eq!(test.endian, Endian::Little);
+
+        let Some(RuleOption::ByteJump(jump)) = rule.options.get(1) else {
+            panic!("expected byte_jump");
+        };
+        assert_eq!(jump.multiplier, 2);
+        assert_eq!(jump.post_offset, -4);
+        assert!(jump.relative);
+    }
+
+    #[test]
+    fn parses_dsize_comparisons_and_ranges() {
+        let single =
+            parse_rule(r#"alert udp any any -> any any (msg:"m"; dsize:>200; sid:1;)"#).unwrap();
+        assert!(matches!(
+            single.options.first(),
+            Some(RuleOption::Dsize(DsizeMatch {
+                op: NumericOp::Greater,
+                value: 200,
+                upper: None
+            }))
+        ));
+
+        let range = parse_rule(r#"alert udp any any -> any any (msg:"m"; dsize:100<>200; sid:1;)"#)
+            .unwrap();
+        let Some(RuleOption::Dsize(dsize)) = range.options.first() else {
+            panic!("expected dsize");
+        };
+        assert_eq!(dsize.upper, Some(200));
+    }
+
+    #[test]
+    fn parses_threshold() {
+        let rule = parse_rule(
+            r#"alert tcp any any -> any any (msg:"m"; threshold:type threshold, track by_src, count 20, seconds 60; sid:1;)"#,
+        )
+        .unwrap();
+        let threshold = rule.threshold.expect("a threshold");
+        assert_eq!(threshold.kind, ThresholdKind::Threshold);
+        assert_eq!(threshold.track, Track::BySource);
+        assert_eq!(threshold.count, 20);
+        assert_eq!(threshold.seconds, 60);
+    }
+
+    #[test]
+    fn an_incomplete_threshold_is_rejected() {
+        // Half a threshold would silently rate-limit differently from what the
+        // author wrote.
+        for text in [
+            r#"alert tcp any any -> any any (msg:"m"; threshold:type threshold, count 5; sid:1;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; threshold:track by_src, count 5, seconds 60; sid:1;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; threshold:type threshold, track by_src, count 0, seconds 60; sid:1;)"#,
+        ] {
+            assert!(
+                parse_rule(text).is_err(),
+                "should have been rejected: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_normalization_conditions() {
+        let rule = parse_rule(
+            r#"alert http any any -> any any (msg:"m"; http.uri; normalized:double_encoded; sid:1;)"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            rule.options.last(),
+            Some(RuleOption::Normalized(
+                NormalizationCondition::DoubleEncoded
+            ))
+        ));
+    }
+
+    #[test]
+    fn priority_becomes_the_alert_severity() {
+        let rule =
+            parse_rule(r#"alert tcp any any -> any any (msg:"m"; priority:1; sid:1;)"#).unwrap();
+        assert_eq!(rule.severity(), 1);
+
+        let default = parse_rule(r#"alert tcp any any -> any any (msg:"m"; sid:1;)"#).unwrap();
+        assert_eq!(
+            default.severity(),
+            3,
+            "an author who says nothing gets the middle"
+        );
+    }
+
+    #[test]
+    fn malformed_option_values_are_rejected_with_a_reason() {
+        for text in [
+            r#"alert tcp any any -> any any (msg:"m"; flow:sideways; sid:1;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; flowbits:frobnicate,x; sid:1;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; flowbits:set; sid:1;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; pcre:"no-delimiters"; sid:1;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; pcre:"/x/q"; sid:1;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; byte_test:99,>,1,0; sid:1;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; byte_test:2,nonsense,1,0; sid:1;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; dsize:abc; sid:1;)"#,
+            r#"alert http any any -> any any (msg:"m"; normalized:nonsense; sid:1;)"#,
+            r#"alert tcp any any -> any any (msg:"m"; http.uri:value; sid:1;)"#,
+        ] {
+            assert!(
+                parse_rule(text).is_err(),
+                "should have been rejected: {text}"
+            );
+        }
     }
 
     #[test]

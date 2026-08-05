@@ -48,11 +48,16 @@
 
 pub mod loader;
 pub mod model;
+pub mod options;
 pub mod parser;
 
 pub use loader::{LoadReport, RuleSet, SkippedRule};
 pub use model::{
     Action, AddressSpec, AddressValue, Direction, MetadataEntry, PortSpec, PortValue, Protocol,
     Rule, RuleHeader, RuleOrigin,
+};
+pub use options::{
+    Buffer, ByteJump, ByteTest, ContentMatch, DsizeMatch, Endian, FlowBitsOp, FlowMatch,
+    NormalizationCondition, NumericOp, PcreMatch, RuleOption, Threshold, ThresholdKind, Track,
 };
 pub use parser::{parse_rule, ParseError};

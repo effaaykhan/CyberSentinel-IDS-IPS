@@ -364,23 +364,23 @@ alert udp any any -> any any (msg:"second"; sid:7;)
     #[test]
     fn counts_unsupported_options_per_keyword() {
         let (_, report) = load(
-            r#"alert tcp any any -> any any (msg:"a"; content:"x"; sid:1;)
-alert tcp any any -> any any (msg:"b"; content:"y"; pcre:"/z/"; sid:2;)
-alert tcp any any -> any any (msg:"c"; sid:3;)
+            r#"alert tcp any any -> any any (msg:"a"; content:"x"; endswith; sid:1;)
+alert tcp any any -> any any (msg:"b"; content:"y"; endswith; detection_filter:x; sid:2;)
+alert tcp any any -> any any (msg:"c"; content:"z"; sid:3;)
 "#,
         );
         assert_eq!(report.loaded, 3);
         assert_eq!(report.evaluable, 1);
         assert_eq!(report.non_evaluable(), 2);
-        assert_eq!(report.unsupported_options["content"], 2);
-        assert_eq!(report.unsupported_options["pcre"], 1);
+        assert_eq!(report.unsupported_options["endswith"], 2);
+        assert_eq!(report.unsupported_options["detection_filter"], 1);
     }
 
     #[test]
     fn evaluable_iterator_excludes_inert_rules() {
         let (set, _) = load(
-            r#"alert tcp any any -> any any (msg:"inert"; content:"x"; sid:1;)
-alert tcp any any -> any any (msg:"live"; sid:2;)
+            r#"alert tcp any any -> any any (msg:"inert"; content:"x"; endswith; sid:1;)
+alert tcp any any -> any any (msg:"live"; content:"y"; sid:2;)
 "#,
         );
         let live: Vec<u32> = set.evaluable().map(|rule| rule.sid).collect();
@@ -435,7 +435,7 @@ alert tcp any any -> any any (msg:"live"; sid:2;)
     fn summary_reports_every_bucket() {
         let (_, report) = load(
             r#"alert tcp any any -> any any (msg:"a"; sid:1;)
-alert tcp any any -> any any (msg:"b"; content:"x"; sid:2;)
+alert tcp any any -> any any (msg:"b"; content:"x"; endswith; sid:2;)
 garbage
 "#,
         );

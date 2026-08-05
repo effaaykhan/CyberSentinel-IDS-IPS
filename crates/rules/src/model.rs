@@ -3,6 +3,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::options::{Buffer, RuleOption, Threshold};
+
 /// What a rule does when it matches.
 ///
 /// v1 is detection-only, so `drop` and `reject` are rejected at parse time
@@ -220,12 +222,28 @@ pub struct Rule {
     pub sid: u32,
     /// Revision. Defaults to 1 when the rule omits `rev`.
     pub rev: u32,
+    /// Generator id, if the rule declared one.
+    pub gid: Option<u32>,
+    /// Priority, 1 (most urgent) to 255. Becomes the alert's severity.
+    pub priority: Option<u8>,
     /// Human-readable description from `msg`.
     pub msg: String,
     /// `classtype`, if declared.
     pub classtype: Option<String>,
     /// `metadata` entries, in the order they appeared.
     pub metadata: Vec<MetadataEntry>,
+    /// `reference` entries, for the analyst rather than the engine.
+    pub references: Vec<String>,
+    /// Match conditions, in the order they were written.
+    ///
+    /// Order is load-bearing: `distance` and `within` are measured from the
+    /// previous match, and `byte_jump` moves the cursor the options after it
+    /// read from.
+    pub options: Vec<RuleOption>,
+    /// Rate limiting, if the rule declared any.
+    pub threshold: Option<Threshold>,
+    /// The rule tracks state without alerting (`flowbits:noalert`).
+    pub no_alert: bool,
     /// Option keywords this build recognises but cannot yet evaluate, in the
     /// order they appeared and without duplicates.
     ///
@@ -247,6 +265,30 @@ impl Rule {
     #[must_use]
     pub fn is_evaluable(&self) -> bool {
         self.unsupported_options.is_empty()
+    }
+
+    /// Severity for the alert this rule raises.
+    ///
+    /// Defaults to 3 — "worth looking at" — when the rule says nothing, so an
+    /// author who does not think about priority does not get the loudest one.
+    #[must_use]
+    pub fn severity(&self) -> u8 {
+        self.priority.unwrap_or(3)
+    }
+
+    /// Every buffer this rule inspects.
+    #[must_use]
+    pub fn buffers(&self) -> Vec<Buffer> {
+        let mut buffers: Vec<Buffer> = self.options.iter().filter_map(RuleOption::buffer).collect();
+        buffers.sort_unstable();
+        buffers.dedup();
+        buffers
+    }
+
+    /// Whether matching this rule needs the HTTP parser.
+    #[must_use]
+    pub fn needs_http(&self) -> bool {
+        self.header.protocol.is_app_layer() || self.buffers().iter().any(|b| b.is_http())
     }
 
     /// Whether this is a host rule, by the SID convention (guide §3.1).
