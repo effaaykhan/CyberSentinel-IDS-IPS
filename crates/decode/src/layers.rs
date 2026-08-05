@@ -64,6 +64,12 @@ pub struct Ipv6Info {
     pub header_len: usize,
     /// Whether a fragment extension header was present.
     pub is_fragment: bool,
+    /// Fragment offset in 8-byte units, from the fragment extension header.
+    pub fragment_offset: u16,
+    /// The "more fragments" flag from the fragment extension header.
+    pub more_fragments: bool,
+    /// Fragment identification, used to group fragments in Phase 2.
+    pub identification: u32,
 }
 
 impl Network {

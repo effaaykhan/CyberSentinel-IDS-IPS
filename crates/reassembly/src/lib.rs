@@ -15,25 +15,20 @@
 //! [`flow`], the bounded flow table those limits first apply to and the state
 //! Phase 2's stream reassembly is keyed on.
 
+pub mod defrag;
 pub mod flow;
+pub mod normalize;
+pub mod policy;
+pub mod range_buffer;
 
 pub use flow::{EndReason, EndedFlow, Endpoint, Flow, FlowCounters, FlowId, FlowKey, FlowTable};
+pub use range_buffer::{RangeBuffer, WriteOutcome};
 
 use std::time::Duration;
 
-/// How to resolve overlapping TCP segments or IP fragments that disagree.
-///
-/// The correct choice depends on the *destination* operating system, which is
-/// why this is per-target policy rather than a global switch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum OverlapPolicy {
-    /// First data received wins (Linux, most BSDs).
-    #[default]
-    First,
-    /// Last data received wins (older Windows).
-    Last,
-}
+/// Re-exported from the config crate: overlap policy is a configured value,
+/// and the loader has to validate it, but it *means* something only here.
+pub use cybersentinel_common::config::{HostPolicy, OverlapPolicy};
 
 /// Hard caps on reassembly state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

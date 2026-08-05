@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::net::IpNetwork;
 
 /// Top-level `config.yaml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +40,8 @@ pub struct Config {
     pub decode: DecodeConfig,
     /// Flow tracking.
     pub flow: FlowConfig,
+    /// IP defragmentation and TCP stream reassembly.
+    pub reassembly: ReassemblyConfig,
     /// Which `.rules` files to load.
     pub rules: RulesConfig,
     /// Where events go.
@@ -188,6 +191,178 @@ impl Default for FlowConfig {
             timeout_secs: 300,
             emit_events: true,
         }
+    }
+}
+
+/// How to resolve overlapping TCP segments or IP fragments whose data
+/// **disagrees**.
+///
+/// This is the evasion-resistance decision (guide §6). When two copies of the
+/// same byte range arrive with different contents, the sensor has to pick one —
+/// and it must pick the same one the *destination host* will, or an attacker
+/// can put one payload in front of the sensor and a different one in front of
+/// the host.
+///
+/// The policy is **configured, not detected**: OS fingerprinting to guess a
+/// stack's behaviour is itself evadable, and a wrong guess fails silently. An
+/// operator who knows their network states what is on it.
+///
+/// Extensible on purpose — OS-family policies (`bsd`, `solaris`, ...) are the
+/// obvious next entries, and adding one must not be a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum OverlapPolicy {
+    /// The data received **first** wins. Linux and most BSDs.
+    #[default]
+    First,
+    /// The data received **last** wins. Older Windows stacks.
+    Last,
+}
+
+impl OverlapPolicy {
+    /// Stable identifier used in config and logs.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::Last => "last",
+        }
+    }
+}
+
+impl std::fmt::Display for OverlapPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// An overlap-policy override for one network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct HostPolicy {
+    /// The network this applies to, in CIDR form. A bare address is one host.
+    pub network: IpNetwork,
+    /// The policy to use for hosts in it.
+    pub policy: OverlapPolicy,
+}
+
+/// IP defragmentation and TCP stream reassembly.
+///
+/// Everything here is either an evasion-resistance decision or a hard bound on
+/// state. Both matter more than they look: get the first wrong and attacks pass
+/// silently, get the second wrong and the sensor is a memory-exhaustion target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct ReassemblyConfig {
+    /// Policy for hosts with no more specific entry in
+    /// [`ReassemblyConfig::host_policies`].
+    pub overlap_policy: OverlapPolicy,
+
+    /// Per-network overrides, matched against the **destination** of the data —
+    /// the host whose stack decides what the bytes mean.
+    ///
+    /// Longest prefix wins, so a `/32` beats a `/24` regardless of order in the
+    /// file. Overlapping entries of the same length are a config error rather
+    /// than a silent first-wins.
+    pub host_policies: Vec<HostPolicy>,
+
+    /// Maximum concurrent in-progress IP fragment reassemblies.
+    pub max_fragment_sets: usize,
+    /// Maximum bytes held across all in-progress fragment reassemblies.
+    pub max_fragment_bytes_total: usize,
+    /// Seconds after which an incomplete fragment set is discarded.
+    ///
+    /// A datagram whose fragments never all arrive is either a broken path or
+    /// an attempt to pin memory; either way it must not be held forever.
+    pub fragment_timeout_secs: u64,
+
+    /// Maximum bytes buffered per flow direction awaiting reassembly.
+    pub max_stream_bytes_per_flow: usize,
+    /// Maximum bytes buffered across every flow direction.
+    pub max_stream_bytes_total: usize,
+
+    /// Deliver un-acknowledged data once this many bytes have buffered.
+    ///
+    /// Reassembled bytes are normally held until the peer acknowledges them,
+    /// which is what makes overlap policy meaningful: a retransmission that
+    /// contradicts earlier data always arrives before the ACK, so the policy
+    /// still has both copies to choose between. On a path where the reverse
+    /// direction is not visible — asymmetric routing, a one-way tap — no ACK
+    /// ever arrives, so this is the fallback that keeps matching working.
+    pub delivery_flush_bytes: usize,
+}
+
+impl Default for ReassemblyConfig {
+    fn default() -> Self {
+        Self {
+            overlap_policy: OverlapPolicy::First,
+            host_policies: Vec::new(),
+            max_fragment_sets: 4_096,
+            max_fragment_bytes_total: 32 << 20,
+            fragment_timeout_secs: 60,
+            max_stream_bytes_per_flow: 1 << 20,
+            max_stream_bytes_total: 256 << 20,
+            delivery_flush_bytes: 64 << 10,
+        }
+    }
+}
+
+impl ReassemblyConfig {
+    /// Reject values the reassembler cannot act on.
+    ///
+    /// # Errors
+    /// [`Error::ConfigInvalid`] naming the offending key.
+    pub fn check(&self) -> Result<()> {
+        if self.max_fragment_sets == 0 {
+            return Err(Error::ConfigInvalid(
+                "reassembly.max-fragment-sets must be at least 1".into(),
+            ));
+        }
+        if self.fragment_timeout_secs == 0 {
+            return Err(Error::ConfigInvalid(
+                "reassembly.fragment-timeout-secs must be at least 1".into(),
+            ));
+        }
+        if self.max_stream_bytes_per_flow == 0 {
+            return Err(Error::ConfigInvalid(
+                "reassembly.max-stream-bytes-per-flow must be at least 1".into(),
+            ));
+        }
+        if self.max_stream_bytes_total < self.max_stream_bytes_per_flow {
+            return Err(Error::ConfigInvalid(
+                "reassembly.max-stream-bytes-total must be at least \
+                 reassembly.max-stream-bytes-per-flow, or no single flow could ever \
+                 reach its own limit"
+                    .into(),
+            ));
+        }
+        if self.delivery_flush_bytes == 0 {
+            return Err(Error::ConfigInvalid(
+                "reassembly.delivery-flush-bytes must be at least 1".into(),
+            ));
+        }
+        if self.delivery_flush_bytes > self.max_stream_bytes_per_flow {
+            return Err(Error::ConfigInvalid(
+                "reassembly.delivery-flush-bytes must not exceed \
+                 reassembly.max-stream-bytes-per-flow, or the per-flow cap would be hit \
+                 before un-acknowledged data was ever flushed"
+                    .into(),
+            ));
+        }
+
+        // Two entries for the same network are ambiguous, and picking one
+        // silently would leave an operator believing the other applied.
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &self.host_policies {
+            if !seen.insert(entry.network.to_string()) {
+                return Err(Error::ConfigInvalid(format!(
+                    "reassembly.host-policies lists {} more than once",
+                    entry.network
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -407,6 +582,7 @@ impl Config {
                 "flow.timeout-secs must be at least 1".into(),
             ));
         }
+        self.reassembly.check()?;
         match self.logging.level.to_ascii_lowercase().as_str() {
             "error" | "warn" | "info" | "debug" | "trace" => {}
             other => {

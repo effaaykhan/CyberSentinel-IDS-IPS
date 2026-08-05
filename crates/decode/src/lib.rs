@@ -389,6 +389,8 @@ fn decode_ipv6(decoded: &mut Decoded<'_>, slice: &[u8]) {
     let mut cursor = after_header;
     let mut is_fragment = false;
     let mut fragment_offset = 0u16;
+    let mut more_fragments = false;
+    let mut identification = 0u32;
     let mut walked = 0;
 
     while is_ipv6_extension(protocol) {
@@ -406,9 +408,14 @@ fn decode_ipv6(decoded: &mut Decoded<'_>, slice: &[u8]) {
         };
         if protocol == IpNumber::IPV6_FRAGMENTATION_HEADER {
             is_fragment = true;
-            // Offset is the top 13 bits of bytes 2..4.
+            // Bytes 2..4 hold the offset in the top 13 bits and the "more
+            // fragments" flag in the lowest; bytes 4..8 hold the id.
             if let (Some(&hi), Some(&lo)) = (cursor.get(2), cursor.get(3)) {
                 fragment_offset = (u16::from(hi) << 8 | u16::from(lo)) >> 3;
+                more_fragments = lo & 1 != 0;
+            }
+            if let Some(bytes) = cursor.get(4..8) {
+                identification = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             }
         }
         protocol = IpNumber(cursor[0]);
@@ -425,6 +432,9 @@ fn decode_ipv6(decoded: &mut Decoded<'_>, slice: &[u8]) {
         payload_length: header.payload_length,
         header_len,
         is_fragment,
+        fragment_offset,
+        more_fragments,
+        identification,
     }));
 
     let claimed_end = start
@@ -468,6 +478,22 @@ fn ipv6_extension_len(protocol: IpNumber, slice: &[u8]) -> Option<usize> {
         _ => (usize::from(slice[1]) + 1) * 8,
     };
     (slice.len() >= len).then_some(len)
+}
+
+/// Decode a transport header from a standalone buffer.
+///
+/// Used for a datagram that has just been reassembled from IP fragments: the
+/// network layer is already known to the caller, and what is left is a
+/// transport header sitting at offset zero of its own buffer.
+///
+/// The returned [`Decoded`] has no network layer, so `five_tuple` returns
+/// `None` — the caller pairs the transport it gets back with the addresses it
+/// already has.
+#[must_use]
+pub fn decode_transport_bytes(bytes: &[u8], protocol: u8) -> Decoded<'_> {
+    let mut decoded = Decoded::new(bytes, bytes.len());
+    decode_transport(&mut decoded, IpNumber(protocol), 0, bytes.len());
+    decoded
 }
 
 /// Decode the transport header living at `start`, with the IP packet ending at

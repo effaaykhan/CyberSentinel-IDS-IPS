@@ -16,12 +16,14 @@ pub mod config;
 pub mod error;
 pub mod event;
 pub mod eventlog;
+pub mod net;
 pub mod sensor;
 pub mod time;
 
 pub use error::{Error, Result};
 pub use event::{Event, EventKind, Payload, SensorInfo};
 pub use eventlog::{EventEmitter, EventPipeline, EventSink, PipelineCounters, PipelineSnapshot};
+pub use net::IpNetwork;
 pub use time::Timestamp;
 
 /// Version of the sensor, taken from the crate metadata at build time.
