@@ -240,6 +240,27 @@ fn stop(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// Wait until a stats event reports a non-empty FIM baseline.
+///
+/// Returns false if it never does, so the caller can fail with a message about
+/// the baseline rather than about whatever went wrong afterwards.
+fn wait_for_baseline(events: &Path, seconds: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while std::time::Instant::now() < deadline {
+        let established = read_events(events).iter().any(|event| {
+            event["event_type"] == "stats"
+                && event["stats"]["hids"]["baseline_entries"]
+                    .as_u64()
+                    .is_some_and(|entries| entries > 0)
+        });
+        if established {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    false
+}
+
 fn read_events(path: &Path) -> Vec<Value> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     text.lines()
@@ -542,7 +563,16 @@ fn a_host_event_and_a_network_alert_become_one_incident() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("starting the sensor");
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    // Wait for the baseline to actually exist rather than sleeping a fixed
+    // interval and hoping. A first scan takes as long as it takes, and under a
+    // parallel test run it takes longer — a fixed sleep made this test fail
+    // intermittently on a sensor that was working perfectly. A check that cries
+    // wolf gets re-run rather than investigated, which is how a real failure
+    // gets missed.
+    assert!(
+        wait_for_baseline(&scratch.path().join("logs/events.json"), 60),
+        "the warmup never established a baseline"
+    );
     stop(&mut warmup);
     let _ = std::fs::remove_file(scratch.path().join("logs/events.json"));
 
