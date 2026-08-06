@@ -294,6 +294,15 @@ impl Event {
 pub enum AlertAction {
     /// The event was recorded; traffic was not altered.
     Alerted,
+    /// The event was recorded **and** the traffic was acted on: the flow was
+    /// terminated and its source blocked from this point on.
+    ///
+    /// Deliberately not read as "no byte of this attack reached the target".
+    /// Matching needs reassembly, so the packets that carried the signature
+    /// have already been forwarded by the time a rule can match on them. What
+    /// `blocked` promises is that the rest of the flow and subsequent
+    /// connections from that source are dropped — see `crates/prevent`.
+    Blocked,
 }
 
 /// Which sensor half produced an alert.
@@ -875,6 +884,58 @@ pub struct SourceStatus {
     pub detail: String,
     /// How much this source has produced since start.
     pub records: u64,
+}
+
+/// Counters for inline prevention.
+///
+/// `mode` and `fail_mode` are strings rather than counters on purpose: an
+/// operator reading a `stats` event needs to know whether this sensor is
+/// currently able to drop anything at all, and inferring that from a zero
+/// drop count is exactly the ambiguity the rest of this schema avoids.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreventStats {
+    /// Whether inline prevention is running at all.
+    pub enabled: bool,
+    /// `detect` or `prevent`. **The arming state.**
+    pub mode: String,
+    /// `open` or `closed` — what the kernel does when the sensor is not
+    /// answering. Enforced by the queueing rule, not by the sensor.
+    pub fail_mode: String,
+    /// Packets the verdict path judged.
+    pub packets_judged: u64,
+    /// Packets dropped.
+    pub packets_dropped: u64,
+    /// Packets that passed because an endpoint is on the allow-list.
+    pub allow_listed_passes: u64,
+    /// Block verdicts refused because an endpoint is on the allow-list.
+    ///
+    /// Non-zero means a rule is matching traffic an operator has declared
+    /// must never be blocked — worth knowing, in both directions.
+    pub allow_listed_blocks_refused: u64,
+    /// Flows condemned by a rule.
+    pub flows_blocked: u64,
+    /// Sources added to the block set.
+    pub sources_blocked: u64,
+    /// Flows currently carrying a block verdict.
+    pub blocked_flows_active: u64,
+    /// Sources currently blocked.
+    pub blocked_sources_active: u64,
+    /// Flow verdicts that lapsed.
+    pub flow_verdicts_expired: u64,
+    /// Source blocks that lapsed.
+    pub source_blocks_expired: u64,
+    /// Block verdicts that could not be recorded because state was full.
+    ///
+    /// **A coverage hole**: a rule asked for traffic to be dropped and it was
+    /// not.
+    pub blocks_dropped_at_capacity: u64,
+    /// Packets the kernel disposed of by the fail mode rather than asking.
+    pub fail_mode_packets: u64,
+    /// Total verdict latency in microseconds, for an average.
+    pub verdict_latency_us_total: u64,
+    /// Worst verdict latency seen, in microseconds. Every microsecond here is
+    /// added to every packet on the path.
+    pub verdict_latency_us_max: u64,
 }
 
 /// Counters for host monitoring.

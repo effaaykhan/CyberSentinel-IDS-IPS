@@ -23,6 +23,7 @@ cybersentinel-applayer = { path = "crates/applayer", version = "0.1.0" }
 cybersentinel-rules = { path = "crates/rules", version = "0.1.0" }
 cybersentinel-engine = { path = "crates/engine", version = "0.1.0" }
 cybersentinel-hids = { path = "crates/hids", version = "0.1.0" }
+cybersentinel-prevent = { path = "crates/prevent", version = "0.1.0" }
 cybersentinel-correlation = { path = "crates/correlation", version = "0.1.0" }
 cybersentinel-storage = { path = "crates/storage", version = "0.1.0" }
 cybersentinel-alerting = { path = "crates/alerting", version = "0.1.0" }
@@ -41,6 +42,8 @@ etherparse = "0.21"
 # Rule regexes. `regex` rather than PCRE for its linear-time guarantee - rule
 # content is attacker-adjacent as soon as rulesets are shared.
 regex = "1"
+# Inline prevention. Pure Rust over netlink — no libnetfilter_queue, no C.
+nfq = "0.2"
 # Live capture only. Reading .pcap *files* is implemented in-tree so the test and
 # CI path needs no libpcap at all — see crates/capture/README.md.
 pcap = "2"

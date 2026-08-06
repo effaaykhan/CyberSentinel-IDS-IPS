@@ -1,0 +1,23 @@
+[package]
+name = "cybersentinel-prevent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CyberSentinel inline prevention: verdicts, flow drops, and source blocking"
+
+[lints]
+workspace = true
+
+[dependencies]
+cybersentinel-common.workspace = true
+tracing.workspace = true
+
+# Pure-Rust NFQUEUE over netlink. Notably **not** a binding to
+# libnetfilter_queue: it depends on `libc` alone, compiles no C, and needs no
+# package installed on the target. That is why this crate keeps the workspace's
+# `unsafe_code = "forbid"` rather than becoming the FFI-only crate the Windows
+# port will still need.
+[target.'cfg(target_os = "linux")'.dependencies]
+nfq.workspace = true
