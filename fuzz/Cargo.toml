@@ -101,3 +101,10 @@ path = "fuzz_targets/proc_reader.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "usn_journal"
+path = "fuzz_targets/usn_journal.rs"
+test = false
+doc = false
+bench = false
