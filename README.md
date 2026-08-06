@@ -38,6 +38,12 @@ as one incident rather than two log lines.
 service, and a check that verifies the privilege model on the installed sensor
 rather than asserting it in a document.
 
+**Windows is not ported yet.** The sensor builds and its tests compile for
+Windows, but the host backends are Linux-only, so a Windows build now *says so*
+— every event source reports whether it is working, and one with no
+implementation reports `unsupported` rather than quietly emitting zeroes. See
+[`packaging/windows/PORT-PLAN.md`](packaging/windows/PORT-PLAN.md).
+
 What works today:
 
 * **Packet capture** — live via libpcap (Linux, macOS), or replaying a `.pcap`
