@@ -19,6 +19,7 @@ cybersentinel-applayer = { path = "../crates/applayer" }
 cybersentinel-common = { path = "../crates/common" }
 cybersentinel-engine = { path = "../crates/engine" }
 cybersentinel-hids = { path = "../crates/hids" }
+cybersentinel-prevent = { path = "../crates/prevent" }
 cybersentinel-decode = { path = "../crates/decode" }
 cybersentinel-reassembly = { path = "../crates/reassembly" }
 cybersentinel-rules = { path = "../crates/rules" }
@@ -105,6 +106,13 @@ bench = false
 [[bin]]
 name = "usn_journal"
 path = "fuzz_targets/usn_journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verdict_path"
+path = "fuzz_targets/verdict_path.rs"
 test = false
 doc = false
 bench = false

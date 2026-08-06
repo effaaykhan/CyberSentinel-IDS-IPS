@@ -160,14 +160,50 @@ impl Default for PreventionSettings {
     }
 }
 
+/// A conversation, as the verdict path identifies one.
+///
+/// **Not the detection path's flow id.** That id mixes in the flow's start
+/// time, so it cannot be recomputed from a packet in isolation — the verdict
+/// path would have to consult the flow table for every packet, on the one code
+/// path that must not depend on anything it does not already hold.
+///
+/// The endpoints are ordered, so both directions of a conversation produce the
+/// same key. That is deliberate: condemning a flow should stop the replies too.
+/// Letting the server keep answering an attacker whose requests are being
+/// dropped is a half-closed session, not a blocked one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FlowKey {
+    protocol: u8,
+    lower: (IpAddr, u16),
+    upper: (IpAddr, u16),
+}
+
+impl FlowKey {
+    /// The key for a 5-tuple, in whichever direction it was seen.
+    #[must_use]
+    pub fn from_tuple(tuple: &NetTuple) -> Self {
+        let first = (tuple.src_ip, tuple.src_port.unwrap_or(0));
+        let second = (tuple.dest_ip, tuple.dest_port.unwrap_or(0));
+        let (lower, upper) = if first <= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        Self {
+            protocol: tuple.proto as u8,
+            lower,
+            upper,
+        }
+    }
+}
+
 /// The verdict store: what to do with a packet, decided from state that already
 /// exists.
 #[derive(Debug)]
 pub struct Prevention {
     settings: PreventionSettings,
-    /// Flows a rule has condemned. Keyed by flow id, which the detection path
-    /// already computes.
-    flows: HashMap<u64, Instant>,
+    /// Conversations a rule has condemned.
+    flows: HashMap<FlowKey, Instant>,
     /// Sources in the block set, with when the block lapses.
     sources: HashMap<IpAddr, Instant>,
     stats: PreventStats,
@@ -245,7 +281,7 @@ impl Prevention {
     ///    your DNS server breaks DNS exactly as thoroughly as blocking it.
     /// 3. Flow verdict, then source block.
     /// 4. Otherwise accept. **Default accept**, always.
-    pub fn decide(&mut self, flow_id: u64, tuple: &NetTuple, now: Instant) -> Decision {
+    pub fn decide(&mut self, tuple: &NetTuple, now: Instant) -> Decision {
         self.stats.packets_judged += 1;
 
         if !self.armed() {
@@ -256,7 +292,7 @@ impl Prevention {
             return Decision::Accept;
         }
 
-        if self.flows.contains_key(&flow_id) {
+        if self.flows.contains_key(&FlowKey::from_tuple(tuple)) {
             self.stats.packets_dropped += 1;
             return Decision::Drop(DropReason::FlowVerdict);
         }
@@ -279,7 +315,7 @@ impl Prevention {
     ///
     /// Called by the detection path when a rule with a block action matches.
     /// Returns what actually happened, because the alert has to say.
-    pub fn block(&mut self, flow_id: u64, tuple: &NetTuple, now: Instant) -> BlockOutcome {
+    pub fn block(&mut self, tuple: &NetTuple, now: Instant) -> BlockOutcome {
         if !self.armed() {
             return BlockOutcome::NotArmed;
         }
@@ -312,7 +348,7 @@ impl Prevention {
             return BlockOutcome::Full;
         }
 
-        self.flows.insert(flow_id, now);
+        self.flows.insert(FlowKey::from_tuple(tuple), now);
         self.stats.flows_blocked += 1;
 
         let expiry = now + self.settings.source_block;
@@ -399,11 +435,11 @@ mod tests {
         let flow = tuple("203.0.113.7", "10.0.0.1");
         // Even after a rule asks for a block.
         assert_eq!(
-            prevention.block(1, &flow, Instant::now()),
+            prevention.block(&flow, Instant::now()),
             BlockOutcome::NotArmed
         );
         assert_eq!(
-            prevention.decide(1, &flow, Instant::now()),
+            prevention.decide(&flow, Instant::now()),
             Decision::Accept,
             "detect mode never drops, whatever the rules say"
         );
@@ -413,7 +449,7 @@ mod tests {
     fn an_unknown_flow_is_accepted() {
         let mut prevention = armed();
         assert_eq!(
-            prevention.decide(99, &tuple("203.0.113.7", "10.0.0.1"), Instant::now()),
+            prevention.decide(&tuple("203.0.113.7", "10.0.0.1"), Instant::now()),
             Decision::Accept,
             "default accept: the verdict path never guesses"
         );
@@ -426,11 +462,11 @@ mod tests {
         let now = Instant::now();
 
         assert!(matches!(
-            prevention.block(7, &flow, now),
+            prevention.block(&flow, now),
             BlockOutcome::Blocked { .. }
         ));
         assert_eq!(
-            prevention.decide(7, &flow, now),
+            prevention.decide(&flow, now),
             Decision::Drop(DropReason::FlowVerdict)
         );
     }
@@ -439,11 +475,11 @@ mod tests {
     fn a_blocked_source_drops_a_brand_new_flow() {
         let mut prevention = armed();
         let now = Instant::now();
-        prevention.block(7, &tuple("203.0.113.7", "10.0.0.1"), now);
+        prevention.block(&tuple("203.0.113.7", "10.0.0.1"), now);
 
         // A different flow id entirely — the next connection from that source.
         assert_eq!(
-            prevention.decide(8, &tuple("203.0.113.7", "10.0.0.2"), now),
+            prevention.decide(&tuple("203.0.113.7", "10.0.0.2"), now),
             Decision::Drop(DropReason::BlockedSource),
             "blocking the source is what stops the next connection starting"
         );
@@ -453,9 +489,9 @@ mod tests {
     fn an_unrelated_source_is_unaffected() {
         let mut prevention = armed();
         let now = Instant::now();
-        prevention.block(7, &tuple("203.0.113.7", "10.0.0.1"), now);
+        prevention.block(&tuple("203.0.113.7", "10.0.0.1"), now);
         assert_eq!(
-            prevention.decide(8, &tuple("198.51.100.4", "10.0.0.1"), now),
+            prevention.decide(&tuple("198.51.100.4", "10.0.0.1"), now),
             Decision::Accept
         );
     }
@@ -482,13 +518,13 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            prevention.block(7, &flow, now),
+            prevention.block(&flow, now),
             BlockOutcome::AllowListed {
                 address: "192.0.2.1".parse().expect("an address")
             },
             "a matching block rule must not enforce against an allow-listed host"
         );
-        assert_eq!(prevention.decide(7, &flow, now), Decision::Accept);
+        assert_eq!(prevention.decide(&flow, now), Decision::Accept);
     }
 
     #[test]
@@ -496,7 +532,7 @@ mod tests {
         let mut prevention = with_allow_list(&["10.0.0.0/8"]);
         let now = Instant::now();
         assert!(matches!(
-            prevention.block(7, &tuple("10.1.2.3", "203.0.113.7"), now),
+            prevention.block(&tuple("10.1.2.3", "203.0.113.7"), now),
             BlockOutcome::AllowListed { .. }
         ));
     }
@@ -510,10 +546,10 @@ mod tests {
         let now = Instant::now();
 
         assert!(matches!(
-            prevention.block(7, &flow, now),
+            prevention.block(&flow, now),
             BlockOutcome::AllowListed { .. }
         ));
-        assert_eq!(prevention.decide(7, &flow, now), Decision::Accept);
+        assert_eq!(prevention.decide(&flow, now), Decision::Accept);
     }
 
     /// The allow-list is checked before any verdict, so no ordering of events
@@ -525,9 +561,9 @@ mod tests {
         // Block a different source, then ask about the protected one whose
         // traffic shares the flow id (a contrived collision, but the check must
         // not depend on that not happening).
-        prevention.block(7, &tuple("203.0.113.7", "10.0.0.1"), now);
+        prevention.block(&tuple("203.0.113.7", "10.0.0.1"), now);
         assert_eq!(
-            prevention.decide(7, &tuple("192.0.2.1", "10.0.0.9"), now),
+            prevention.decide(&tuple("192.0.2.1", "10.0.0.9"), now),
             Decision::Accept
         );
     }
@@ -542,12 +578,12 @@ mod tests {
         let flow = tuple("203.0.113.7", "10.0.0.1");
         let now = Instant::now();
 
-        prevention.block(7, &flow, now);
-        assert!(prevention.decide(7, &flow, now).is_drop());
+        prevention.block(&flow, now);
+        assert!(prevention.decide(&flow, now).is_drop());
 
         prevention.set_mode(Mode::Detect);
         assert_eq!(
-            prevention.decide(7, &flow, now),
+            prevention.decide(&flow, now),
             Decision::Accept,
             "the kill switch cannot be outrun by a verdict recorded before it"
         );
@@ -559,12 +595,12 @@ mod tests {
         let flow = tuple("203.0.113.7", "10.0.0.1");
         let now = Instant::now();
 
-        prevention.block(7, &flow, now);
+        prevention.block(&flow, now);
         prevention.set_mode(Mode::Detect);
         prevention.set_mode(Mode::Prevent);
 
         assert!(
-            prevention.decide(7, &flow, now).is_drop(),
+            prevention.decide(&flow, now).is_drop(),
             "re-arming should not require re-detecting everything"
         );
     }
@@ -581,11 +617,11 @@ mod tests {
             ..PreventionSettings::default()
         });
         let start = Instant::now();
-        prevention.block(7, &tuple("203.0.113.7", "10.0.0.1"), start);
+        prevention.block(&tuple("203.0.113.7", "10.0.0.1"), start);
 
         let later = start + Duration::from_secs(61);
         assert_eq!(
-            prevention.decide(8, &tuple("203.0.113.7", "10.0.0.2"), later),
+            prevention.decide(&tuple("203.0.113.7", "10.0.0.2"), later),
             Decision::Accept,
             "a block that never lapses is a permanent outage nobody chose"
         );
@@ -600,11 +636,7 @@ mod tests {
         });
         let start = Instant::now();
         for index in 0..10 {
-            prevention.block(
-                index,
-                &tuple(&format!("203.0.113.{index}"), "10.0.0.1"),
-                start,
-            );
+            prevention.block(&tuple(&format!("203.0.113.{index}"), "10.0.0.1"), start);
         }
         assert_eq!(prevention.stats().blocked_flows_active, 10);
 
@@ -623,16 +655,12 @@ mod tests {
         let now = Instant::now();
         for index in 0..2 {
             assert!(matches!(
-                prevention.block(
-                    index,
-                    &tuple(&format!("203.0.113.{index}"), "10.0.0.1"),
-                    now
-                ),
+                prevention.block(&tuple(&format!("203.0.113.{index}"), "10.0.0.1"), now),
                 BlockOutcome::Blocked { .. }
             ));
         }
         assert_eq!(
-            prevention.block(99, &tuple("203.0.113.99", "10.0.0.1"), now),
+            prevention.block(&tuple("203.0.113.99", "10.0.0.1"), now),
             BlockOutcome::Full,
             "a block that could not be recorded is a hole, not a silent no-op"
         );
@@ -667,7 +695,7 @@ mod tests {
         let mut prevention = Prevention::new(PreventionSettings::default());
         let flow = tuple("203.0.113.7", "10.0.0.1");
         for _ in 0..5 {
-            prevention.decide(1, &flow, Instant::now());
+            prevention.decide(&flow, Instant::now());
         }
         assert_eq!(prevention.stats().packets_judged, 5);
         assert_eq!(prevention.stats().packets_dropped, 0);

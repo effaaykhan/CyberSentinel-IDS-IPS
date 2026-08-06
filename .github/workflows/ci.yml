@@ -548,6 +548,11 @@ jobs:
           # its own filename — the input class this project keeps in-tree and
           # fuzzes rather than parsing behind an FFI boundary.
           cargo fuzz run usn_journal  -- -max_total_time=90 -print_final_stats=1
+          # The inline verdict path. This one runs in-path on every packet with
+          # the kernel waiting, so a panic is a stalled queue rather than a
+          # crashed process — and past the queue bound that means the fail mode
+          # applies to production traffic.
+          cargo fuzz run verdict_path -- -max_total_time=90 -print_final_stats=1
 
       - name: Upload any crash artifacts
         if: failure()
