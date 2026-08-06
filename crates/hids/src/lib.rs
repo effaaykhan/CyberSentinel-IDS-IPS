@@ -24,6 +24,7 @@
 //! entries. The capability set it needs, and the reason for each, is documented
 //! in `CLAUDE.md` for the packaging pass to wire into the service unit.
 
+pub mod evtx;
 pub mod fim;
 pub mod logs;
 pub mod platform;
