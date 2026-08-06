@@ -164,6 +164,12 @@ pub struct CompiledRule {
     pub classtype: Option<String>,
     /// Severity, from `priority`.
     pub severity: u8,
+    /// Whether this rule asks for the traffic to be blocked.
+    ///
+    /// Carried from the rule header so the alert can say what was *actually*
+    /// done, rather than what the rule wanted. Honouring it is the verdict
+    /// path's business and depends on the sensor being armed.
+    pub blocks: bool,
     /// Metadata, grouped by key.
     pub metadata: BTreeMap<String, Vec<String>>,
     /// Resolved header.
@@ -448,6 +454,7 @@ fn compile_rule(
         msg: rule.msg.clone(),
         classtype: rule.classtype.clone(),
         severity: rule.severity(),
+        blocks: rule.header.action.blocks(),
         metadata,
         header,
         options,

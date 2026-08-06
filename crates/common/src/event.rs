@@ -680,6 +680,8 @@ pub struct StatsEvent {
     pub hids: HidsStats,
     /// Correlation counters.
     pub correlation: CorrelationStats,
+    /// Inline prevention counters.
+    pub prevent: PreventStats,
 }
 
 /// Counters for the decoupled event pipeline.

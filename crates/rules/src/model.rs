@@ -16,6 +16,24 @@ pub enum Action {
     Alert,
     /// Stop evaluating this input; emit nothing.
     Pass,
+    /// Emit an `alert` event **and** ask for the traffic to be blocked.
+    ///
+    /// Only honoured when the sensor is armed (`prevent.mode: prevent`). In
+    /// detect mode the rule still loads and still alerts, and the loader says
+    /// how many rules are asking for a block that will not happen — an
+    /// operator who wrote a blocking rule must never be left believing it
+    /// blocks when it does not. That was the reason the parser used to refuse
+    /// these outright; now that prevention exists, saying so is the honest
+    /// version of the same care.
+    Drop,
+}
+
+impl Action {
+    /// Whether this action asks for traffic to be blocked.
+    #[must_use]
+    pub fn blocks(self) -> bool {
+        matches!(self, Self::Drop)
+    }
 }
 
 impl Action {
@@ -25,6 +43,7 @@ impl Action {
         match self {
             Self::Alert => "alert",
             Self::Pass => "pass",
+            Self::Drop => "drop",
         }
     }
 }

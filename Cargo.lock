@@ -230,6 +230,7 @@ dependencies = [
  "cybersentinel-decode",
  "cybersentinel-engine",
  "cybersentinel-hids",
+ "cybersentinel-prevent",
  "cybersentinel-reassembly",
  "cybersentinel-rules",
  "cybersentinel-storage",

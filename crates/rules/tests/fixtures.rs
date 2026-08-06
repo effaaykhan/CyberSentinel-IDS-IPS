@@ -19,10 +19,20 @@ fn mixed_fixture_loads_the_good_rules_and_accounts_for_the_rest() {
     let (set, report) = RuleSet::load_files(&[fixture("mixed.rules")]);
 
     assert_eq!(report.files.len(), 1);
-    assert_eq!(report.loaded, 5, "{}", report.summary());
-    assert_eq!(report.evaluable, 4, "{}", report.summary());
+    assert_eq!(report.loaded, 6, "{}", report.summary());
+    assert_eq!(report.evaluable, 5, "{}", report.summary());
     assert_eq!(report.non_evaluable(), 1, "{}", report.summary());
-    assert_eq!(set.len(), 5);
+    assert_eq!(set.len(), 6);
+
+    // The `drop` rule loads and asks for a block. Whether that block happens
+    // is the sensor's arming state, not the loader's business.
+    let blocking: Vec<_> = set
+        .rules()
+        .iter()
+        .filter(|rule| rule.header.action.blocks())
+        .map(|rule| rule.sid)
+        .collect();
+    assert_eq!(blocking, [900_021], "{}", report.summary());
 
     // Every skip names a reason and a line, so the log points at the problem.
     assert_eq!(report.skipped.len(), 5, "{:#?}", report.skipped);
@@ -71,8 +81,8 @@ fn only_evaluable_rules_are_offered_to_the_engine() {
     let sids: Vec<u32> = set.evaluable().map(|rule| rule.sid).collect();
     assert_eq!(
         sids,
-        vec![900_001, 900_002, 900_010, 900_011],
-        "the Phase 3 subset is evaluable; only the `endswith` rule is not"
+        vec![900_001, 900_002, 900_010, 900_011, 900_021],
+        "the Phase 3 subset is evaluable, including the drop rule; only `endswith` is not"
     );
 }
 

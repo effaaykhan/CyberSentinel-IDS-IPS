@@ -25,6 +25,7 @@ cybersentinel-decode.workspace = true
 cybersentinel-correlation.workspace = true
 cybersentinel-engine.workspace = true
 cybersentinel-hids.workspace = true
+cybersentinel-prevent.workspace = true
 cybersentinel-reassembly.workspace = true
 cybersentinel-rules.workspace = true
 cybersentinel-storage.workspace = true

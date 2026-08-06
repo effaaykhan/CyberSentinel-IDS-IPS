@@ -27,7 +27,7 @@ use cybersentinel_capture::{CaptureCounters, RawPacket};
 use cybersentinel_common::config::Config;
 use cybersentinel_common::event::{
     AlertAction, AlertEvent, AlertSource, AnomalyEvent, AnomalyRecord, CorrelationStats, EventKind,
-    FlowEndReason, FlowEvent, HidsStats, NetTuple, Payload, Protocol,
+    FlowEndReason, FlowEvent, HidsStats, NetTuple, Payload, PreventStats, Protocol,
 };
 use cybersentinel_common::eventlog::EventEmitter;
 use cybersentinel_common::Timestamp;
@@ -36,6 +36,7 @@ use cybersentinel_decode::{DecodeCounters, Decoded, Network, Transport};
 use cybersentinel_engine::host::HostObservation;
 use cybersentinel_engine::{AlertRecord, Engine, EngineCounters};
 use cybersentinel_hids::sensor::{HostBatch, HostSensor};
+use cybersentinel_prevent::{BlockOutcome, Prevention};
 use cybersentinel_reassembly::defrag::{DefragCounters, Defragmenter, FragmentView, Reassembled};
 use cybersentinel_reassembly::flow::{
     EndReason, EndedFlow, FlowCounters, FlowTable, PacketSummary,
@@ -81,6 +82,8 @@ pub struct PipelineSnapshot {
     pub hids: HidsStats,
     /// Correlation counters.
     pub correlation: CorrelationStats,
+    /// Inline prevention counters.
+    pub prevent: PreventStats,
     /// Whether a replayed capture file was torn.
     pub capture_truncated: bool,
 }
@@ -128,6 +131,13 @@ pub struct PacketPipeline {
     correlator: Option<Correlator>,
     /// Host alerts raised so far.
     host_alerts: u64,
+    /// Inline prevention, when it is configured.
+    ///
+    /// Shared with the verdict thread: that thread reads it for every packet
+    /// while the detection path writes verdicts into it. A mutex is the right
+    /// primitive here precisely because the critical sections are a hash lookup
+    /// on one side and an insert on the other.
+    prevention: Option<Arc<Mutex<Prevention>>>,
     /// Reused across packets so alerting costs no allocation.
     alerts: Vec<AlertRecord>,
     rules_armed: u64,
@@ -168,6 +178,7 @@ impl PacketPipeline {
             host: None,
             correlator: None,
             host_alerts: 0,
+            prevention: None,
             alerts: Vec::new(),
             rules_armed: 0,
             rules_awaiting_support: 0,
@@ -185,6 +196,11 @@ impl PacketPipeline {
         self.rules_failed = report.failed.len() as u64;
         self.rules_without_prefilter = report.without_prefilter as u64;
         self.engine = Some(engine);
+    }
+
+    /// Attach inline prevention.
+    pub fn arm_prevention(&mut self, prevention: Arc<Mutex<Prevention>>) {
+        self.prevention = Some(prevention);
     }
 
     /// Attach host monitoring and, optionally, correlation.
@@ -361,6 +377,57 @@ impl PacketPipeline {
         self.correlate(Domain::Host, event_type, sid, severity, summary, timestamp);
         self.alerts = records;
         self.alerts.clear();
+    }
+
+    /// Resolve a rule's block request into what actually happened.
+    ///
+    /// Returns [`AlertAction::Blocked`] only when a verdict was genuinely
+    /// recorded and will be enforced. Detect mode, an allow-listed endpoint,
+    /// and a full verdict store all yield `Alerted` — the detection was real
+    /// and is reported either way, but nothing was dropped and the event must
+    /// not claim otherwise.
+    fn enforce(&mut self, rule_blocks: bool, tuple: &NetTuple) -> AlertAction {
+        if !rule_blocks {
+            return AlertAction::Alerted;
+        }
+        let Some(prevention) = self.prevention.as_ref() else {
+            return AlertAction::Alerted;
+        };
+        let Ok(mut prevention) = prevention.lock() else {
+            tracing::error!("the prevention store is poisoned; alerting without enforcing");
+            return AlertAction::Alerted;
+        };
+
+        match prevention.block(tuple, std::time::Instant::now()) {
+            BlockOutcome::Blocked { source } => {
+                if let Some(address) = source {
+                    // Push the source into the kernel's set so the *next*
+                    // connection never reaches userspace at all.
+                    let timeout = prevention.source_block_timeout();
+                    drop(prevention);
+                    match cybersentinel_prevent::nft::add_blocked_source(address, timeout) {
+                        cybersentinel_prevent::nft::SetOutcome::Added => {
+                            tracing::warn!(%address, ?timeout, "source blocked");
+                        }
+                        other => {
+                            // The in-process store still drops this flow, so
+                            // this is a degradation rather than a failure — but
+                            // it is one an operator should know about.
+                            tracing::error!(
+                                %address,
+                                outcome = ?other,
+                                "could not add the source to the nftables set; \
+                                 the flow is still dropped in-process"
+                            );
+                        }
+                    }
+                }
+                AlertAction::Blocked
+            }
+            BlockOutcome::NotArmed | BlockOutcome::AllowListed { .. } | BlockOutcome::Full => {
+                AlertAction::Alerted
+            }
+        }
     }
 
     /// Offer one observation to correlation and emit any incident it completes.
@@ -609,8 +676,13 @@ impl PacketPipeline {
         // Taken so the emitter and the correlator can both be borrowed.
         let records = std::mem::take(&mut self.alerts);
         for record in &records {
+            // What the rule wanted, resolved against what the sensor is
+            // actually able and allowed to do. The event carries the outcome,
+            // never the intent: an alert saying `blocked` when nothing was
+            // dropped is a lie an operator would build a response process on.
+            let action = self.enforce(record.blocks, &tuple);
             let body = AlertEvent {
-                action: AlertAction::Alerted,
+                action,
                 source: AlertSource::Network,
                 sid: record.sid,
                 rev: record.rev,
@@ -845,6 +917,11 @@ impl PacketPipeline {
             rules_failed: self.rules_failed,
             rules_without_prefilter: self.rules_without_prefilter,
             hids: self.host_stats(),
+            prevent: self
+                .prevention
+                .as_ref()
+                .and_then(|store| store.lock().ok().map(|store| store.stats()))
+                .unwrap_or_default(),
             correlation: self
                 .correlator
                 .as_ref()

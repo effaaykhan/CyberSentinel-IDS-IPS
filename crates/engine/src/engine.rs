@@ -75,6 +75,13 @@ pub struct AlertRecord {
     pub severity: u8,
     /// The rule's metadata.
     pub metadata: BTreeMap<String, Vec<String>>,
+    /// Whether the rule asked for the traffic to be blocked.
+    ///
+    /// **What the rule wanted, not what happened.** Whether anything was
+    /// dropped depends on the sensor being armed and the endpoints not being
+    /// allow-listed, which only the verdict path knows. The pipeline resolves
+    /// the two into the `action` the alert carries.
+    pub blocks: bool,
 }
 
 /// Running totals.
@@ -269,6 +276,11 @@ impl Engine {
                 classtype: rule.classtype.clone(),
                 severity: rule.severity,
                 metadata: rule.metadata.clone(),
+                // Host rules never block. A file change or a logon failure has
+                // no packet to drop; blocking the *source* of a failed logon
+                // burst is a plausible future feature and a different design
+                // decision, not something to infer from a rule action here.
+                blocks: false,
             };
 
             self.counters.matches += 1;
@@ -558,6 +570,11 @@ impl Engine {
                 classtype: rule.classtype.clone(),
                 severity: rule.severity,
                 metadata: rule.metadata.clone(),
+                // What the rule asked for. Whether it happens is the
+                // verdict path's business: the pipeline resolves this against
+                // the arming state and the allow-list before the event says
+                // anything.
+                blocks: rule.blocks,
             };
 
             self.counters.matches += 1;

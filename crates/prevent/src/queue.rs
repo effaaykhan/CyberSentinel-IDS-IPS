@@ -123,6 +123,216 @@ impl VerdictSource for OfflineQueue {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the 5-tuple, from a bare IP packet
+// ---------------------------------------------------------------------------
+
+/// Read the 5-tuple out of an IP packet.
+///
+/// NFQUEUE hands over the packet from the IP header on — no Ethernet framing —
+/// so this is a deliberately small, bounded read of just the fields the verdict
+/// path needs. It is not a decoder: anything it does not fully understand
+/// yields `None`, and a packet with no tuple is accepted rather than guessed
+/// at, because the alternative is dropping traffic on the strength of a header
+/// we could not read.
+///
+/// Fragments are handled by taking the tuple from the **first** fragment only.
+/// A later fragment carries no ports, and inventing them from the payload would
+/// attribute the packet to a port nobody used — the same rule the decoder
+/// already follows.
+#[must_use]
+pub fn tuple_from_ip_packet(bytes: &[u8]) -> Option<NetTuple> {
+    use cybersentinel_common::event::Protocol;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let version = bytes.first()? >> 4;
+    let (source, destination, protocol, transport) = match version {
+        4 => {
+            let header_len = usize::from(bytes.first()? & 0x0f) * 4;
+            if header_len < 20 || bytes.len() < header_len {
+                return None;
+            }
+            let protocol = *bytes.get(9)?;
+            let source = IpAddr::V4(Ipv4Addr::new(
+                *bytes.get(12)?,
+                *bytes.get(13)?,
+                *bytes.get(14)?,
+                *bytes.get(15)?,
+            ));
+            let destination = IpAddr::V4(Ipv4Addr::new(
+                *bytes.get(16)?,
+                *bytes.get(17)?,
+                *bytes.get(18)?,
+                *bytes.get(19)?,
+            ));
+            // A non-initial fragment has no transport header to read.
+            let fragment_offset = u16::from_be_bytes([*bytes.get(6)? & 0x1f, *bytes.get(7)?]);
+            let transport = if fragment_offset == 0 {
+                bytes.get(header_len..)
+            } else {
+                None
+            };
+            (source, destination, protocol, transport)
+        }
+        6 => {
+            if bytes.len() < 40 {
+                return None;
+            }
+            let protocol = *bytes.get(6)?;
+            let mut octets = [0_u8; 16];
+            octets.copy_from_slice(bytes.get(8..24)?);
+            let source = IpAddr::V6(Ipv6Addr::from(octets));
+            octets.copy_from_slice(bytes.get(24..40)?);
+            let destination = IpAddr::V6(Ipv6Addr::from(octets));
+            // Extension headers are not walked. A packet carrying them yields
+            // no ports rather than ports read from the wrong offset; it is
+            // still identified by address, which is what source blocking needs.
+            (source, destination, protocol, bytes.get(40..))
+        }
+        _ => return None,
+    };
+
+    let (proto, wants_ports) = match protocol {
+        6 => (Protocol::Tcp, true),
+        17 => (Protocol::Udp, true),
+        1 | 58 => (Protocol::Icmp, false),
+        _ => (Protocol::Ip, false),
+    };
+
+    let (src_port, dest_port) = match (wants_ports, transport) {
+        (true, Some(payload)) if payload.len() >= 4 => (
+            Some(u16::from_be_bytes([payload[0], payload[1]])),
+            Some(u16::from_be_bytes([payload[2], payload[3]])),
+        ),
+        _ => (None, None),
+    };
+
+    Some(NetTuple {
+        src_ip: source,
+        src_port,
+        dest_ip: destination,
+        dest_port,
+        proto,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// the real queue
+// ---------------------------------------------------------------------------
+
+/// Packets from the kernel's netfilter queue.
+///
+/// The only part of prevention that touches a kernel. It holds no logic: it
+/// reads a packet, hands the tuple to [`judge`] through [`run`], and echoes the
+/// answer back. A packet whose header could not be read is **accepted** — the
+/// verdict path must never drop traffic on the strength of a header it did not
+/// understand.
+#[cfg(target_os = "linux")]
+#[allow(missing_debug_implementations)] // `nfq::Queue` is not `Debug`.
+pub struct KernelQueue {
+    queue: nfq::Queue,
+    /// Packets received but not yet answered, by kernel id.
+    in_flight: std::collections::HashMap<u32, nfq::Message>,
+    /// Packets accepted without judgement because their header was unreadable.
+    pub unparsed: u64,
+    /// Recoverable receive errors that were retried.
+    pub retries: u64,
+    /// The error that ended the loop, if one did.
+    pub fatal: Option<std::io::Error>,
+}
+
+#[cfg(target_os = "linux")]
+impl KernelQueue {
+    /// Bind to a queue number.
+    ///
+    /// # Errors
+    /// If the queue cannot be opened or bound — most often because the process
+    /// lacks `CAP_NET_ADMIN`, or because another program already holds it.
+    pub fn bind(number: u16) -> std::io::Result<Self> {
+        let mut queue = nfq::Queue::open()?;
+        queue.bind(number)?;
+        Ok(Self {
+            queue,
+            in_flight: std::collections::HashMap::new(),
+            unparsed: 0,
+            retries: 0,
+            fatal: None,
+        })
+    }
+
+    /// Set how many packets the kernel will hold for us before applying the
+    /// fail mode.
+    ///
+    /// # Errors
+    /// If the queue cannot be configured.
+    pub fn set_queue_length(&mut self, number: u16, packets: u32) -> std::io::Result<()> {
+        self.queue.set_queue_max_len(number, packets)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl VerdictSource for KernelQueue {
+    fn next_packet(&mut self) -> Option<QueuedPacket> {
+        loop {
+            // A recoverable error must not end enforcement. This used to be
+            // `recv().ok()?`, which turned any error at all — including an
+            // `EINTR` from an ordinary signal — into the end of the loop. The
+            // thread exited after its first packet, the kernel fell back to the
+            // fail mode, and the sensor went on reporting itself as armed. It
+            // took live traffic to see it: the unit tests use the offline
+            // queue, which cannot produce an errno.
+            let message = match self.queue.recv() {
+                Ok(message) => message,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    self.retries += 1;
+                    continue;
+                }
+                Err(error) => {
+                    // Genuinely fatal. Kept so the caller can say *why*
+                    // enforcement stopped rather than just that it did.
+                    self.fatal = Some(error);
+                    return None;
+                }
+            };
+            let id = message.get_packet_id();
+            match tuple_from_ip_packet(message.get_payload()) {
+                Some(tuple) => {
+                    self.in_flight.insert(id, message);
+                    return Some(QueuedPacket { id, tuple });
+                }
+                None => {
+                    // Unreadable header: accept it and move on. Dropping a
+                    // packet we could not parse would make every malformed
+                    // frame an outage.
+                    self.unparsed += 1;
+                    let mut message = message;
+                    message.set_verdict(nfq::Verdict::Accept);
+                    let _ = self.queue.verdict(message);
+                }
+            }
+        }
+    }
+
+    fn resolve(&mut self, packet: QueuedPacket, decision: Decision) {
+        let Some(mut message) = self.in_flight.remove(&packet.id) else {
+            return;
+        };
+        message.set_verdict(match decision {
+            Decision::Accept => nfq::Verdict::Accept,
+            Decision::Drop(_) => nfq::Verdict::Drop,
+        });
+        // A failed verdict leaves the kernel holding the packet until the
+        // queue's own timeout applies the fail mode. Nothing better is
+        // available from here, and it is counted by the caller.
+        let _ = self.queue.verdict(message);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,185 +559,5 @@ mod tests {
         let mut queue = OfflineQueue::new(Vec::new());
         let mut prevention = armed();
         assert_eq!(run(&mut queue, &mut prevention), RunSummary::default());
-    }
-}
-
-// ---------------------------------------------------------------------------
-// the 5-tuple, from a bare IP packet
-// ---------------------------------------------------------------------------
-
-/// Read the 5-tuple out of an IP packet.
-///
-/// NFQUEUE hands over the packet from the IP header on — no Ethernet framing —
-/// so this is a deliberately small, bounded read of just the fields the verdict
-/// path needs. It is not a decoder: anything it does not fully understand
-/// yields `None`, and a packet with no tuple is accepted rather than guessed
-/// at, because the alternative is dropping traffic on the strength of a header
-/// we could not read.
-///
-/// Fragments are handled by taking the tuple from the **first** fragment only.
-/// A later fragment carries no ports, and inventing them from the payload would
-/// attribute the packet to a port nobody used — the same rule the decoder
-/// already follows.
-#[must_use]
-pub fn tuple_from_ip_packet(bytes: &[u8]) -> Option<NetTuple> {
-    use cybersentinel_common::event::Protocol;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    let version = bytes.first()? >> 4;
-    let (source, destination, protocol, transport) = match version {
-        4 => {
-            let header_len = usize::from(bytes.first()? & 0x0f) * 4;
-            if header_len < 20 || bytes.len() < header_len {
-                return None;
-            }
-            let protocol = *bytes.get(9)?;
-            let source = IpAddr::V4(Ipv4Addr::new(
-                *bytes.get(12)?,
-                *bytes.get(13)?,
-                *bytes.get(14)?,
-                *bytes.get(15)?,
-            ));
-            let destination = IpAddr::V4(Ipv4Addr::new(
-                *bytes.get(16)?,
-                *bytes.get(17)?,
-                *bytes.get(18)?,
-                *bytes.get(19)?,
-            ));
-            // A non-initial fragment has no transport header to read.
-            let fragment_offset = u16::from_be_bytes([*bytes.get(6)? & 0x1f, *bytes.get(7)?]);
-            let transport = if fragment_offset == 0 {
-                bytes.get(header_len..)
-            } else {
-                None
-            };
-            (source, destination, protocol, transport)
-        }
-        6 => {
-            if bytes.len() < 40 {
-                return None;
-            }
-            let protocol = *bytes.get(6)?;
-            let mut octets = [0_u8; 16];
-            octets.copy_from_slice(bytes.get(8..24)?);
-            let source = IpAddr::V6(Ipv6Addr::from(octets));
-            octets.copy_from_slice(bytes.get(24..40)?);
-            let destination = IpAddr::V6(Ipv6Addr::from(octets));
-            // Extension headers are not walked. A packet carrying them yields
-            // no ports rather than ports read from the wrong offset; it is
-            // still identified by address, which is what source blocking needs.
-            (source, destination, protocol, bytes.get(40..))
-        }
-        _ => return None,
-    };
-
-    let (proto, wants_ports) = match protocol {
-        6 => (Protocol::Tcp, true),
-        17 => (Protocol::Udp, true),
-        1 | 58 => (Protocol::Icmp, false),
-        _ => (Protocol::Ip, false),
-    };
-
-    let (src_port, dest_port) = match (wants_ports, transport) {
-        (true, Some(payload)) if payload.len() >= 4 => (
-            Some(u16::from_be_bytes([payload[0], payload[1]])),
-            Some(u16::from_be_bytes([payload[2], payload[3]])),
-        ),
-        _ => (None, None),
-    };
-
-    Some(NetTuple {
-        src_ip: source,
-        src_port,
-        dest_ip: destination,
-        dest_port,
-        proto,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// the real queue
-// ---------------------------------------------------------------------------
-
-/// Packets from the kernel's netfilter queue.
-///
-/// The only part of prevention that touches a kernel. It holds no logic: it
-/// reads a packet, hands the tuple to [`judge`] through [`run`], and echoes the
-/// answer back. A packet whose header could not be read is **accepted** — the
-/// verdict path must never drop traffic on the strength of a header it did not
-/// understand.
-#[cfg(target_os = "linux")]
-#[allow(missing_debug_implementations)] // `nfq::Queue` is not `Debug`.
-pub struct KernelQueue {
-    queue: nfq::Queue,
-    /// Packets received but not yet answered, by kernel id.
-    in_flight: std::collections::HashMap<u32, nfq::Message>,
-    /// Packets accepted without judgement because their header was unreadable.
-    pub unparsed: u64,
-}
-
-#[cfg(target_os = "linux")]
-impl KernelQueue {
-    /// Bind to a queue number.
-    ///
-    /// # Errors
-    /// If the queue cannot be opened or bound — most often because the process
-    /// lacks `CAP_NET_ADMIN`, or because another program already holds it.
-    pub fn bind(number: u16) -> std::io::Result<Self> {
-        let mut queue = nfq::Queue::open()?;
-        queue.bind(number)?;
-        Ok(Self {
-            queue,
-            in_flight: std::collections::HashMap::new(),
-            unparsed: 0,
-        })
-    }
-
-    /// Set how many packets the kernel will hold for us before applying the
-    /// fail mode.
-    ///
-    /// # Errors
-    /// If the queue cannot be configured.
-    pub fn set_queue_length(&mut self, number: u16, packets: u32) -> std::io::Result<()> {
-        self.queue.set_queue_max_len(number, packets)
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl VerdictSource for KernelQueue {
-    fn next_packet(&mut self) -> Option<QueuedPacket> {
-        loop {
-            let message = self.queue.recv().ok()?;
-            let id = message.get_packet_id();
-            match tuple_from_ip_packet(message.get_payload()) {
-                Some(tuple) => {
-                    self.in_flight.insert(id, message);
-                    return Some(QueuedPacket { id, tuple });
-                }
-                None => {
-                    // Unreadable header: accept it and move on. Dropping a
-                    // packet we could not parse would make every malformed
-                    // frame an outage.
-                    self.unparsed += 1;
-                    let mut message = message;
-                    message.set_verdict(nfq::Verdict::Accept);
-                    let _ = self.queue.verdict(message);
-                }
-            }
-        }
-    }
-
-    fn resolve(&mut self, packet: QueuedPacket, decision: Decision) {
-        let Some(mut message) = self.in_flight.remove(&packet.id) else {
-            return;
-        };
-        message.set_verdict(match decision {
-            Decision::Accept => nfq::Verdict::Accept,
-            Decision::Drop(_) => nfq::Verdict::Drop,
-        });
-        // A failed verdict leaves the kernel holding the packet until the
-        // queue's own timeout applies the fail mode. Nothing better is
-        // available from here, and it is counted by the caller.
-        let _ = self.queue.verdict(message);
     }
 }

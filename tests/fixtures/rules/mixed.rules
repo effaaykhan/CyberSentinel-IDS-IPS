@@ -1,7 +1,7 @@
 # Fixture: every load outcome in one file, so the loader's reporting is tested
 # against something an operator could plausibly write.
 #
-# Expected: 5 loaded (4 evaluable, 1 awaiting engine support), 5 skipped.
+# Expected: 6 loaded (5 evaluable, 1 awaiting engine support), 5 skipped.
 
 # --- loads, fully evaluable by Phase 0 (header + metadata only) -------------
 alert tcp $EXTERNAL_NET any -> $HOME_NET 22 (msg:"FIXTURE header only"; sid:900001; rev:2;)
@@ -17,11 +17,16 @@ alert tcp any any -> any any ( \
 # --- loads, but uses a condition this build cannot evaluate yet -------------
 alert tcp any any -> any any (msg:"FIXTURE awaiting support"; content:"x"; endswith; sid:900012;)
 
+# --- loads and asks for a block. Honoured only when the sensor is armed ------
+drop tcp any any -> any any (msg:"FIXTURE prevention action"; content:"x"; sid:900021;)
+
 # --- skipped: unparseable ---------------------------------------------------
 this is not a rule
 alert tcp any any -> any any (msg:"FIXTURE no sid";)
 alert tcp any any -> any any (msg:"FIXTURE typo"; contnet:"evil"; sid:900020;)
-drop tcp any any -> any any (msg:"FIXTURE prevention action"; sid:900021;)
+# `reject` additionally sends an RST, which this build does not do; accepting
+# it as a synonym for `drop` would silently give less than was asked for.
+reject tcp any any -> any any (msg:"FIXTURE reject action"; sid:900022;)
 
 # --- skipped: duplicate of sid 900001 ---------------------------------------
 alert udp any any -> any any (msg:"FIXTURE duplicate sid"; sid:900001;)

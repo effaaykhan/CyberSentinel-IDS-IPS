@@ -459,8 +459,29 @@ is the failure mode this whole project is built to avoid.
 | `CAP_NET_RAW` | opening the live capture handle | **dropped after open** | Nothing on the packet path needs it once libpcap holds the socket. |
 | `CAP_NET_ADMIN` | promiscuous mode, kernel BPF filter | **dropped after open** | Same. |
 | `CAP_DAC_READ_SEARCH` | FIM hashing, reading `/var/log/secure` and `/var/log/audit/`, `journalctl` reading `/var/log/journal` | **retained while `hids.enabled`** | Bypasses file-read and directory-search checks, and nothing else. The smallest capability that makes FIM and log reading actually cover what they claim to. |
+| `CAP_NET_ADMIN` (for prevention) | **inline prevention**: setting a verdict on a queued packet | **retained while `prevent.enabled`** | Setting a verdict is a privileged netlink *send*, not merely a read of the queue. Binding early and then dropping is not enough — see below. |
+| `CAP_NET_ADMIN` (again) | **inline prevention**: setting a verdict on a queued packet | **retained while `prevent.enabled`** | Setting a verdict is a privileged netlink *send*, not just a read of the queue. Binding early and dropping is not enough — see below. |
 | `CAP_SYS_PTRACE` | `/proc/<pid>/exe` and `/proc/<pid>/fd` for **other users'** processes — i.e. attributing a listening socket to the process holding it | **never granted** | It permits ptracing any process on the box, which is full compromise. The socket is still reported; the owning process shows as `unknown`. Losing an attribution is worth far more than handing an attacker that capability. |
 | `CAP_AUDIT_READ` | reading the kernel audit netlink socket directly | **not used** | Phase 4 reads auditd's log *file*, which `CAP_DAC_READ_SEARCH` already covers. Revisit only if a netlink reader is added. |
+
+### `CAP_NET_ADMIN` is temporal for capture and permanent for prevention
+
+The same capability, two different lifetimes, and getting it wrong produced a
+sensor that reported itself as armed and was not.
+
+For **capture**, `CAP_NET_ADMIN` is needed once, to open the handle. For
+**prevention** it is needed for the process's whole life, because issuing a
+verdict is a netlink *send* and that send is privileged. Dropping it after
+binding the queue looks correct and fails in a way that is hard to read: the
+kernel refuses the verdict and reports the refusal *asynchronously*, so the
+next `recv` returns `EPERM`, the verdict loop ends, and the kernel falls back
+to the configured fail mode — silently, on a sensor still logging that it is
+armed.
+
+Measured, not reasoned about. With the capability dropped, the sensor judged
+exactly **one** packet and then stopped; with it retained, the same traffic
+went to 100% loss. Both the retention and the loud "the verdict path STOPPED"
+error exist because of that run.
 
 `CAP_DAC_READ_SEARCH` is placed in the **permitted, effective, inheritable and
 ambient** sets. The first two are for this process. The last two are for the
@@ -846,9 +867,47 @@ Broad fuzzing · an adversarial suite (fragmented, overlapping, encoded, low-and
 · drop-rate monitoring under load · state-exhaustion resistance · DNS and TLS
 coverage · service self-protection · secure auto-update.
 
-**Out of scope for v1:** inline prevention (NFQUEUE/WFP/NetworkExtension plus
-driver and extension signing) and any central console. The architecture leaves
-room for both.
+### The Linux IPS pass — inline prevention ✅
+
+NFQUEUE verdicts behind the existing engine. Detection is unchanged; what is
+new is that a rule with a `drop` action can now record a verdict the verdict
+path enforces.
+
+**The verdict path and the detection path are two different jobs**, and the
+boundary is the honest part. Detection is ACK-gated — reassembly holds bytes
+until the peer acknowledges them, because that is the only way a target-based
+overlap policy can be applied at all. Inline, a round trip is not available:
+holding a packet that long stalls the connection under inspection. So the
+verdict path answers immediately from state that already exists, never
+reassembles, and defaults to accept; the detection path runs on its existing
+timeline and *records* verdicts.
+
+**What that buys, stated plainly:** because matching needs reassembly, the
+first packets carrying a brand-new signature **may pass** before the match
+completes. Inline prevention here reliably drops the *rest of the flow* and
+*every subsequent connection from a flagged source*. A single-packet exploit
+that fits in the first segment will land; the session is then killed and the
+source blocked. That is inherent to any reassembly-based IPS, and `blocked` in
+an alert means "the flow was terminated and the source blocked from this
+point", not "no byte of this attack reached the target".
+
+**Fail-open is not a code path.** If the process dies, none of our code runs.
+`queue num N` drops when nothing is listening; `queue num N bypass` accepts.
+The fail mode therefore lives in the nftables rule, and the sensor logs the
+rule it expects rather than applying one behind an operator's back.
+
+**Detect is the default and the kill switch.** `prevent.mode` is checked before
+any verdict, so disarming cannot be outrun by state recorded a moment earlier.
+The allow-list is checked next, on **both** endpoints, because cutting the flow
+to a critical host breaks it exactly as thoroughly as blocking that host.
+
+**Done when:** the same traffic, the same rules, and the same binary produce
+100% packet loss armed and 0% disarmed. Measured on loopback through a real
+netfilter queue, along with the allow-list, the kernel block set, and both fail
+modes.
+
+**Still out of scope for v1:** Windows WFP and macOS NetworkExtension inline
+prevention (both need driver or extension signing), and any central console.
 
 ---
 

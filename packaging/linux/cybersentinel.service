@@ -37,6 +37,12 @@ RestartSec=5s
 # the owning process shows as "unknown". Losing one attribution is worth far
 # more than handing an attacker that capability.
 #
+# **Inline prevention changes this.** With `prevent.enabled`, CAP_NET_ADMIN is
+# needed for the process's whole life, not just to bind the queue: issuing a
+# verdict is a privileged netlink send. Dropping it after binding produces a
+# sensor that judges one packet, stops, and goes on reporting itself as armed
+# while the kernel quietly applies the fail mode. See CLAUDE.md §8.
+#
 # On a HIDS-only install, drop the two NET capabilities. On a NIDS-only one,
 # drop CAP_DAC_READ_SEARCH. The sensor works with either half missing and says
 # so in its `stats` events.

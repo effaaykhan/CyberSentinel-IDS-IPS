@@ -231,3 +231,36 @@ correlation:
   cooldown-secs: 300
   max-hosts: 1024
   max-per-host: 256
+
+# ---------------------------------------------------------------------------
+# Inline prevention (the IPS half). OFF by default, and detect-only if enabled.
+#
+# Turning this on puts the sensor in the path of your traffic. Read
+# packaging/linux/README.md first; in particular, the sensor logs the nftables
+# rule it expects and does NOT apply it for you.
+# ---------------------------------------------------------------------------
+prevent:
+  enabled: false
+
+  # `detect` or `prevent`. THE ARMING CONTROL, and the kill switch.
+  # In `detect`, rules with a `drop` action still alert and nothing is ever
+  # dropped — identical behaviour to the IDS.
+  mode: detect
+
+  # What the KERNEL does when the sensor is not answering: `open` or `closed`.
+  # Not a branch in the sensor: if the process is dead, none of its code runs.
+  # This decides whether the queueing rule carries `bypass`.
+  fail-mode: open
+
+  queue: 0
+  queue-length: 1024
+
+  # Never blocked, whatever matches. Gateways, DNS resolvers, the management
+  # network, the host you administer this box from. Checked before any verdict
+  # and on BOTH endpoints, because cutting the flow to a critical host breaks
+  # it exactly as thoroughly as blocking that host's own traffic.
+  allow-list: []
+
+  source-block-secs: 600
+  max-blocked-flows: 65536
+  max-blocked-sources: 16384

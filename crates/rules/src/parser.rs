@@ -183,7 +183,12 @@ fn parse_action(text: &str) -> Result<Action, ParseError> {
     match text.to_ascii_lowercase().as_str() {
         "alert" => Ok(Action::Alert),
         "pass" => Ok(Action::Pass),
-        "drop" | "reject" | "rejectsrc" | "rejectdst" | "rejectboth" => {
+        // `drop` blocks. The `reject*` family additionally sends an RST or an
+        // ICMP unreachable, which this build does not do — accepting them as
+        // synonyms for `drop` would silently give an operator less than they
+        // asked for, so they stay refused until the responses exist.
+        "drop" => Ok(Action::Drop),
+        "reject" | "rejectsrc" | "rejectdst" | "rejectboth" => {
             Err(ParseError::PreventionAction(text.to_string()))
         }
         _ => Err(ParseError::UnknownAction(text.to_string())),
@@ -1465,13 +1470,34 @@ mod tests {
         assert_eq!(rule.sid, 9);
     }
 
+    /// `drop` is a real action now that inline prevention exists. It is
+    /// honoured only when the sensor is armed, and the loader reports how many
+    /// rules want a block that will not happen — the same care that used to be
+    /// expressed by refusing the action outright.
     #[test]
-    fn prevention_actions_are_rejected_not_downgraded() {
-        for action in ["drop", "reject"] {
+    fn drop_parses_and_asks_for_a_block() {
+        let rule = parse_rule(&MINIMAL.replace("alert", "drop")).expect("drop is a real action");
+        assert_eq!(rule.header.action, Action::Drop);
+        assert!(rule.header.action.blocks());
+    }
+
+    #[test]
+    fn alert_does_not_ask_for_a_block() {
+        let rule = parse_rule(MINIMAL).expect("a rule");
+        assert_eq!(rule.header.action, Action::Alert);
+        assert!(!rule.header.action.blocks());
+    }
+
+    /// The `reject` family also sends an RST or an ICMP unreachable. This build
+    /// does not, and quietly treating them as synonyms for `drop` would give an
+    /// operator less than they asked for without saying so.
+    #[test]
+    fn reject_actions_are_still_refused_because_the_response_does_not_exist() {
+        for action in ["reject", "rejectsrc", "rejectdst", "rejectboth"] {
             let text = MINIMAL.replace("alert", action);
             assert!(
                 matches!(parse_rule(&text), Err(ParseError::PreventionAction(_))),
-                "{action} must be rejected: v1 cannot block"
+                "{action} must be refused until the responses exist"
             );
         }
     }

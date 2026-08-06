@@ -52,6 +52,8 @@ pub struct Config {
     pub hids: HidsConfig,
     /// Joining host and network evidence into incidents.
     pub correlation: CorrelationConfig,
+    /// Inline prevention. **Off by default.**
+    pub prevent: PreventConfig,
     /// Where events go.
     pub outputs: OutputsConfig,
     /// Diagnostic logging (distinct from event output).
@@ -570,6 +572,65 @@ impl Default for StatsConfig {
     }
 }
 
+/// Inline prevention.
+///
+/// Every default here is the safe one: prevention off, and fail-open if it is
+/// ever switched on. Turning a detection sensor into something that drops
+/// traffic is a decision an operator makes deliberately, and the shape of this
+/// section is meant to make it hard to do by accident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct PreventConfig {
+    /// Run the verdict path at all.
+    pub enabled: bool,
+    /// `detect` or `prevent`. **The arming control**, and the kill switch.
+    ///
+    /// `detect` is the default and behaves exactly like the IDS: rules with a
+    /// `drop` action still alert, and nothing is ever dropped.
+    pub mode: String,
+    /// What the **kernel** does when the sensor is not answering: `open` or
+    /// `closed`.
+    ///
+    /// Not a branch in the sensor — if the process is dead, none of its code
+    /// runs. This value decides whether the generated nftables rule carries
+    /// `bypass`, and the sensor logs the rule it expects at startup.
+    pub fail_mode: String,
+    /// The netfilter queue number to bind.
+    pub queue: u16,
+    /// How many packets the kernel holds for us before applying the fail mode.
+    pub queue_length: u32,
+    /// Addresses and networks that must **never** be blocked, whatever
+    /// matches: gateways, DNS resolvers, the management network, the host you
+    /// administer this box from.
+    ///
+    /// Checked before any verdict and on **both** endpoints, because cutting
+    /// the flow to a critical host breaks it exactly as thoroughly as blocking
+    /// that host's own traffic.
+    pub allow_list: Vec<String>,
+    /// How long a blocked source stays blocked, in seconds.
+    pub source_block_secs: u64,
+    /// Most flows carrying a block verdict at once.
+    pub max_blocked_flows: usize,
+    /// Most sources blocked at once.
+    pub max_blocked_sources: usize,
+}
+
+impl Default for PreventConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "detect".to_string(),
+            fail_mode: "open".to_string(),
+            queue: 0,
+            queue_length: 1_024,
+            allow_list: Vec::new(),
+            source_block_secs: 600,
+            max_blocked_flows: 65_536,
+            max_blocked_sources: 16_384,
+        }
+    }
+}
+
 /// Host-based monitoring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
@@ -854,6 +915,35 @@ impl Config {
                     .into(),
             ));
         }
+        // Prevention's values are checked strictly: a typo in the mode is the
+        // difference between a sensor that drops traffic and one that does
+        // not, and defaulting a misspelling to either answer would be wrong.
+        if !matches!(self.prevent.mode.as_str(), "detect" | "prevent") {
+            return Err(Error::ConfigInvalid(format!(
+                "prevent.mode must be `detect` or `prevent`, not {:?}",
+                self.prevent.mode
+            )));
+        }
+        if !matches!(self.prevent.fail_mode.as_str(), "open" | "closed") {
+            return Err(Error::ConfigInvalid(format!(
+                "prevent.fail-mode must be `open` or `closed`, not {:?}",
+                self.prevent.fail_mode
+            )));
+        }
+        for entry in &self.prevent.allow_list {
+            if entry.parse::<IpNetwork>().is_err() {
+                return Err(Error::ConfigInvalid(format!(
+                    "prevent.allow-list entry {entry:?} is not an address or network"
+                )));
+            }
+        }
+        if self.prevent.enabled && self.prevent.source_block_secs == 0 {
+            return Err(Error::ConfigInvalid(
+                "prevent.source-block-secs must be at least 1: a zero-length block blocks nothing"
+                    .into(),
+            ));
+        }
+
         // A zero window correlates nothing, which is a silently disabled
         // feature rather than a configured one.
         if self.correlation.enabled && self.correlation.window_secs == 0 {

@@ -233,6 +233,12 @@ impl Prevention {
         self.settings.mode == Mode::Prevent
     }
 
+    /// How long a source block lasts, for the kernel-side set.
+    #[must_use]
+    pub fn source_block_timeout(&self) -> Duration {
+        self.settings.source_block
+    }
+
     /// The configured fail mode.
     #[must_use]
     pub fn fail_mode(&self) -> FailMode {

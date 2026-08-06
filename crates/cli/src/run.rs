@@ -20,6 +20,7 @@ use cybersentinel_engine::{CompileReport, Engine, EngineLimits, VarTable};
 use cybersentinel_hids::fim::FimSettings;
 use cybersentinel_hids::process::ScanLimits;
 use cybersentinel_hids::sensor::{HostSensor, HostSettings};
+use cybersentinel_prevent::{FailMode, Mode, Prevention, PreventionSettings};
 use cybersentinel_rules::{LoadReport, RuleSet};
 use cybersentinel_storage::{FileEventSink, StdoutEventSink};
 
@@ -190,7 +191,16 @@ pub fn run(args: &RunArgs) -> Result<()> {
     // and every thread created afterwards inherits the dropped set.
     // ---------------------------------------------------------------------
     let mut source = open_source(args, &config)?;
-    if matches!(source, Source::None) {
+
+    // The netfilter queue is bound here, next to the capture handle and for
+    // exactly the same reason: it needs CAP_NET_ADMIN, and the whole point of
+    // the drop below is that nothing afterwards has it. Binding it later —
+    // which is where it naturally wanted to live, beside the rest of the
+    // prevention setup — meant `bind` returned EPERM on a correctly configured
+    // system and the sensor degraded to detect-only. Loudly, but still.
+    let queue = bind_verdict_queue(&config);
+
+    if matches!(source, Source::None) && queue.is_none() {
         tracing::info!("no capture source configured; running as a heartbeat only");
     } else {
         drop_privileges(&config);
@@ -223,6 +233,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
         &compile_report,
         engine,
         &mut source,
+        queue,
     );
 
     // Always drain and flush, even if the run failed: queued events are
@@ -288,12 +299,28 @@ fn open_live(_config: &Config) -> Result<Source> {
 /// Deliberately non-fatal: a monitoring tool that refuses to monitor is not the
 /// safer outcome. The residual privilege is made loud instead.
 fn drop_privileges(config: &Config) {
-    let report = if config.hids.enabled {
-        cybersentinel_capture::privileges::drop_after_capture_open_retaining(&[
-            HOST_READ_CAPABILITY,
-        ])
-    } else {
+    let mut retain = Vec::new();
+    if config.hids.enabled {
+        retain.push(HOST_READ_CAPABILITY);
+    }
+    // Inline prevention needs CAP_NET_ADMIN for the process's whole life, not
+    // just to bind the queue. Setting a verdict is a netlink *send*, and that
+    // send is privileged: without the capability the kernel refuses it and
+    // reports the refusal asynchronously, so the next `recv` returns EPERM and
+    // the verdict path stops. Binding early is necessary and not sufficient.
+    //
+    // Measured, not reasoned about: with the capability dropped, the sensor
+    // judged exactly one packet, the thread exited, the kernel fell back to the
+    // fail mode, and nothing said the sensor had stopped enforcing.
+    #[cfg(target_os = "linux")]
+    if config.prevent.enabled {
+        retain.push(caps::Capability::CAP_NET_ADMIN);
+    }
+
+    let report = if retain.is_empty() {
         cybersentinel_capture::privileges::drop_after_capture_open()
+    } else {
+        cybersentinel_capture::privileges::drop_after_capture_open_retaining(&retain)
     };
 
     if report.is_overprivileged() {
@@ -418,6 +445,161 @@ fn host_settings(config: &Config) -> Option<HostSettings> {
     anything_enabled.then_some(settings)
 }
 
+/// Build inline prevention from the config, and start the verdict path.
+///
+/// Returns the shared store so the detection path can record verdicts into it.
+/// `None` means prevention is switched off entirely, which is the default and
+/// leaves the sensor behaving exactly as an IDS.
+///
+/// The nftables rule is **logged, not applied**. Taking a machine's traffic
+/// into userspace is not something a sensor should do to an operator by
+/// surprise on first start, and an inline rule installed wrongly is an outage.
+fn start_prevention(config: &Config) -> Option<Arc<Mutex<Prevention>>> {
+    if !config.prevent.enabled {
+        return None;
+    }
+
+    let mode = if config.prevent.mode == "prevent" {
+        Mode::Prevent
+    } else {
+        Mode::Detect
+    };
+    let fail_mode = if config.prevent.fail_mode == "closed" {
+        FailMode::Closed
+    } else {
+        FailMode::Open
+    };
+    let allow_list: Vec<_> = config
+        .prevent
+        .allow_list
+        .iter()
+        .filter_map(|entry| entry.parse().ok())
+        .collect();
+
+    let prevention = Arc::new(Mutex::new(Prevention::new(PreventionSettings {
+        mode,
+        fail_mode,
+        allow_list,
+        source_block: Duration::from_secs(config.prevent.source_block_secs),
+        max_blocked_flows: config.prevent.max_blocked_flows,
+        max_blocked_sources: config.prevent.max_blocked_sources,
+    })));
+
+    // Both of these are load-bearing and easy to get wrong by hand, so the
+    // sensor says exactly what it expects rather than leaving an operator to
+    // infer it. A `fail-mode: open` config with a rule that lacks `bypass` is
+    // fail-closed in practice, and nobody finds that out until an outage.
+    tracing::warn!(
+        mode = mode.as_str(),
+        fail_mode = fail_mode.as_str(),
+        queue = config.prevent.queue,
+        allow_list = config.prevent.allow_list.len(),
+        "inline prevention is enabled"
+    );
+    if mode == Mode::Prevent {
+        tracing::warn!(
+            "ARMED: matching traffic will be DROPPED. Set prevent.mode to `detect` to disarm."
+        );
+    } else {
+        tracing::info!("prevention is in detect mode: rules that ask to block will only alert");
+    }
+    tracing::info!(
+        "the queueing rule this sensor expects (apply it yourself; it is not applied for you):\n{}",
+        cybersentinel_prevent::nft::queue_rule(config.prevent.queue, fail_mode)
+    );
+
+    Some(prevention)
+}
+
+/// Bind the netfilter queue, while the process still has `CAP_NET_ADMIN`.
+///
+/// Called beside `open_source` and before `drop_privileges`, which is the only
+/// place it can go: capabilities are dropped once, early, while the process is
+/// single-threaded, and everything after that runs without them.
+#[cfg(target_os = "linux")]
+fn bind_verdict_queue(config: &Config) -> Option<cybersentinel_prevent::queue::KernelQueue> {
+    use cybersentinel_prevent::queue::KernelQueue;
+
+    if !config.prevent.enabled {
+        return None;
+    }
+    match KernelQueue::bind(config.prevent.queue) {
+        Ok(mut queue) => {
+            if let Err(error) =
+                queue.set_queue_length(config.prevent.queue, config.prevent.queue_length)
+            {
+                tracing::warn!(%error, "could not set the queue length; the kernel default applies");
+            }
+            Some(queue)
+        }
+        Err(error) => {
+            // Not fatal. Detection continues; what is lost is enforcement, and
+            // it is lost loudly rather than by a sensor that looks armed.
+            tracing::error!(
+                %error,
+                queue = config.prevent.queue,
+                "could not bind the netfilter queue; the sensor will DETECT BUT NOT PREVENT \
+                 (CAP_NET_ADMIN is required, and the queue must not already be bound)"
+            );
+            None
+        }
+    }
+}
+
+/// Bind the netfilter queue. Linux-only.
+#[cfg(not(target_os = "linux"))]
+fn bind_verdict_queue(_config: &Config) -> Option<()> {
+    None
+}
+
+/// Run the verdict path on its own thread.
+///
+/// Its own thread because it must answer the kernel promptly and cannot be
+/// behind a packet-capture poll or a FIM scan. It holds the lock only for the
+/// duration of a hash lookup.
+#[cfg(target_os = "linux")]
+fn spawn_verdict_thread(
+    mut queue: cybersentinel_prevent::queue::KernelQueue,
+    prevention: Arc<Mutex<Prevention>>,
+    shutdown: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    use cybersentinel_prevent::queue::{judge, VerdictSource};
+
+    let queue_number = 0_u16;
+    std::thread::Builder::new()
+        .name("cybersentinel-verdict".to_string())
+        .spawn(move || {
+            tracing::info!(queue = queue_number, "verdict path running");
+            while !shutdown.load(Ordering::Relaxed) {
+                let Some(packet) = queue.next_packet() else {
+                    break;
+                };
+                let decision = {
+                    let Ok(mut store) = prevention.lock() else {
+                        break;
+                    };
+                    judge(&mut store, &packet, std::time::Instant::now())
+                };
+                queue.resolve(packet, decision);
+            }
+            // A stopped verdict path means the kernel's fail mode is now
+            // deciding for every packet on this queue. That is a change in what
+            // the machine does to traffic, so it is an error, not an info line.
+            match queue.fatal.take() {
+                Some(error) => tracing::error!(
+                    %error,
+                    retries = queue.retries,
+                    "the verdict path STOPPED: the kernel's fail mode now applies to every packet"
+                ),
+                None => tracing::info!(
+                    retries = queue.retries,
+                    "verdict path stopped; the kernel now applies the configured fail mode"
+                ),
+            }
+        })
+        .ok()
+}
+
 /// Attach host monitoring to the pipeline, if it is configured.
 ///
 /// A host sensor that cannot start is reported and skipped rather than fatal:
@@ -472,6 +654,8 @@ fn main_loop(
     compile_report: &CompileReport,
     engine: Engine,
     source: &mut Source,
+    #[cfg(target_os = "linux")] queue: Option<cybersentinel_prevent::queue::KernelQueue>,
+    #[cfg(not(target_os = "linux"))] queue: Option<()>,
 ) -> Result<()> {
     let started = Instant::now();
     let shutdown = install_signal_handler()?;
@@ -501,6 +685,23 @@ fn main_loop(
     }
     attach_host_monitoring(config, &mut pipeline);
 
+    // Inline prevention, if it is configured. The verdict thread runs whether
+    // or not there is a capture source: a machine can be inline without the
+    // sensor also sniffing it.
+    let prevention = start_prevention(config);
+    #[cfg(target_os = "linux")]
+    let verdict_thread = match (queue, prevention.as_ref()) {
+        (Some(queue), Some(store)) => {
+            spawn_verdict_thread(queue, Arc::clone(store), Arc::clone(&shutdown))
+        }
+        _ => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = queue;
+    if let Some(store) = prevention.as_ref() {
+        pipeline.arm_prevention(Arc::clone(store));
+    }
+
     // Publish before the first stats event so the startup heartbeat reports the
     // real baseline and watch counts rather than zeroes.
     pipeline.publish(&snapshot, CaptureCounters::default());
@@ -517,15 +718,43 @@ fn main_loop(
     // and so a quiet link still produces a heartbeat.
     let stats_thread = spawn_stats_thread(config, emitter, report, started, &snapshot, &shutdown);
 
-    let outcome = if source.as_packet_source().is_some() {
+    let mut outcome = if source.as_packet_source().is_some() {
         run_packet_loop(source, &snapshot, &shutdown, &mut pipeline)
     } else {
         host_only_loop(&snapshot, &shutdown, &mut pipeline)
     };
 
+    // A capture file ending is not a reason to stop enforcing. The verdict
+    // path is still bound to the kernel's queue and still holding traffic;
+    // exiting here would hand every packet to the fail mode because a replay
+    // finished. Keep going until signalled, the same as any other inline run.
+    #[cfg(target_os = "linux")]
+    let enforcing = verdict_thread.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let enforcing = false;
+    // Only when a queue is actually being served. `prevent.enabled` with no
+    // bound queue enforces nothing, and a `--replay` run that never exits
+    // because of a config flag would be a surprise with no upside.
+    if outcome.is_ok() && enforcing && !shutdown.load(Ordering::Relaxed) {
+        tracing::info!(
+            "the capture source is finished, but prevention is active: \
+             staying up to keep enforcing"
+        );
+        outcome = host_only_loop(&snapshot, &shutdown, &mut pipeline);
+    }
+
     // Stop the stats thread and emit one final stats event with the closing
     // counters — in particular whether anything was dropped.
     shutdown.store(true, Ordering::Relaxed);
+    #[cfg(target_os = "linux")]
+    if verdict_thread.is_some() {
+        // Deliberately not joined. The verdict thread blocks in `recv` waiting
+        // for a packet that may never come on a quiet link, and holding
+        // shutdown open for it would make the sensor look wedged. Letting the
+        // process exit hands the queue back to the kernel, which then applies
+        // the configured fail mode — which is exactly the intended behaviour.
+        tracing::info!("leaving the verdict path to the kernel's fail mode");
+    }
     if let Some(handle) = stats_thread {
         let _ = handle.join();
     }
@@ -763,6 +992,7 @@ fn emit_stats(
             resets_ignored: pipeline.flows.resets_ignored,
         },
         hids: pipeline.hids.clone(),
+        prevent: pipeline.prevent.clone(),
         correlation: pipeline.correlation.clone(),
         engine: EngineStats {
             enabled: capturing && pipeline.rules_armed > 0,
