@@ -820,6 +820,63 @@ pub struct ReassemblyStats {
     pub resets_ignored: u64,
 }
 
+/// Whether a host event source is actually working.
+///
+/// A sensor that reports nothing looks identical whether the host is quiet or
+/// the source that watches it is broken. On Linux that distinction was made by
+/// counters; porting to another OS makes it structural, because the ways a
+/// source can fail differ per platform while "we are not seeing this any more"
+/// does not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceState {
+    /// Running. It may legitimately have nothing to report.
+    #[default]
+    Active,
+    /// Running with less coverage than it should have. **A partial hole.**
+    Degraded,
+    /// Configured, but could not start on this host — a missing binary, a
+    /// permission, a disabled audit policy. **A hole.**
+    Unavailable,
+    /// Not implemented for this platform yet. **A hole**, and an expected one,
+    /// but an operator reading a quiet sensor still needs to be told.
+    Unsupported,
+}
+
+impl SourceState {
+    /// The wire string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Degraded => "degraded",
+            Self::Unavailable => "unavailable",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    /// Whether this state means coverage is missing.
+    #[must_use]
+    pub fn is_hole(self) -> bool {
+        !matches!(self, Self::Active)
+    }
+}
+
+/// One host event source and what it is doing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceStatus {
+    /// Stable identifier — `fim.realtime`, `auth.journald`, `process.table`.
+    pub name: String,
+    /// Whether it is working.
+    pub state: SourceState,
+    /// Why, in one line. Always set when the state is not `active`, because
+    /// "unavailable" without a reason is not actionable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    /// How much this source has produced since start.
+    pub records: u64,
+}
+
 /// Counters for host monitoring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HidsStats {
@@ -856,6 +913,13 @@ pub struct HidsStats {
     pub process_events: u64,
     /// Host alerts raised.
     pub host_alerts: u64,
+    /// Every event source and whether it is actually working.
+    ///
+    /// The point of listing sources that are **not** working is that they are
+    /// otherwise indistinguishable from a quiet host. A consumer should alarm
+    /// on any entry whose state is not `active`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceStatus>,
 }
 
 /// Counters for host/network correlation.

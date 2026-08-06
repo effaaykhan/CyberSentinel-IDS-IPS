@@ -45,6 +45,7 @@
 use crate::fim::{self, FimSettings};
 use crate::logs::{self, Tailer};
 use crate::process::{self, ScanLimits};
+use crate::sources::{self, names, SourceRegistry};
 use crate::HostError;
 use cybersentinel_common::event::{AuthEvent, FimDetection, FimEvent, HidsStats, ProcessEvent};
 use notify::{RecursiveMode, Watcher as _};
@@ -397,6 +398,8 @@ pub struct HostSensor {
     journal: Option<JournalReader>,
     processes: Option<process::Watcher>,
     next_sweep: Instant,
+    /// What each source is doing, and whether it is doing anything.
+    sources: SourceRegistry,
     stats: HidsStats,
 }
 
@@ -439,6 +442,7 @@ impl HostSensor {
                 process::Watcher::new(settings.proc_root.clone(), settings.process_limits)
             }),
             next_sweep: Instant::now(),
+            sources: SourceRegistry::new(),
             stats: HidsStats {
                 enabled: true,
                 ..HidsStats::default()
@@ -446,23 +450,82 @@ impl HostSensor {
             settings,
         };
 
+        // Declare this platform's gaps first, so a backend that exists can
+        // overwrite its entry below. Whatever is left saying `unsupported` is
+        // genuinely unsupported — and says so, rather than reporting zeroes.
+        sources::declare_platform_gaps(&mut sensor.sources);
+
         if let Some(fim_settings) = sensor.settings.fim.clone() {
             sensor.spawn_fim(&fim_settings)?;
         }
 
         if sensor.settings.journald {
             match JournalReader::spawn() {
-                Ok(reader) => sensor.journal = Some(reader),
+                Ok(reader) => {
+                    sensor.sources.active(names::AUTH_STRUCTURED);
+                    sensor.journal = Some(reader);
+                }
                 Err(detail) => {
-                    tracing::warn!(
-                        detail,
-                        "journald unavailable; continuing with configured log files"
-                    );
+                    // A hole, not a warning to move past: authentication
+                    // activity on this host is now only as visible as the
+                    // configured log files make it.
+                    sensor
+                        .sources
+                        .unavailable(names::AUTH_STRUCTURED, format!("journalctl: {detail}"));
+                    sensor.journal = None;
                 }
             }
         }
 
+        sensor.declare_auth_files();
+        sensor.sources.log_holes();
+        sensor.stats.sources = sensor.sources.snapshot();
+
         Ok(sensor)
+    }
+
+    /// Say whether the configured authentication log files exist.
+    ///
+    /// A file that is not there is not an error — a service may simply not have
+    /// logged yet — but *none* of them being there means this source will never
+    /// produce anything, which an operator should hear about rather than infer
+    /// from a permanent zero.
+    fn declare_auth_files(&mut self) {
+        if self.tailers.is_empty() {
+            return;
+        }
+        let present: Vec<_> = self
+            .tailers
+            .iter()
+            .filter(|tailer| tailer.path().exists())
+            .map(|tailer| tailer.path().display().to_string())
+            .collect();
+
+        if present.is_empty() {
+            let configured: Vec<_> = self
+                .tailers
+                .iter()
+                .map(|tailer| tailer.path().display().to_string())
+                .collect();
+            self.sources.unavailable(
+                names::AUTH_FILES,
+                format!(
+                    "none of the configured files exist: {}",
+                    configured.join(", ")
+                ),
+            );
+        } else if present.len() < self.tailers.len() {
+            self.sources.degraded(
+                names::AUTH_FILES,
+                format!(
+                    "{} of {} configured files exist",
+                    present.len(),
+                    self.tailers.len()
+                ),
+            );
+        } else {
+            self.sources.active(names::AUTH_FILES);
+        }
     }
 
     /// Put the FIM worker on its own thread.
@@ -521,6 +584,7 @@ impl HostSensor {
             self.sweep_processes(&mut batch);
             self.next_sweep = now + self.settings.process_interval;
         }
+        self.stats.sources = self.sources.snapshot();
         batch
     }
 
@@ -542,6 +606,41 @@ impl HostSensor {
                 }
             }
         }
+        // FIM's two detectors are two sources, and they fail independently:
+        // watches can all fail while the baseline still works, which is a
+        // partial hole, not an outage.
+        if self.settings.fim.is_some() {
+            if self.fim_counters.watched_paths == 0 && self.fim_counters.watch_failures > 0 {
+                self.sources.unavailable(
+                    names::FIM_REALTIME,
+                    "no path could be watched in real time; only the periodic rescan sees changes",
+                );
+            } else if self.fim_counters.watch_failures > 0 {
+                self.sources.degraded(
+                    names::FIM_REALTIME,
+                    format!(
+                        "{} path(s) could not be watched; those are covered by the rescan only",
+                        self.fim_counters.watch_failures
+                    ),
+                );
+            } else if self.fim_counters.watched_paths > 0 {
+                self.sources.active(names::FIM_REALTIME);
+            }
+
+            if self.fim_counters.rescans > 0 && self.fim_counters.baseline_entries == 0 {
+                // A completed scan that hashed nothing means the configured
+                // paths matched no files. The sensor is watching an empty set
+                // and would report nothing for ever.
+                self.sources.unavailable(
+                    names::FIM_BASELINE,
+                    "a scan completed but the baseline is empty: hids.fim.paths matched no files",
+                );
+            } else if self.fim_counters.rescans > 0 {
+                self.sources.active(names::FIM_BASELINE);
+            }
+            self.sources.produced(names::FIM_REALTIME, 0);
+        }
+
         self.stats.watched_paths = self.fim_counters.watched_paths;
         self.stats.watch_failures = self.fim_counters.watch_failures;
         self.stats.fim_realtime = self.fim_counters.realtime;
@@ -610,6 +709,46 @@ impl HostSensor {
             return;
         };
         let outcome = watcher.sweep();
+
+        // **Silence that is provably wrong.** A process table always contains
+        // at least this process, so a sweep seeing one entry or none is not
+        // watching a quiet machine — its view has been restricted. That is the
+        // exact shape of the `ProtectProc=invisible` failure the packaging pass
+        // found by testing: service healthy, capture fine, FIM fine, process
+        // monitoring reporting nothing at all and looking no different from a
+        // host where nothing started.
+        if outcome.processes_seen <= 1 {
+            self.sources.unavailable(
+                names::PROCESS_TABLE,
+                format!(
+                    "a sweep of {} saw {} process(es); a process table always contains this one, \
+                     so the view is restricted (ProtectProc/hidepid?), not quiet",
+                    self.settings.proc_root.display(),
+                    outcome.processes_seen
+                ),
+            );
+        } else {
+            self.sources.active(names::PROCESS_TABLE);
+        }
+
+        // Sockets are read from a different file with different permissions, so
+        // they can fail while the process table works — `ProcSubset=pid` does
+        // exactly that. Zero listening sockets is possible on a real host
+        // though, so this cannot be a hard failure: it is reported as degraded
+        // only when the table itself is readable and the socket file is not.
+        match watcher.sockets_readable() {
+            true => self.sources.active(names::PROCESS_SOCKETS),
+            false => self.sources.unavailable(
+                names::PROCESS_SOCKETS,
+                format!(
+                    "no socket table under {}: listening sockets are invisible (ProcSubset=pid?)",
+                    self.settings.proc_root.display()
+                ),
+            ),
+        }
+
+        self.sources
+            .produced(names::PROCESS_TABLE, outcome.events.len() as u64);
         self.stats.process_events += outcome.events.len() as u64;
         batch.process.extend(outcome.events);
     }
@@ -1029,6 +1168,215 @@ mod tests {
         let batch = sensor.poll_at(start + Duration::from_secs(61));
         assert_eq!(batch.process.len(), 1);
         assert_eq!(batch.process[0].name, "nc");
+    }
+
+    // -----------------------------------------------------------------------
+    // silence that is provably wrong
+    // -----------------------------------------------------------------------
+
+    /// The `ProtectProc=invisible` failure, reproduced without systemd.
+    ///
+    /// The packaging pass found it by measurement: service healthy, capture
+    /// working, FIM working, and process monitoring reporting nothing at all —
+    /// indistinguishable from a host where nothing started. A process table
+    /// always contains the sensor's own process, so seeing one entry is proof
+    /// the view is restricted rather than the host being quiet.
+    #[test]
+    fn a_process_sweep_that_can_only_see_itself_reports_a_hole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A /proc containing exactly one process: what hidepid leaves behind.
+        write(
+            &dir.path().join("1/stat"),
+            "1 (cybersentinel) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 5 0 0",
+        );
+        write(&dir.path().join("net/tcp"), "  sl  local_address\n");
+
+        let mut sensor = HostSensor::start(HostSettings {
+            proc_root: dir.path().to_path_buf(),
+            process_monitoring: true,
+            ..HostSettings::default()
+        })
+        .expect("sensor");
+        sensor.poll();
+
+        let status = sensor
+            .stats()
+            .sources
+            .iter()
+            .find(|source| source.name == names::PROCESS_TABLE)
+            .expect("the process source is listed");
+        assert_eq!(
+            status.state,
+            cybersentinel_common::event::SourceState::Unavailable,
+            "one visible process is a blinded sensor, not a quiet host"
+        );
+        assert!(
+            status.detail.contains("restricted"),
+            "the report must say what is wrong: {:?}",
+            status.detail
+        );
+    }
+
+    #[test]
+    fn a_process_sweep_that_sees_a_real_table_is_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for pid in 1..=5 {
+            write(
+                &dir.path().join(format!("{pid}/stat")),
+                &format!("{pid} (proc) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {pid} 0 0"),
+            );
+        }
+        write(&dir.path().join("net/tcp"), "  sl  local_address\n");
+
+        let mut sensor = HostSensor::start(HostSettings {
+            proc_root: dir.path().to_path_buf(),
+            process_monitoring: true,
+            ..HostSettings::default()
+        })
+        .expect("sensor");
+        sensor.poll();
+
+        let sources = &sensor.stats().sources;
+        let table = sources
+            .iter()
+            .find(|source| source.name == names::PROCESS_TABLE)
+            .expect("listed");
+        assert_eq!(
+            table.state,
+            cybersentinel_common::event::SourceState::Active
+        );
+    }
+
+    /// The `ProcSubset=pid` failure: the process table is readable, the socket
+    /// table is not, and listening-socket detection stops with nothing to show.
+    #[test]
+    fn a_missing_socket_table_reports_a_hole_of_its_own() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for pid in 1..=4 {
+            write(
+                &dir.path().join(format!("{pid}/stat")),
+                &format!("{pid} (proc) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {pid} 0 0"),
+            );
+        }
+        // No net/tcp at all — what ProcSubset=pid leaves behind.
+
+        let mut sensor = HostSensor::start(HostSettings {
+            proc_root: dir.path().to_path_buf(),
+            process_monitoring: true,
+            ..HostSettings::default()
+        })
+        .expect("sensor");
+        sensor.poll();
+
+        let sources = &sensor.stats().sources;
+        let table = sources
+            .iter()
+            .find(|source| source.name == names::PROCESS_TABLE)
+            .expect("listed");
+        let sockets = sources
+            .iter()
+            .find(|source| source.name == names::PROCESS_SOCKETS)
+            .expect("listed");
+
+        assert_eq!(
+            table.state,
+            cybersentinel_common::event::SourceState::Active,
+            "the process table is fine; only the socket half broke"
+        );
+        assert_eq!(
+            sockets.state,
+            cybersentinel_common::event::SourceState::Unavailable,
+            "an unreadable socket table is a hole, not zero sockets"
+        );
+    }
+
+    #[test]
+    fn auth_files_that_do_not_exist_are_a_reported_hole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sensor = HostSensor::start(HostSettings {
+            auth_files: vec![
+                dir.path().join("nope.log"),
+                dir.path().join("also-nope.log"),
+            ],
+            ..HostSettings::default()
+        })
+        .expect("sensor");
+
+        let status = sensor
+            .stats()
+            .sources
+            .iter()
+            .find(|source| source.name == names::AUTH_FILES)
+            .expect("listed");
+        assert_eq!(
+            status.state,
+            cybersentinel_common::event::SourceState::Unavailable,
+            "a source that can never produce anything must say so"
+        );
+        assert!(status.detail.contains("none of the configured files exist"));
+    }
+
+    #[test]
+    fn some_auth_files_missing_is_degraded_not_dead() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let present = dir.path().join("auth.log");
+        write(&present, "");
+
+        let sensor = HostSensor::start(HostSettings {
+            auth_files: vec![present, dir.path().join("secure")],
+            ..HostSettings::default()
+        })
+        .expect("sensor");
+
+        let status = sensor
+            .stats()
+            .sources
+            .iter()
+            .find(|source| source.name == names::AUTH_FILES)
+            .expect("listed");
+        assert_eq!(
+            status.state,
+            cybersentinel_common::event::SourceState::Degraded
+        );
+    }
+
+    /// FIM watching a path set that matches nothing would report zero for ever
+    /// and look like a filesystem nobody touched.
+    #[test]
+    fn a_baseline_that_matched_no_files_is_a_reported_hole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = dir.path().join("empty-dir");
+        fs::create_dir_all(&empty).expect("mkdir");
+
+        let mut sensor = HostSensor::start(HostSettings {
+            fim: Some(FimSettings {
+                paths: vec![empty],
+                ..FimSettings::default()
+            }),
+            ..HostSettings::default()
+        })
+        .expect("sensor");
+
+        for _ in 0..200 {
+            sensor.poll();
+            if sensor.stats().rescans >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        sensor.poll();
+
+        let status = sensor
+            .stats()
+            .sources
+            .iter()
+            .find(|source| source.name == names::FIM_BASELINE)
+            .expect("listed");
+        assert_eq!(
+            status.state,
+            cybersentinel_common::event::SourceState::Unavailable,
+            "a completed scan with an empty baseline means the paths matched nothing"
+        );
     }
 
     #[test]

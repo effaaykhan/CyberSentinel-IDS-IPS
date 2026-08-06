@@ -29,6 +29,7 @@ pub mod logs;
 pub mod platform;
 pub mod process;
 pub mod sensor;
+pub mod sources;
 
 /// Host rules occupy SIDs at or above this value, keeping them out of the
 /// network rule space.

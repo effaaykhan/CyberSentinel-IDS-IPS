@@ -318,6 +318,15 @@ pub struct SweepOutcome {
     pub events: Vec<ProcessEvent>,
     /// Entries dropped because a bound was reached.
     pub truncated: u64,
+    /// How many processes the sweep could see at all.
+    ///
+    /// Not a statistic: it is how the caller tells "quiet host" from "blinded
+    /// sensor". A process table always contains at least this process, so a
+    /// sweep that sees one or none is not watching a machine where nothing
+    /// happened — something has restricted its view of `/proc`.
+    pub processes_seen: usize,
+    /// How many listening sockets the sweep could see.
+    pub sockets_seen: usize,
 }
 
 impl Watcher {
@@ -341,6 +350,8 @@ impl Watcher {
         let snapshot = snapshot(&self.proc_root, self.limits);
         let mut outcome = SweepOutcome {
             truncated: snapshot.truncated,
+            processes_seen: snapshot.processes.len(),
+            sockets_seen: snapshot.listening.len(),
             ..SweepOutcome::default()
         };
 
@@ -388,6 +399,20 @@ impl Watcher {
         self.known_listening = snapshot.listening.keys().copied().collect();
         self.established = true;
         outcome
+    }
+
+    /// Whether the socket table can be read at all.
+    ///
+    /// Separate from "are there any listening sockets", which can legitimately
+    /// be zero. `/proc/net/tcp` exists on every Linux with a network stack, so
+    /// its *absence* means something has hidden it — `ProcSubset=pid` does
+    /// exactly this — and listening-socket detection is then off with nothing
+    /// to show for it.
+    #[must_use]
+    pub fn sockets_readable(&self) -> bool {
+        ["net/tcp", "net/tcp6"]
+            .iter()
+            .any(|file| self.proc_root.join(file).exists())
     }
 
     /// Find the process holding a socket inode, by scanning `/proc/<pid>/fd`.
