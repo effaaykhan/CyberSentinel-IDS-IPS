@@ -403,6 +403,26 @@ impl Prevention {
     pub fn record_latency(&mut self, micros: u64) {
         self.stats.verdict_latency_us_total += micros;
         self.stats.verdict_latency_us_max = self.stats.verdict_latency_us_max.max(micros);
+        // The tail, not the median. A verdict path's median is a hash lookup
+        // and stays flat right up until the queue backs up; what moves first is
+        // the number of packets that took far longer than they should have.
+        if micros > 1_000 {
+            self.stats.verdict_latency_over_1ms += 1;
+        }
+        if micros > 10_000 {
+            self.stats.verdict_latency_over_10ms += 1;
+        }
+    }
+
+    /// Fold in what the kernel says about the queue.
+    ///
+    /// Called from the stats path, not the verdict path: it reads a proc file,
+    /// and nothing that touches the filesystem belongs in the loop the kernel
+    /// is waiting on.
+    pub fn record_queue_depth(&mut self, depth: &crate::depth::QueueDepth) {
+        self.stats.queue_depth = u64::from(depth.queued);
+        self.stats.queue_depth_max = self.stats.queue_depth_max.max(u64::from(depth.queued));
+        self.stats.queue_unjudged = depth.unjudged();
     }
 
     /// Record that the kernel applied the fail mode rather than asking us.

@@ -60,6 +60,7 @@
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+pub mod depth;
 pub mod nft;
 pub mod queue;
 pub mod store;

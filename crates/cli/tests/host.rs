@@ -240,6 +240,21 @@ fn stop(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// Poll the event log until `done` is satisfied, or the deadline passes.
+///
+/// Outcome-based waiting, because every fixed sleep in this file has eventually
+/// become a flaky test on a loaded machine.
+fn wait_for(events: &Path, seconds: u64, mut done: impl FnMut(&[Value]) -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while std::time::Instant::now() < deadline {
+        if done(&read_events(events)) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    false
+}
+
 /// Wait until a stats event reports a non-empty FIM baseline.
 ///
 /// Returns false if it never does, so the caller can fail with a message about
@@ -504,11 +519,28 @@ fn a_new_listening_socket_produces_a_host_alert() {
         .spawn()
         .expect("starting the sensor");
 
-    // Let the first sweep establish what is already listening — nothing.
+    // Wait for the first sweep to establish what is already listening —
+    // nothing — rather than sleeping a guess. A sweep takes as long as its
+    // interval, and under a parallel test run it takes longer; a fixed sleep
+    // made this fail intermittently on a sensor that was working.
+    let events_path = scratch.path().join("logs/events.json");
+    assert!(
+        wait_for(&events_path, 60, |events| {
+            events.iter().any(|event| event["event_type"] == "stats")
+        }),
+        "the sensor never published a stats event"
+    );
     std::thread::sleep(std::time::Duration::from_secs(2));
+
     fake_process(&proc, 1337, "backdoor", 99);
     scratch.write("proc/net/tcp", LISTENING_ON_4444);
-    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // And wait for the outcome rather than for a duration.
+    wait_for(&events_path, 60, |events| {
+        events.iter().any(|event| {
+            event["event_type"] == "process" && event["process"]["change"] == "listening"
+        })
+    });
     stop(&mut child);
 
     let events = read_events(&scratch.path().join("logs/events.json"));

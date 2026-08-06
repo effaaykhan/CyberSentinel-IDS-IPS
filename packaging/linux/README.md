@@ -171,6 +171,53 @@ measurement rather than by copying a hardening checklist.
 `AF_INET`/`AF_INET6` are deliberately absent until the Phase 7 webhook sink
 needs them — with a check that shows it does.
 
+## Inline prevention: measure before you arm
+
+`sudo sh packaging/linux/measure-prevention.sh` puts real traffic through a
+real queue and reports what the sensor costs. Measured on this project's
+development host — 8 cores, loopback, ~283,000 packets:
+
+| | value |
+|---|---|
+| mean verdict latency | **31 µs** |
+| worst | 5.3 ms |
+| verdicts over 10 ms | **0** |
+| peak queue depth | 52 of 1024 |
+| packets never judged | **0** |
+
+Latency was never the problem. What the measurement found was **1.3% of
+packets never reaching a verdict at all**, and the first diagnosis of it was
+wrong — which is worth recording, because the wrong fix looked like it worked.
+
+An `iperf3` run left **3,566 of ~283,000 packets `user_dropped`**: discarded
+between the kernel and the sensor. The queue never went deeper than five of
+1024, so `queue-length` was never the constraint. Raising
+`net.core.rmem_default` from 208 KB to 8 MB took it to zero, which looked like
+the answer.
+
+It was not the cause. NFQUEUE copies the **whole packet** to userspace by
+default, and the verdict path reads at most 64 bytes of it — an IP header and
+two ports. Copying headers only takes the count to **zero at the stock 208 KB
+buffer**, because the bytes crossing netlink fall by three orders of magnitude.
+The sensor now sets a 128-byte copy range at bind time.
+
+The trade is visible and worth knowing: packets that used to be dropped are now
+queued and judged, so peak depth went from 5 to 52 and worst-case latency from
+1 ms to 5 ms. Complete coverage costs tail latency.
+
+**Watch `stats.prevent.queue_unjudged`.** It is the count of packets the kernel
+disposed of before the sensor could judge them — forwarded **unexamined** under
+fail-open, **dropped** under fail-closed — and the sensor cannot see them from
+the inside, which is why it reads them back out of
+`/proc/net/netfilter/nfnetlink_queue`. A rising value is the only warning you
+get. `sysctl -w net.core.rmem_default=8388608` buys extra headroom for bursts
+on top of the copy reduction.
+
+**What loopback cannot tell you.** No NIC, no driver, no interrupt path, and a
+higher packet rate than most links. It stresses the verdict path harder than a
+real segment and says nothing about behaviour behind a saturated interface.
+Re-run this on the real path before arming.
+
 ## Still to do
 
 * **arm64.** The build pins `x86_64-unknown-linux-gnu`; `aarch64` needs the

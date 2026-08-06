@@ -29,6 +29,14 @@ pub struct QueuedPacket {
     pub id: u32,
     /// Its 5-tuple. The verdict path derives everything it needs from this.
     pub tuple: NetTuple,
+    /// When the packet came out of the kernel.
+    ///
+    /// The number an operator cares about is not how long `decide` took — that
+    /// is a hash lookup — but how long the kernel held the packet because of
+    /// us, which is receipt to verdict-sent. Timing only the decision would
+    /// have reported microseconds while the real in-path delay sat in the
+    /// netlink send.
+    pub received: Instant,
 }
 
 /// Judge one packet. The entire hot path.
@@ -37,11 +45,29 @@ pub struct QueuedPacket {
 /// exercise exactly what the NFQUEUE loop exercises, rather than a
 /// reimplementation of it that could drift.
 pub fn judge(prevention: &mut Prevention, packet: &QueuedPacket, now: Instant) -> Decision {
-    let started = Instant::now();
-    let decision = prevention.decide(&packet.tuple, now);
-    // Microseconds: a verdict path measured in milliseconds is already broken.
-    let elapsed = started.elapsed().as_micros();
-    prevention.record_latency(u64::try_from(elapsed).unwrap_or(u64::MAX));
+    prevention.decide(&packet.tuple, now)
+}
+
+/// Judge one packet, return the verdict, and record what it cost.
+///
+/// **The only way a verdict should be issued.** It used to be a `judge` call
+/// followed by a `resolve` call, with the latency recorded alongside — and the
+/// CLI's verdict thread, which has its own loop rather than using [`run`],
+/// recorded nothing. 302,313 packets went through the real path reporting a
+/// mean latency of zero, which is exactly the reading that would let somebody
+/// arm this believing it was free. One function, so there is no second copy to
+/// drift.
+pub fn judge_and_resolve<S: VerdictSource>(
+    source: &mut S,
+    prevention: &mut Prevention,
+    packet: QueuedPacket,
+) -> Decision {
+    let received = packet.received;
+    let decision = judge(prevention, &packet, Instant::now());
+    source.resolve(packet, decision);
+    // After the verdict has gone back, so this is the whole of the delay the
+    // sensor adds to a packet in the path — not just the hash lookup.
+    prevention.record_latency(u64::try_from(received.elapsed().as_micros()).unwrap_or(u64::MAX));
     decision
 }
 
@@ -49,12 +75,10 @@ pub fn judge(prevention: &mut Prevention, packet: &QueuedPacket, now: Instant) -
 pub fn run<S: VerdictSource>(source: &mut S, prevention: &mut Prevention) -> RunSummary {
     let mut summary = RunSummary::default();
     while let Some(packet) = source.next_packet() {
-        let decision = judge(prevention, &packet, Instant::now());
-        match decision {
+        match judge_and_resolve(source, prevention, packet) {
             Decision::Accept => summary.accepted += 1,
             Decision::Drop(_) => summary.dropped += 1,
         }
-        source.resolve(packet, decision);
     }
     summary
 }
@@ -268,6 +292,29 @@ impl KernelQueue {
     pub fn set_queue_length(&mut self, number: u16, packets: u32) -> std::io::Result<()> {
         self.queue.set_queue_max_len(number, packets)
     }
+
+    /// Copy only the packet headers to userspace, not the payload.
+    ///
+    /// By default NFQUEUE copies the **whole packet** across netlink. The
+    /// verdict path reads at most 64 bytes of it — an IPv4 header with options
+    /// plus two ports — so copying a 64 KB segment moves three orders of
+    /// magnitude more data than the decision needs, and it lands in a socket
+    /// buffer that then overflows.
+    ///
+    /// Measured before this existed: an `iperf3` run over loopback left 3,778
+    /// packets `user_dropped` — never judged, and under fail-open forwarded
+    /// unexamined — while the queue itself never went deeper than five packets.
+    /// The queue was never the bottleneck; the copy was.
+    ///
+    /// **This truncation is invisible to detection**, which reads full packets
+    /// from the capture path. If the verdict path is ever given a job that
+    /// needs payload, this is the line that has to change with it.
+    ///
+    /// # Errors
+    /// If the queue cannot be configured.
+    pub fn set_header_only(&mut self, number: u16, bytes: u16) -> std::io::Result<()> {
+        self.queue.set_copy_range(number, bytes)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -303,7 +350,11 @@ impl VerdictSource for KernelQueue {
             match tuple_from_ip_packet(message.get_payload()) {
                 Some(tuple) => {
                     self.in_flight.insert(id, message);
-                    return Some(QueuedPacket { id, tuple });
+                    return Some(QueuedPacket {
+                        id,
+                        tuple,
+                        received: Instant::now(),
+                    });
                 }
                 None => {
                     // Unreadable header: accept it and move on. Dropping a
@@ -342,6 +393,7 @@ mod tests {
     fn packet(id: u32, src: &str) -> QueuedPacket {
         QueuedPacket {
             id,
+            received: Instant::now(),
             tuple: NetTuple {
                 src_ip: src.parse().expect("an address"),
                 src_port: Some(4_000),

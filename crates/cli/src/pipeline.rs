@@ -131,6 +131,8 @@ pub struct PacketPipeline {
     correlator: Option<Correlator>,
     /// Host alerts raised so far.
     host_alerts: u64,
+    /// Which netfilter queue prevention is bound to, for depth readings.
+    prevent_queue: u16,
     /// Inline prevention, when it is configured.
     ///
     /// Shared with the verdict thread: that thread reads it for every packet
@@ -178,6 +180,7 @@ impl PacketPipeline {
             host: None,
             correlator: None,
             host_alerts: 0,
+            prevent_queue: 0,
             prevention: None,
             alerts: Vec::new(),
             rules_armed: 0,
@@ -199,8 +202,9 @@ impl PacketPipeline {
     }
 
     /// Attach inline prevention.
-    pub fn arm_prevention(&mut self, prevention: Arc<Mutex<Prevention>>) {
+    pub fn arm_prevention(&mut self, prevention: Arc<Mutex<Prevention>>, queue: u16) {
         self.prevention = Some(prevention);
+        self.prevent_queue = queue;
     }
 
     /// Attach host monitoring and, optionally, correlation.
@@ -920,7 +924,18 @@ impl PacketPipeline {
             prevent: self
                 .prevention
                 .as_ref()
-                .and_then(|store| store.lock().ok().map(|store| store.stats()))
+                .and_then(|store| {
+                    store.lock().ok().map(|mut store| {
+                        // Ask the kernel how deep the queue is while we are
+                        // already publishing counters, so the reading and the
+                        // rest of the stats describe the same moment.
+                        if let Some(depth) = cybersentinel_prevent::depth::read(self.prevent_queue)
+                        {
+                            store.record_queue_depth(&depth);
+                        }
+                        store.stats()
+                    })
+                })
                 .unwrap_or_default(),
             correlation: self
                 .correlator

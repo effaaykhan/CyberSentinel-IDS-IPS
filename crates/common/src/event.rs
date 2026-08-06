@@ -938,6 +938,29 @@ pub struct PreventStats {
     /// Worst verdict latency seen, in microseconds. Every microsecond here is
     /// added to every packet on the path.
     pub verdict_latency_us_max: u64,
+    /// Verdicts that took longer than a millisecond.
+    ///
+    /// A count rather than a percentile because the shape that matters is not
+    /// the median — which is a hash lookup — but the tail, and a tail that is
+    /// growing is a queue about to back up.
+    pub verdict_latency_over_1ms: u64,
+    /// Verdicts that took longer than ten milliseconds.
+    pub verdict_latency_over_10ms: u64,
+    /// Packets the kernel had queued for us at the last reading.
+    ///
+    /// The depth grows before anything is dropped, so this is the early
+    /// warning that `fail_mode_packets` is the confirmation of.
+    pub queue_depth: u64,
+    /// The deepest the queue has been seen.
+    pub queue_depth_max: u64,
+    /// Packets the **kernel** discarded before the sensor could judge them —
+    /// a full queue, or a netlink buffer that could not take them.
+    ///
+    /// **A coverage hole, and the one the sensor cannot see from the inside**:
+    /// from the verdict loop, packets that never arrived are indistinguishable
+    /// from a quiet link. Read from
+    /// `/proc/net/netfilter/nfnetlink_queue`.
+    pub queue_unjudged: u64,
 }
 
 /// Counters for host monitoring.

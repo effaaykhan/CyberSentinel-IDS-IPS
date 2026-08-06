@@ -51,6 +51,13 @@ const HOST_POLL: Duration = Duration::from_millis(200);
 /// How long shutdown waits for the host sensors to hand over what they found.
 const HOST_DRAIN: Duration = Duration::from_secs(5);
 
+/// How much of each packet the kernel copies for a verdict.
+///
+/// The verdict path reads an IPv4 header with options (60) plus two ports (4).
+/// 128 leaves room without copying payload nobody looks at.
+#[cfg(target_os = "linux")]
+const VERDICT_COPY_BYTES: u16 = 128;
+
 /// The one capability host monitoring keeps.
 ///
 /// `CAP_DAC_READ_SEARCH` bypasses file-read and directory-search permission
@@ -503,6 +510,26 @@ fn start_prevention(config: &Config) -> Option<Arc<Mutex<Prevention>>> {
     } else {
         tracing::info!("prevention is in detect mode: rules that ask to block will only alert");
     }
+    // Defence in depth, not a prerequisite. Copying headers only (above) is
+    // what actually keeps packets from being dropped between the kernel and
+    // this process; a larger buffer absorbs bursts on top of that. Worth
+    // saying on a host running close to the edge, not worth refusing to start
+    // over — and `nfq` does not expose the socket, so the sensor cannot set it
+    // itself in any case.
+    match cybersentinel_prevent::depth::netlink_recv_buffer() {
+        Some(bytes) if cybersentinel_prevent::depth::buffer_is_adequate(bytes) => {
+            tracing::info!(bytes, "netlink receive buffer is large enough");
+        }
+        Some(bytes) => tracing::warn!(
+            bytes,
+            suggested = cybersentinel_prevent::depth::MIN_NETLINK_RECV_BUFFER,
+            "net.core.rmem_default is small; bursts may be dropped between the kernel and the \
+             sensor. `sysctl -w net.core.rmem_default=8388608` gives more headroom. Watch \
+             stats.prevent.queue_unjudged — it counts packets that never reached a verdict"
+        ),
+        None => tracing::warn!("could not read net.core.rmem_default"),
+    }
+
     tracing::info!(
         "the queueing rule this sensor expects (apply it yourself; it is not applied for you):\n{}",
         cybersentinel_prevent::nft::queue_rule(config.prevent.queue, fail_mode)
@@ -529,6 +556,16 @@ fn bind_verdict_queue(config: &Config) -> Option<cybersentinel_prevent::queue::K
                 queue.set_queue_length(config.prevent.queue, config.prevent.queue_length)
             {
                 tracing::warn!(%error, "could not set the queue length; the kernel default applies");
+            }
+            // Headers only. The verdict path reads at most 64 bytes of a
+            // packet; copying whole segments across netlink moves three orders
+            // of magnitude more data than the decision needs.
+            if let Err(error) = queue.set_header_only(config.prevent.queue, VERDICT_COPY_BYTES) {
+                tracing::warn!(
+                    %error,
+                    "could not limit the packet copy range; whole packets will be copied to \
+                     userspace, which needs a larger net.core.rmem_default to keep up"
+                );
             }
             Some(queue)
         }
@@ -563,7 +600,7 @@ fn spawn_verdict_thread(
     prevention: Arc<Mutex<Prevention>>,
     shutdown: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
-    use cybersentinel_prevent::queue::{judge, VerdictSource};
+    use cybersentinel_prevent::queue::{judge_and_resolve, VerdictSource};
 
     let queue_number = 0_u16;
     std::thread::Builder::new()
@@ -574,13 +611,13 @@ fn spawn_verdict_thread(
                 let Some(packet) = queue.next_packet() else {
                     break;
                 };
-                let decision = {
-                    let Ok(mut store) = prevention.lock() else {
-                        break;
-                    };
-                    judge(&mut store, &packet, std::time::Instant::now())
+                let Ok(mut store) = prevention.lock() else {
+                    break;
                 };
-                queue.resolve(packet, decision);
+                // One call, so the verdict and the latency it cost cannot come
+                // apart the way they did when this loop had its own copy.
+                judge_and_resolve(&mut queue, &mut store, packet);
+                drop(store);
             }
             // A stopped verdict path means the kernel's fail mode is now
             // deciding for every packet on this queue. That is a change in what
@@ -699,7 +736,7 @@ fn main_loop(
     #[cfg(not(target_os = "linux"))]
     let _ = queue;
     if let Some(store) = prevention.as_ref() {
-        pipeline.arm_prevention(Arc::clone(store));
+        pipeline.arm_prevention(Arc::clone(store), config.prevent.queue);
     }
 
     // Publish before the first stats event so the startup heartbeat reports the

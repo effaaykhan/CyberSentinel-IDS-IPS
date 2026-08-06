@@ -239,6 +239,19 @@ correlation:
 # packaging/linux/README.md first; in particular, the sensor logs the nftables
 # rule it expects and does NOT apply it for you.
 # ---------------------------------------------------------------------------
+# BEFORE ARMING, measure: `sudo sh packaging/linux/measure-prevention.sh`.
+#
+# On this project's development host, ~283,000 packets over loopback: mean
+# verdict latency 31us, worst 5.3ms, nothing over 10ms, peak queue depth 52 of
+# 1024, and zero packets that never reached a verdict.
+#
+# The counter to watch in production is `stats.prevent.queue_unjudged`. It
+# counts packets the kernel disposed of before the sensor could judge them —
+# forwarded unexamined under fail-open, dropped under fail-closed — and the
+# sensor cannot see them from the inside, which is why it reads them back out
+# of /proc/net/netfilter/nfnetlink_queue.
+#
+# `sysctl -w net.core.rmem_default=8388608` gives extra headroom for bursts.
 prevent:
   enabled: false
 
