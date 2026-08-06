@@ -206,6 +206,34 @@ every stage; memory safety is the reason the language was chosen. A crate that
 genuinely needs `unsafe` (a capture backend, plausibly) must opt out explicitly
 and document why.
 
+**Phase 5 forces this question, and it needs an answer before the port
+starts.** Every function in the `windows`/`windows-sys` crates is an `unsafe
+fn`, because they are raw FFI. `ReadDirectoryChangesW`, `DeviceIoControl` for
+the USN journal, ETW session setup, and `GetExtendedTcpTable` cannot be called
+under `forbid`. Three ways out, in preference order:
+
+1. **Safe wrapper crates where one exists and is worth trusting** — e.g.
+   `windows-service` for the service control handler. Fewest lines of our own
+   `unsafe`, but each one is a dependency inside a security tool, so each is a
+   judgement call and not automatically better.
+2. **One opted-out backend crate**, `hids-windows`, with
+   `#![allow(unsafe_code)]` at its root, every `unsafe` block individually
+   justified, and a hard rule that **no parsing happens inside it**. The FFI
+   layer's only job is to hand a `&[u8]` and a length to a safe parser that
+   lives outside it and is fuzzed — exactly the split that keeps the pcap
+   *reader* in-tree and safe while the capture *backend* is FFI.
+3. Do not port. Not a real option.
+
+**Recommended: (2), with (1) where a wrapper is small enough to audit.** The
+value of `forbid` was never the absence of the keyword; it was that no
+attacker-controlled bytes are parsed by unsafe code. That property survives (2)
+and is the one worth defending.
+
+Whichever is chosen, `unsafe_code = "forbid"` stops being literally true
+workspace-wide, and the acceptance criterion that says it holds should be
+restated as *"no first-party crate parses input under `unsafe`"* — otherwise it
+will either be quietly violated or block the port.
+
 ### Parsers must be total
 Every parser returns a value or a typed error for **any** input, including
 malformed, adversarial, and enormous. No panics, no unbounded recursion. Guide
@@ -778,9 +806,18 @@ dedicated user holding only `CAP_DAC_READ_SEARCH`, live capture still works,
 and `/etc/shadow` is hashed into the baseline. All four are asserted by
 `verify-install.sh`, which CI runs against the installed service.
 
-### Phase 5 — Windows port + installer
-Npcap capture (bundled) · FIM via `ReadDirectoryChangesW`/USN · ETW/Event Log ·
-Windows Service · `.msi`/`.exe` · Authenticode.
+### Phase 5 — Windows port + installer 🚧 **blocked on a Windows host and a CI remote**
+Npcap capture (**detected, not bundled**) · FIM via `ReadDirectoryChangesW` +
+USN journal catch-up · ETW + Event Log · Windows Service · `.msi`/`.exe` ·
+Authenticode.
+
+The phase's own sequencing puts *"CI green on the Windows runner first"* ahead
+of every platform feature. That step needs a remote this repository has never
+had, and the machine has no Windows host. What could be settled and proven from
+Linux was: the Npcap licence decision, the `unsafe` decision above, and the
+**source model** — every host source now reports whether it is working, and a
+platform with no backends says so instead of reporting zeroes. The full plan,
+including what would falsify it, is `packaging/windows/PORT-PLAN.md`.
 
 ### Phase 6 — macOS port + installer
 BPF capture · FSEvents · unified log/OpenBSM · launchd · universal binary ·

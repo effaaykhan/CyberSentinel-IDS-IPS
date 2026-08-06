@@ -1,8 +1,11 @@
 # Windows packaging
 
-**Status: scaffolding (Phase 5).** Nothing here is built by CI yet; CI does
-compile and test the sensor on `windows-latest`, so the code stays portable in
-the meantime.
+**Status: scaffolding (Phase 5).** Nothing here is built by CI yet. CI compiles
+and tests the sensor on `windows-latest` and cross-compiles it for Windows from
+the Linux runner, so the code stays portable in the meantime.
+
+**Read `PORT-PLAN.md` first.** It records what Phase 5 settled, what it built,
+and why no Windows platform code is in the tree yet.
 
 ## Planned shape
 
