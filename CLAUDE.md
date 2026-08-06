@@ -813,11 +813,25 @@ Authenticode.
 
 The phase's own sequencing puts *"CI green on the Windows runner first"* ahead
 of every platform feature. That step needs a remote this repository has never
-had, and the machine has no Windows host. What could be settled and proven from
-Linux was: the Npcap licence decision, the `unsafe` decision above, and the
-**source model** — every host source now reports whether it is working, and a
-platform with no backends says so instead of reporting zeroes. The full plan,
-including what would falsify it, is `packaging/windows/PORT-PLAN.md`.
+had, and the machine has no Windows host.
+
+**The platform-independent half is written, tested, and fuzzed**: the USN
+journal parser and catch-up planner (`crates/hids/src/usn.rs`) and the
+Security-log logon parser (`crates/hids/src/evtx.rs`), plus the Npcap licence
+decision, the `unsafe` decision above, and the **source model** — every host
+source now reports whether it is working, and a platform with no backends says
+so instead of reporting zeroes.
+
+Both parsers are pure byte and text parsing with no Windows dependency, which
+is the only reason their behaviour could be established at all. That split is
+deliberate and is the shape the rest of the port should take: the FFI crate
+obtains buffers, and everything that *interprets* them is safe, first-party,
+and fuzzed — the same division that keeps the `.pcap` reader in-tree while the
+capture backend is libpcap.
+
+What remains needs a Windows machine: the FFI calls themselves, the service,
+the installer, and signing. The full plan, including what would falsify it, is
+`packaging/windows/PORT-PLAN.md`.
 
 ### Phase 6 — macOS port + installer
 BPF capture · FSEvents · unified log/OpenBSM · launchd · universal binary ·

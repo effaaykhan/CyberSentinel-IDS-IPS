@@ -5,7 +5,20 @@ why this is a plan and a set of decisions rather than an implementation. It
 records what was settled, what was built because it could be verified here, and
 what is deliberately not written yet.
 
-## Why no Windows code is in the tree
+## Status
+
+The **platform-independent half** of the Windows port is written, tested, and
+fuzzed: the USN journal parser and catch-up planner (`crates/hids/src/usn.rs`)
+and the Security-log logon parser (`crates/hids/src/evtx.rs`). Both are pure
+`&[u8]`/`&str` parsing with no Windows dependency, which is why their behaviour
+could be established at all from a Linux machine.
+
+The **FFI half** — actually calling `FSCTL_READ_USN_JOURNAL`,
+`ReadDirectoryChangesW`, `EvtQuery`/`EvtRender`, ETW, `GetExtendedTcpTable` —
+is not, and neither is the service, the installer, or signing. Those need a
+Windows machine and a CI remote.
+
+## Why the FFI half is not in the tree
 
 The phase's own sequencing puts *"CI green on the Windows runner first"* at step
 1, ahead of every platform feature, and says why: everything below it would
@@ -62,6 +75,24 @@ question — *is this source working?* — and a platform-specific reason string
 | A FIM baseline that matched no files is a reported hole | test |
 | The workspace, tests included, cross-compiles for Windows | `cargo build --workspace --tests --target x86_64-pc-windows-gnu`, and now in CI |
 | The `/proc` reader and journald no longer run on Windows and contradict the registry | test + cross-compile |
+| USN record parsing: bounds, totality, termination, rejection of incoherent records | 35 tests + a fuzz target, 4.2M executions clean |
+| USN catch-up planning: resume vs. full rescan, including journal replacement and wrap | tests over every branch |
+| Security-log 4624/4625 → `AuthEvent`, including field-injection refusal | 17 tests |
+
+### Two things the tests changed
+
+Both were caught by writing the test before believing the code:
+
+* **The USN walk resynchronised on nonsense.** It stepped forward by any
+  declared record length, including lengths too small to be a record, which
+  landed mid-record and turned one bad length into a run of fabricated
+  rejections. The fuzzer found it in seconds. The walk now stops at the first
+  length that cannot belong to a real record and counts one hole.
+* **"First occurrence wins" was no defence against field injection.** If the
+  event renderer ever failed to escape a username, a crafted one looks like
+  more fields — and `TargetUserName` is rendered *before* `IpAddress`, so the
+  forged address comes first. A duplicated field is now refused outright: no
+  source address beats an attacker-chosen one.
 
 ## Then, in this order
 
@@ -98,20 +129,28 @@ privilege — and the sensor keeps running with the rest.
   question is whether `notify`'s Windows backend surfaces overflow at all. If
   it does not, that is a coverage hole and must be found now, not after
   shipping.
-* **FIM catch-up:** the USN journal. Read from the last-processed USN to find
-  what changed while the sensor was down, then hash those files — the journal
-  says *that* a file changed, never *what to*, so content integrity still comes
-  from hashing. Handle journal wrap: a `USN_JOURNAL_ID` that no longer matches,
-  or a start USN below `FirstUsn`, means records were lost and the answer is a
-  full rescan, reported. **Parse the record buffer with a safe, fuzzed parser
-  outside the FFI crate** — variable-length records from a kernel buffer are
-  exactly the input class this project keeps in-tree.
-* **Auth:** Event Log 4624/4625. Structured, so the `for invalid user`
-  ambiguity documented in `crates/hids/README.md` does not arise — the account
-  is a field. Note that 4688 process auditing is **off by default**, which is
-  why process events come from ETW instead; if a deployment wants 4688 anyway,
-  its absence must be reported rather than looking like a host where nothing
-  ran.
+* **FIM catch-up:** the USN journal. **The parsing and the catch-up decision
+  are written** — `crates/hids/src/usn.rs`. What remains is the FFI:
+  `FSCTL_QUERY_USN_JOURNAL` into `parse_journal_data`, `plan_catch_up` to
+  decide resume-or-rescan, `FSCTL_READ_USN_JOURNAL` into
+  `parse_read_response`, and `OpenFileById` to turn a parent reference into a
+  path. Then hash the files it names — the journal says *that* a file changed,
+  never *what to*, so content integrity still comes from hashing.
+
+  **Confirm the layout constants on first contact.** They come from the
+  documented `USN_RECORD_V2`/`V3` layouts, not from bytes off an NTFS volume.
+  A wrong one shows up as a non-zero `rejected` count rather than as wrong
+  events, which is the failure mode that was designed for — but it is still a
+  failure, so check `rejected` is zero against a real journal before trusting
+  anything downstream of it.
+* **Auth:** Event Log 4624/4625. **The mapping is written** —
+  `crates/hids/src/evtx.rs` turns a rendered event into an `AuthEvent`. What
+  remains is `EvtQuery`/`EvtSubscribe` plus `EvtRender` to produce the XML it
+  parses. Structured, so the `for invalid user` ambiguity documented in
+  `crates/hids/README.md` does not arise — the account is a field. Note that
+  4688 process auditing is **off by default**, which is why process events come
+  from ETW instead; if a deployment wants 4688 anyway, its absence must be
+  reported rather than looking like a host where nothing ran.
 * **Process:** ETW Kernel-Process provider. **Sockets:**
   `GetExtendedTcpTable`. Both keep the `Watcher` shape: a sweep or a stream,
   producing the same `ProcessEvent`s the engine already matches on.
