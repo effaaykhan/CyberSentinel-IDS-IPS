@@ -1,4 +1,14 @@
-//! End-to-end tests for host-based detection.
+//! End-to-end tests for host-based detection **on Linux**.
+//!
+//! Gated to Linux as a whole rather than test by test. Parts of it would run
+//! elsewhere — the FIM path is `notify`, which is cross-platform, and the
+//! syslog parser is pure text — but the suite as written asserts Linux
+//! backends: a `/proc` tree, `/proc/net/tcp`, and syslog-shaped auth records.
+//! Letting the portable half run on Windows would report coverage for a
+//! platform whose host backends do not exist yet, which is the opposite of
+//! what this file is for. The Windows equivalent arrives with those backends.
+#![cfg(target_os = "linux")]
+
 //!
 //! These are the Phase 4 acceptance criteria, driven through the real binary:
 //! a watched file changes, a login fails repeatedly, a socket starts listening

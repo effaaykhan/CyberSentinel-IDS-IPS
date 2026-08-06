@@ -88,6 +88,19 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # Cross-compile the whole workspace, tests included, for Windows from the
+      # Linux runner. The windows-latest leg of this matrix is the real check —
+      # it uses MSVC, which this does not — but that leg is also the one most
+      # likely to be unavailable in a given environment, and a portability
+      # regression should not wait for it. mingw catches missing platform gates
+      # and unported code the moment they land.
+      - name: Cross-compile for Windows (portability guard)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+          rustup target add x86_64-pc-windows-gnu
+          cargo build --workspace --tests --target x86_64-pc-windows-gnu
+
       - name: Test
         run: cargo test --workspace
 

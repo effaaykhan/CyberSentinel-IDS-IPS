@@ -438,7 +438,12 @@ impl HostSensor {
             fim_counters: FimCounters::default(),
             tailers: settings.auth_files.iter().map(Tailer::new).collect(),
             journal: None,
-            processes: settings.process_monitoring.then(|| {
+            // Linux-only, and gated rather than left to fail quietly. The
+            // `/proc` reader is ordinary file I/O, so on Windows it would
+            // construct happily, find nothing, and report zero events — while
+            // the source registry said "unsupported". Two answers to the same
+            // question is worse than one wrong one.
+            processes: (cfg!(target_os = "linux") && settings.process_monitoring).then(|| {
                 process::Watcher::new(settings.proc_root.clone(), settings.process_limits)
             }),
             next_sweep: Instant::now(),
@@ -459,7 +464,11 @@ impl HostSensor {
             sensor.spawn_fim(&fim_settings)?;
         }
 
-        if sensor.settings.journald {
+        // journald is Linux. Attempting it elsewhere would replace the
+        // registry's accurate "the Event Log backend arrives in Phase 5" with a
+        // misleading "journalctl could not be spawned" — both are holes, but
+        // only one tells an operator what is actually going on.
+        if sensor.settings.journald && cfg!(target_os = "linux") {
             match JournalReader::spawn() {
                 Ok(reader) => {
                     sensor.sources.active(names::AUTH_STRUCTURED);
