@@ -10,8 +10,11 @@ the meantime.
 2. Wrap in an **MSI (WiX)** or an **EXE (Inno Setup)**. `cybersentinel.wxs` is a
    WiX v4 skeleton; the toolchain choice is still open — see below.
 3. Register a **Windows Service** (`windows-service` crate) with automatic start.
-4. **Bundle the Npcap installer** — packet capture on Windows depends on it, and
-   the product promises no external prerequisites. See `../third_party/`.
+4. **Detect Npcap and prompt** — do **not** bundle it. Npcap's licence
+   restricts redistribution, and bundling generally needs a commercial OEM
+   licence; detect-and-prompt has no procurement dependency. The cost is that
+   the Windows NIDS has one external prerequisite, which is now stated rather
+   than promised away. See `../third_party/`.
 5. **Authenticode sign** the binary and the installer.
 
 ## Open decision: WiX vs Inno

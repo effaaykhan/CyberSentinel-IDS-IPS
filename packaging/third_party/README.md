@@ -5,19 +5,46 @@ licensing answer *before* it is.
 
 ## Npcap (Windows packet capture) — Phase 5
 
-Windows has no built-in packet-capture interface, so Phase 5 depends on Npcap,
-and the product's "no external prerequisites" promise means bundling its
-installer rather than telling operators to fetch it.
+Windows has no built-in packet-capture interface, so the Windows NIDS depends
+on Npcap.
 
 **Npcap is not open source.** It ships under a custom licence that restricts
-redistribution; bundling it in a distributed product generally requires a
-commercial OEM licence from the Nmap Project. **This must be resolved before
-Phase 5 ships, not after.** The alternatives, if it cannot be:
+redistribution; bundling its installer in a distributed product generally
+requires a commercial OEM licence from the Nmap Project. Nothing here should be
+treated as legal advice — read the licence that ships with the version you
+intend to use, and get the OEM question answered by someone qualified before
+distributing anything.
 
-* Detect Npcap at install time and direct the operator to install it — honest,
-  but it breaks the no-prerequisites promise.
-* Use a different capture path on Windows, at a meaningful cost in coverage and
-  compatibility.
+### Decision: detect and prompt. Do not bundle.
+
+The installer **detects** Npcap and, if it is absent, tells the operator what
+to install and why. It does not carry the Npcap installer.
+
+That is the option with no procurement dependency and no licence risk, and it
+can be revisited: if the product is later distributed with Npcap bundled, the
+OEM licence has to be obtained first, and this file is where that change gets
+recorded.
+
+### What it costs, stated plainly
+
+It breaks the "**no external prerequisites**" promise in CLAUDE.md §1 — for the
+**network half, on Windows, only**. The honest statement of the product is now:
+
+* **HIDS on Windows: no prerequisites.** File integrity, authentication, and
+  process monitoring need nothing installed.
+* **NIDS on Windows: needs Npcap.** One prerequisite, detected at install and
+  named in the installer rather than discovered at 3am.
+* **Linux and macOS: unchanged.** libpcap is present by default on both and is
+  a package dependency, not a bundled payload.
+
+### The requirement that follows
+
+A Windows sensor whose capture backend is unavailable must **say so**, in the
+same way every other missing source now does — `capture` reports unavailable
+with "Npcap is not installed" rather than running happily and seeing no
+traffic. An operator who skipped the prompt must not have to infer that from a
+packet counter stuck at zero. See `crates/hids/src/sources.rs` for the shape
+this takes on the host side.
 
 ## Detection content
 

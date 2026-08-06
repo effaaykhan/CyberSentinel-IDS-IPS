@@ -3,7 +3,11 @@
 A **standalone intrusion detection sensor** for Windows, Linux, and macOS. One
 installed binary per host does both **host-based** (file integrity,
 authentication and system logs, processes) and **network-based** monitoring,
-with **no external prerequisites** and **no central server** to run.
+with **no external prerequisites** and **no central server** to run. (One
+exception, documented: network monitoring *on Windows* needs Npcap, which the
+installer detects and prompts for — see
+[`packaging/third_party/`](packaging/third_party/README.md). Host monitoring on
+Windows needs nothing, and Linux and macOS need nothing.)
 
 * **Detection-only.** It alerts; it does not block. The rule parser rejects
   `drop` and `reject` outright rather than quietly downgrading them, so a

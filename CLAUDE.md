@@ -40,6 +40,16 @@ monitoring, shipped as a native installer per OS with **no external
 prerequisites** and **no central server**. It can forward events to a SIEM the
 operator already runs; it ships no console of its own.
 
+**One documented exception, from Phase 5:** the Windows *network* half needs
+**Npcap**, which is detected at install and prompted for rather than bundled —
+its licence restricts redistribution and bundling generally needs a commercial
+OEM licence, which is a procurement dependency the project has chosen not to
+take. The Windows *host* half needs nothing. Linux and macOS are unchanged:
+libpcap is present by default on both and is a package dependency, not a
+payload. The trade is recorded in `packaging/third_party/README.md`, and a
+sensor whose capture backend is missing must **report it as an unavailable
+source** rather than run quietly seeing no traffic.
+
 **Detection-only (IDS) in v1.** It alerts; it does not block. This is enforced in
 code, not just documented: the rule parser *rejects* `drop` and `reject` actions
 rather than silently downgrading them to alerts, so an operator who writes a
