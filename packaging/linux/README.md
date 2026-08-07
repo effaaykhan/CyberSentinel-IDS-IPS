@@ -213,6 +213,38 @@ the inside, which is why it reads them back out of
 get. `sysctl -w net.core.rmem_default=8388608` buys extra headroom for bursts
 on top of the copy reduction.
 
+### Soak: does it drift?
+
+`sudo sh packaging/linux/soak-prevention.sh 180` answers the different question
+a burst cannot — whether anything *grows*. An IPS holds state per condemned
+flow and per blocked source, and both are fed by whoever is attacking, which is
+the shape of a leak an attacker gets to trigger.
+
+180 seconds, 4,200,000 packets judged (~23k pps sustained):
+
+| | |
+|---|---|
+| mean latency, first tenth of the run | 11.8 µs |
+| mean latency, last tenth | **11.7 µs** |
+| worst | 4.9 ms |
+| verdicts over 10 ms | **0** |
+| peak queue depth | 1 |
+| packets never judged | **0** |
+| RSS, start → end | 7048 → 7060 kB |
+
+The early-versus-late comparison is the point: a cumulative mean would average a
+slow climb away against the first quiet minute, so the script recomputes the
+mean per interval and compares the ends. Flat latency, flat memory, nothing
+unjudged.
+
+**What this soak does not cover:** nothing matched, so the verdict *store* was
+empty throughout — it measures the path, not state growth under sustained
+blocking. That is covered deterministically instead, by
+`an_hour_of_continuous_blocking_stays_bounded_and_drains` in
+`crates/prevent`, which runs a simulated hour of blocking and asserts the
+tables stay bounded, never hold anything past its expiry, and drain to zero.
+Simulated time, so it runs in milliseconds and runs in CI.
+
 **What loopback cannot tell you.** No NIC, no driver, no interrupt path, and a
 higher packet rate than most links. It stresses the verdict path harder than a
 real segment and says nothing about behaviour behind a saturated interface.

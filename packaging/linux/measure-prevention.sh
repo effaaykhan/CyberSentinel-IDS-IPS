@@ -31,7 +31,8 @@ WORK=$(mktemp -d)
 SAMPLES="$WORK/depth.tsv"
 
 cleanup() {
-    kill "${SENSOR_PID:-0}" "${LOAD_PID:-0}" 2>/dev/null || true
+    trap - EXIT INT TERM
+    kill "${SAMPLER:-0}" "${SENSOR_PID:-0}" "${LOAD_PID:-0}" 2>/dev/null || true
     nft delete table inet "$TABLE" 2>/dev/null || true
     rm -rf "$WORK"
 }

@@ -693,6 +693,138 @@ mod tests {
         assert_eq!(prevention.stats().blocks_dropped_at_capacity, 1);
     }
 
+    // -----------------------------------------------------------------------
+    // soak: does the state stay bounded and drain, over a long timeline
+    // -----------------------------------------------------------------------
+
+    /// The question a five-second burst cannot answer: does this leak?
+    ///
+    /// An IPS holds state per condemned flow and per blocked source, and both
+    /// are fed by whoever is attacking — which is exactly the shape of an
+    /// unbounded-growth bug an attacker gets to trigger. Simulated time rather
+    /// than real, so the whole hour runs in milliseconds and runs in CI.
+    #[test]
+    fn an_hour_of_continuous_blocking_stays_bounded_and_drains() {
+        let block_for = Duration::from_secs(60);
+        let mut prevention = Prevention::new(PreventionSettings {
+            mode: Mode::Prevent,
+            source_block: block_for,
+            max_blocked_flows: 4_096,
+            max_blocked_sources: 4_096,
+            ..PreventionSettings::default()
+        });
+
+        let start = Instant::now();
+        // An hour, a block every second, from a rotating cast of sources —
+        // 3,600 blocks against a store that may hold 4,096.
+        for second in 0..3_600_u64 {
+            let now = start + Duration::from_secs(second);
+            let source = format!(
+                "10.{}.{}.{}",
+                second % 251,
+                (second / 251) % 251,
+                1 + second % 250
+            );
+            prevention.block(&tuple(&source, "10.0.0.1"), now);
+            prevention.expire(now);
+
+            let stats = prevention.stats();
+            assert!(
+                stats.blocked_flows_active <= 4_096,
+                "flow table exceeded its cap at second {second}"
+            );
+            assert!(
+                stats.blocked_sources_active <= 4_096,
+                "source table exceeded its cap at second {second}"
+            );
+            // Nothing may be held longer than the block duration, so the live
+            // set can never be larger than one block-window's worth of work.
+            assert!(
+                stats.blocked_sources_active <= 61,
+                "at second {second} the source table held {} entries, but nothing \
+                 should outlive its 60s block",
+                stats.blocked_sources_active
+            );
+        }
+
+        // And it drains completely once the traffic stops.
+        prevention.expire(start + Duration::from_secs(3_600 + 61));
+        let stats = prevention.stats();
+        assert_eq!(
+            stats.blocked_sources_active, 0,
+            "the source table did not drain"
+        );
+        assert_eq!(
+            stats.blocked_flows_active, 0,
+            "the flow table did not drain"
+        );
+        assert!(
+            stats.blocks_dropped_at_capacity == 0,
+            "a cap was hit that should not have been"
+        );
+    }
+
+    /// The same source attacking continuously must not grow the table: it is
+    /// one entry whose expiry moves, not one entry per attempt.
+    #[test]
+    fn one_persistent_source_is_one_entry() {
+        let mut prevention = armed();
+        let start = Instant::now();
+        for second in 0..10_000_u64 {
+            let now = start + Duration::from_millis(second * 100);
+            prevention.block(&tuple("203.0.113.7", "10.0.0.1"), now);
+            prevention.expire(now);
+        }
+        assert_eq!(
+            prevention.stats().blocked_sources_active,
+            1,
+            "a source blocked ten thousand times is still one source"
+        );
+    }
+
+    /// Past the cap the store refuses rather than grows, and says so. The
+    /// refusal is the important half: silently evicting a live verdict would
+    /// let an attacker restore their own traffic by making noise.
+    #[test]
+    fn a_flood_of_distinct_sources_hits_the_cap_and_reports_it() {
+        let mut prevention = Prevention::new(PreventionSettings {
+            mode: Mode::Prevent,
+            max_blocked_sources: 512,
+            max_blocked_flows: 512,
+            source_block: Duration::from_secs(3_600),
+            ..PreventionSettings::default()
+        });
+        let now = Instant::now();
+        for index in 0..5_000_u32 {
+            let source = format!(
+                "10.{}.{}.{}",
+                index / 65_536,
+                (index / 256) % 256,
+                index % 256
+            );
+            prevention.block(&tuple(&source, "10.0.0.1"), now);
+        }
+
+        let stats = prevention.stats();
+        assert!(stats.blocked_sources_active <= 512);
+        assert!(
+            stats.blocks_dropped_at_capacity > 0,
+            "hitting the cap must be counted: a block that was not recorded is not enforced"
+        );
+    }
+
+    /// Latency accounting must survive a long run without wrapping.
+    #[test]
+    fn latency_totals_do_not_overflow_over_a_long_run() {
+        let mut prevention = armed();
+        for _ in 0..100_000 {
+            prevention.record_latency(u64::MAX / 200_000);
+        }
+        let stats = prevention.stats();
+        assert!(stats.verdict_latency_us_total > 0);
+        assert!(stats.verdict_latency_us_max > 0);
+    }
+
     #[test]
     fn stats_report_the_active_mode_and_fail_mode() {
         let prevention = Prevention::new(PreventionSettings {
