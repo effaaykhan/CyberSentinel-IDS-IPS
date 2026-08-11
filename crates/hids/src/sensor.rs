@@ -1146,6 +1146,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn process_sweeps_respect_their_interval() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1190,6 +1191,16 @@ mod tests {
     /// indistinguishable from a host where nothing started. A process table
     /// always contains the sensor's own process, so seeing one entry is proof
     /// the view is restricted rather than the host being quiet.
+    // `/proc` process monitoring is Linux-only — `HostSensor::start` gates the
+    // watcher on it, so on any other platform `processes` is `None` and no
+    // sweep happens. These four tests assert what a sweep *found*, so they are
+    // Linux-only too.
+    //
+    // They were not, and CI's first run on real Windows and macOS runners
+    // failed all four. The cross-compile guard could not have caught it: it
+    // compiles the tests, it never runs them. Gating the runtime without
+    // gating the tests that exercise it is a gap only a real runner shows.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_process_sweep_that_can_only_see_itself_reports_a_hole() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1226,6 +1237,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_process_sweep_that_sees_a_real_table_is_active() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1258,6 +1270,7 @@ mod tests {
 
     /// The `ProcSubset=pid` failure: the process table is readable, the socket
     /// table is not, and listening-socket detection stops with nothing to show.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_missing_socket_table_reports_a_hole_of_its_own() {
         let dir = tempfile::tempdir().expect("tempdir");
