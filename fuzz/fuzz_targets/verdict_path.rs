@@ -28,8 +28,12 @@ fuzz_target!(|data: &[u8]| {
     let Some(tuple) = tuple_from_ip_packet(data) else {
         return;
     };
-    let packet = QueuedPacket { id: 1, tuple };
     let now = Instant::now();
+    let packet = QueuedPacket {
+        id: 1,
+        tuple,
+        received: now,
+    };
 
     // 1. An empty store accepts everything.
     let mut empty = Prevention::new(PreventionSettings {

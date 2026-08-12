@@ -550,6 +550,24 @@ jobs:
 
       # Every parser that touches attacker-supplied input gets a short run, so a
       # regression surfaces on the PR that caused it rather than months later.
+      # Build every target BEFORE running any of them.
+      #
+      # `fuzz/` is a separate workspace — deliberately, so nightly and the
+      # sanitizer flags stay out of the stable build — which means
+      # `cargo build --workspace` and `cargo clippy --workspace` never compile
+      # it. A change to a type used by a fuzz target therefore breaks it
+      # silently, and the break surfaces only when that target's turn comes
+      # round. That is what happened: eleven targets ran clean for fifteen
+      # minutes and the twelfth failed to compile, because a field added to
+      # `QueuedPacket` was never threaded into it.
+      #
+      # Building first turns a fifteen-minute discovery into a thirty-second
+      # one, and makes "does the fuzz crate still compile" a thing CI answers
+      # on every run rather than only when a target happens to be reached.
+      - name: Build every fuzz target
+        working-directory: fuzz
+        run: cargo fuzz build
+
       - name: Fuzz the parsers
         working-directory: fuzz
         run: |

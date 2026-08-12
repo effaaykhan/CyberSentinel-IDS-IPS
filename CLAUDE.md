@@ -937,6 +937,12 @@ cargo run -p cybersentinel -- run --config config/config.yaml \
     --replay tests/fixtures/pcap/evasion.pcap --dump-streams /tmp/streams
 
 # Fuzzing — run from INSIDE fuzz/, whose rust-toolchain.toml selects nightly.
+#
+# `fuzz/` is EXCLUDED from the root workspace, so `cargo build --workspace` and
+# `cargo clippy --workspace` never compile it. Change a type a fuzz target uses
+# and nothing local will tell you it broke. Build the targets after any such
+# change:
+#     cd fuzz && cargo fuzz build
 # `cargo fuzz` resolves the toolchain from the working directory, so running it
 # from the repo root picks up the root pin (stable) and fails.
 cd fuzz && cargo fuzz run reassembler -- -max_total_time=60
