@@ -381,26 +381,38 @@ jobs:
           dpkg-deb --info "$deb"
           dpkg-deb --contents "$deb"
 
+          # Capture the listings ONCE, then grep the files.
+          #
+          # `dpkg-deb --contents "$deb" | grep -q ...` looks equivalent and is
+          # not: grep -q exits on its first match, dpkg-deb's tar gets SIGPIPE
+          # mid-write and returns non-zero, and `set -o pipefail` fails the
+          # check even though the file was present. It passed locally and
+          # failed on the runner — the timing decides whether tar has finished
+          # writing before grep leaves. CI reported the sensor binary as
+          # missing from a package that plainly contained it.
+          dpkg-deb --contents "$deb" > deb-contents.txt
+          dpkg-deb -f "$deb" Depends > deb-depends.txt
+
           for path in \
             ./usr/bin/cybersentinel \
             ./etc/cybersentinel/config.yaml \
             ./etc/cybersentinel/rules/cybersentinel.rules \
             ./etc/logrotate.d/cybersentinel
           do
-            dpkg-deb --contents "$deb" | grep -q " $path\$" \
+            grep -q " $path\$" deb-contents.txt \
               || { echo "missing from the package: $path"; exit 1; }
           done
 
-          dpkg-deb --contents "$deb" | grep -q "cybersentinel.service" \
+          grep -q "cybersentinel.service" deb-contents.txt \
             || { echo "the systemd unit is missing from the package"; exit 1; }
 
           # Live capture is a runtime dependency, not an optional extra: a
           # sensor installed without libpcap monitors only the host, and an
           # operator would have to notice that for themselves.
-          dpkg-deb -f "$deb" Depends | grep -q "libpcap0.8" \
+          grep -q "libpcap0.8" deb-depends.txt \
             || { echo "the .deb does not depend on libpcap"; exit 1; }
           # And the glibc floor must be the pinned one, not the runner's.
-          dpkg-deb -f "$deb" Depends | grep -q "libc6 (>= 2.28)" \
+          grep -q "libc6 (>= 2.28)" deb-depends.txt \
             || { echo "the .deb declares the wrong glibc baseline"; exit 1; }
 
       - name: Verify the .rpm
@@ -412,6 +424,11 @@ jobs:
           rpm -qp --info "$rpm"
           rpm -qpl "$rpm"
 
+          # Same reasoning as the .deb above: capture once, grep the files.
+          rpm -qpl "$rpm" > rpm-files.txt
+          rpm -qpc "$rpm" > rpm-config.txt
+          rpm -qp --requires "$rpm" > rpm-requires.txt
+
           for path in \
             /usr/bin/cybersentinel \
             /etc/cybersentinel/config.yaml \
@@ -419,21 +436,21 @@ jobs:
             /usr/lib/systemd/system/cybersentinel.service \
             /etc/logrotate.d/cybersentinel
           do
-            rpm -qpl "$rpm" | grep -qx "$path" \
+            grep -qx "$path" rpm-files.txt \
               || { echo "missing from the package: $path"; exit 1; }
           done
 
           # Config files must be marked as such, or an upgrade silently
           # overwrites an operator's tuning.
-          rpm -qpc "$rpm" | grep -qx /etc/cybersentinel/config.yaml \
+          grep -qx /etc/cybersentinel/config.yaml rpm-config.txt \
             || { echo "config.yaml is not marked as a config file"; exit 1; }
 
-          rpm -qp --requires "$rpm" | grep -q "libpcap.so.0.8" \
+          grep -q "libpcap.so.0.8" rpm-requires.txt \
             || { echo "the .rpm does not depend on libpcap"; exit 1; }
 
           # The RPM derives per-symbol-version requires straight from the ELF,
           # so this is an independent check on the glibc pinning.
-          highest=$(rpm -qp --requires "$rpm" | grep -oE 'GLIBC_[0-9.]+' \
+          highest=$(grep -oE 'GLIBC_[0-9.]+' rpm-requires.txt \
             | sed 's/GLIBC_//' | sort -V | tail -1)
           echo "highest glibc requirement: $highest"
           [ "$(printf '2.28\n%s\n' "$highest" | sort -V | tail -1)" = "2.28" ] \
