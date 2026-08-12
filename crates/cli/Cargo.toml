@@ -86,6 +86,10 @@ assets = [
     # The checks behind CLAUDE.md §8, shipped so an operator can run them on
     # their own machine rather than trust ours.
     ["../../packaging/linux/verify-install.sh", "usr/share/doc/cybersentinel/verify-install.sh", "755"],
+    # An operator arming inline prevention needs to measure it first; shipping
+    # the tools beside the sensor is what makes that advice actionable.
+    ["../../packaging/linux/measure-prevention.sh", "usr/share/doc/cybersentinel/measure-prevention.sh", "755"],
+    ["../../packaging/linux/soak-prevention.sh", "usr/share/doc/cybersentinel/soak-prevention.sh", "755"],
 ]
 conf-files = ["/etc/cybersentinel/config.yaml", "/etc/cybersentinel/rules/cybersentinel.rules"]
 # cargo-deb generates the maintainer scripts that register the unit. The service
@@ -123,6 +127,8 @@ assets = [
     { source = "packaging/linux/logrotate", dest = "/etc/logrotate.d/cybersentinel", mode = "644", config = true },
     { source = "README.md", dest = "/usr/share/doc/cybersentinel/README.md", mode = "644", doc = true },
     { source = "packaging/linux/verify-install.sh", dest = "/usr/share/doc/cybersentinel/verify-install.sh", mode = "755" },
+    { source = "packaging/linux/measure-prevention.sh", dest = "/usr/share/doc/cybersentinel/measure-prevention.sh", mode = "755" },
+    { source = "packaging/linux/soak-prevention.sh", dest = "/usr/share/doc/cybersentinel/soak-prevention.sh", mode = "755" },
 ]
 
 # systemd registration, matching what cargo-deb generates for the .deb. The
