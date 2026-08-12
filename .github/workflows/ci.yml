@@ -349,8 +349,28 @@ jobs:
           key: ${{ runner.os }}-cargo-deb-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-deb-
 
+      # Install only what the cache did not already restore.
+      #
+      # This job caches ~/.cargo/bin, so a plain `cargo install` works on the
+      # very first run and fails on every one after it with "binary
+      # `cargo-deb` already exists in destination" — cargo will not overwrite
+      # a binary it did not just build. The failure is invisible until a
+      # second run exists, which is exactly the shape of bug a repository
+      # that has never had CI walks into.
+      #
+      # `--force` would also work and would recompile three tools from source
+      # every run, which is most of this job's wall-clock. Skipping what is
+      # already present keeps the cache doing its job.
       - name: Install the packaging tools
-        run: cargo install cargo-deb cargo-generate-rpm cargo-zigbuild --locked
+        run: |
+          set -euo pipefail
+          for tool in cargo-deb cargo-generate-rpm cargo-zigbuild; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              echo "$tool: already present (restored from cache)"
+            else
+              cargo install "$tool" --locked
+            fi
+          done
 
       # zig is what pins the glibc baseline. Without it the packages would be
       # built against the runner's glibc (2.39 on ubuntu-latest) and would
