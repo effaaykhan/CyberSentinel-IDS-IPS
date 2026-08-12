@@ -299,9 +299,15 @@ jobs:
           fi
 
           # HTTP: one rule, five spellings of the same request.
-          sed -i 's/files: \[detection.rules\]/files: [http.rules]/' detect.yaml
+          #
+          # Written without `sed -i`, which is not portable: GNU sed treats the
+          # next argument as the script, BSD sed (macOS) treats it as a
+          # mandatory backup suffix and then reads the filename as the script.
+          # The macOS runner failed here with "extra characters at the end of d
+          # command" while every detection in this step had already passed.
+          sed 's/files: \[detection.rules\]/files: [http.rules]/' detect.yaml > http.yaml
           cargo run --quiet -p cybersentinel -- run \
-            --config detect.yaml --replay tests/fixtures/pcap/http.pcap > http-alerts.json
+            --config http.yaml --replay tests/fixtures/pcap/http.pcap > http-alerts.json
           test "$(grep -c '"sid":9100001,' http-alerts.json)" -eq 5 \
             || { echo "the URI rule did not match every spelling"; exit 1; }
           test "$(grep -c '"sid":9100002,' http-alerts.json)" -eq 1 \
