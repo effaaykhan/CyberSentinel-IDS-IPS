@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "cybersentinel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "caps",
@@ -241,14 +241,14 @@ dependencies = [
 
 [[package]]
 name = "cybersentinel-alerting"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cybersentinel-common",
 ]
 
 [[package]]
 name = "cybersentinel-applayer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cybersentinel-common",
  "cybersentinel-reassembly",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "cybersentinel-capture"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "caps",
  "pcap",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "cybersentinel-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gethostname",
  "serde",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "cybersentinel-correlation"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cybersentinel-common",
  "time",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "cybersentinel-decode"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cybersentinel-common",
  "etherparse",
@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "cybersentinel-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aho-corasick",
  "cybersentinel-applayer",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "cybersentinel-hids"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cybersentinel-common",
  "notify",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "cybersentinel-prevent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cybersentinel-common",
  "nfq",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "cybersentinel-reassembly"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cybersentinel-common",
  "tracing",
@@ -343,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "cybersentinel-rules"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror",
  "tracing",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "cybersentinel-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cybersentinel-common",
  "tracing",

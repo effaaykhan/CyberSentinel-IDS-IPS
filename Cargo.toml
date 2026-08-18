@@ -6,7 +6,7 @@ members = ["crates/*"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
@@ -15,18 +15,18 @@ description = "CyberSentinel-IPS — standalone host- and network-based intrusio
 
 [workspace.dependencies]
 # Internal crates
-cybersentinel-common = { path = "crates/common", version = "0.1.0" }
-cybersentinel-capture = { path = "crates/capture", version = "0.1.0" }
-cybersentinel-decode = { path = "crates/decode", version = "0.1.0" }
-cybersentinel-reassembly = { path = "crates/reassembly", version = "0.1.0" }
-cybersentinel-applayer = { path = "crates/applayer", version = "0.1.0" }
-cybersentinel-rules = { path = "crates/rules", version = "0.1.0" }
-cybersentinel-engine = { path = "crates/engine", version = "0.1.0" }
-cybersentinel-hids = { path = "crates/hids", version = "0.1.0" }
-cybersentinel-prevent = { path = "crates/prevent", version = "0.1.0" }
-cybersentinel-correlation = { path = "crates/correlation", version = "0.1.0" }
-cybersentinel-storage = { path = "crates/storage", version = "0.1.0" }
-cybersentinel-alerting = { path = "crates/alerting", version = "0.1.0" }
+cybersentinel-common = { path = "crates/common", version = "0.1.1" }
+cybersentinel-capture = { path = "crates/capture", version = "0.1.1" }
+cybersentinel-decode = { path = "crates/decode", version = "0.1.1" }
+cybersentinel-reassembly = { path = "crates/reassembly", version = "0.1.1" }
+cybersentinel-applayer = { path = "crates/applayer", version = "0.1.1" }
+cybersentinel-rules = { path = "crates/rules", version = "0.1.1" }
+cybersentinel-engine = { path = "crates/engine", version = "0.1.1" }
+cybersentinel-hids = { path = "crates/hids", version = "0.1.1" }
+cybersentinel-prevent = { path = "crates/prevent", version = "0.1.1" }
+cybersentinel-correlation = { path = "crates/correlation", version = "0.1.1" }
+cybersentinel-storage = { path = "crates/storage", version = "0.1.1" }
+cybersentinel-alerting = { path = "crates/alerting", version = "0.1.1" }
 
 # External
 anyhow = "1"
