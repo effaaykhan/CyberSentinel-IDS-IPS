@@ -570,6 +570,11 @@ impl HostSensor {
 
         self.fim_updates = Some(receiver);
         self.fim_thread = Some(handle);
+        // The watches are already established — `FimWorker::start` attaches
+        // them on this thread — so say so now. The caller logs `stats()` as
+        // soon as `start()` returns, and a zero there would misreport a
+        // working sensor as a blind one.
+        self.publish_fim_counters();
         Ok(())
     }
 
@@ -650,6 +655,25 @@ impl HostSensor {
             self.sources.produced(names::FIM_REALTIME, 0);
         }
 
+        self.publish_fim_counters();
+    }
+
+    /// Copy the FIM counters into the reported stats.
+    ///
+    /// Called from `drain_fim` on every poll, and once from `spawn_fim` so the
+    /// numbers are true the moment [`HostSensor::start`] returns rather than
+    /// only after the first poll.
+    ///
+    /// That gap was visible in the field. Watches are established
+    /// synchronously in `FimWorker::start`, so `fim_counters` is already
+    /// correct when `spawn_fim` captures it — but `stats` was refreshed only
+    /// here, and the caller logs `stats()` immediately after starting. A
+    /// healthy sensor watching five paths therefore announced
+    /// `watched_paths=0 watch_failures=0`, which reads as "watching nothing"
+    /// and is the exact shape of the coverage hole this project tells
+    /// operators to look for. Reporting a false hole trains people to ignore
+    /// the real ones.
+    fn publish_fim_counters(&mut self) {
         self.stats.watched_paths = self.fim_counters.watched_paths;
         self.stats.watch_failures = self.fim_counters.watch_failures;
         self.stats.fim_realtime = self.fim_counters.realtime;
@@ -1074,6 +1098,35 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "start took {elapsed:?}; the scan belongs on the FIM thread"
         );
+    }
+
+    /// The startup log line reads `stats()` the instant `start()` returns, so
+    /// the watch counts have to be true by then.
+    ///
+    /// They were not: watches are established synchronously, but `stats` was
+    /// only refreshed on the first poll, so a healthy sensor announced
+    /// `watched_paths=0 watch_failures=0` — indistinguishable from watching
+    /// nothing, which is the coverage hole operators are told to look for.
+    ///
+    /// Polling before the assertion would pass against the broken code and pin
+    /// nothing. Not polling is the whole test.
+    #[test]
+    fn starting_reports_the_watches_it_established() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir.path().join("passwd"), "root:x:0:0");
+
+        let sensor = HostSensor::start(HostSettings {
+            fim: Some(fim_settings(dir.path())),
+            ..HostSettings::default()
+        })
+        .expect("sensor");
+
+        assert_eq!(
+            sensor.stats().watched_paths,
+            1,
+            "one configured path was watched; start() must say so before any poll"
+        );
+        assert_eq!(sensor.stats().watch_failures, 0);
     }
 
     #[test]
