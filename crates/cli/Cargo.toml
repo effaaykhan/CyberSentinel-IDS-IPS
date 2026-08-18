@@ -104,7 +104,7 @@ conf-files = ["/etc/cybersentinel/config.yaml", "/etc/cybersentinel/rules/cybers
 # it at a directory with no maintainer scripts in it is what makes cargo-deb
 # write the generated ones.
 maintainer-scripts = "../../packaging/linux/maintainer"
-systemd-units = { unit-name = "cybersentinel", unit-scripts = "../../packaging/linux", enable = true, start = false }
+systemd-units = { unit-name = "cybersentinel-ips", unit-scripts = "../../packaging/linux", enable = true, start = false }
 
 # ---------------------------------------------------------------------------
 # RPM packaging (`cargo generate-rpm -p crates/cli`).
@@ -123,7 +123,7 @@ assets = [
     { source = "target/release/cybersentinel", dest = "/usr/bin/cybersentinel", mode = "755" },
     { source = "packaging/linux/config.yaml", dest = "/etc/cybersentinel/config.yaml", mode = "644", config = true },
     { source = "rules/cybersentinel.rules", dest = "/etc/cybersentinel/rules/cybersentinel.rules", mode = "644", config = true },
-    { source = "packaging/linux/cybersentinel.service", dest = "/usr/lib/systemd/system/cybersentinel.service", mode = "644" },
+    { source = "packaging/linux/cybersentinel-ips.service", dest = "/usr/lib/systemd/system/cybersentinel-ips.service", mode = "644" },
     { source = "packaging/linux/logrotate", dest = "/etc/logrotate.d/cybersentinel", mode = "644", config = true },
     { source = "README.md", dest = "/usr/share/doc/cybersentinel/README.md", mode = "644", doc = true },
     { source = "packaging/linux/verify-install.sh", dest = "/usr/share/doc/cybersentinel/verify-install.sh", mode = "755" },
@@ -134,6 +134,7 @@ assets = [
 # systemd registration, matching what cargo-deb generates for the .deb. The
 # scriptlets are files rather than inline strings so they are reviewable, and
 # shared with anything else that needs them.
+pre_install_script = "../../packaging/linux/rpm-pre-install.sh"
 post_install_script = "../../packaging/linux/rpm-post-install.sh"
 pre_uninstall_script = "../../packaging/linux/rpm-pre-uninstall.sh"
 post_uninstall_script = "../../packaging/linux/rpm-post-uninstall.sh"

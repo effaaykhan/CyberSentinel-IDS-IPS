@@ -38,8 +38,8 @@ Debian 10+, Ubuntu 20.04+, SLES 15 SP2+.
 ## Install
 
 ```sh
-sudo dpkg --install cybersentinel_0.1.1-1_amd64.deb     # Debian, Ubuntu
-sudo dnf install cybersentinel-0.1.1-1.x86_64.rpm       # RHEL, Fedora, SUSE
+sudo dpkg --install cybersentinel_0.2.0-1_amd64.deb     # Debian, Ubuntu
+sudo dnf install cybersentinel-0.2.0-1.x86_64.rpm       # RHEL, Fedora, SUSE
 ```
 
 Both packages pull in **libpcap** as a dependency; live capture needs it.
@@ -48,7 +48,7 @@ The service is **enabled but not started**. That's deliberate — review the
 config before the sensor begins watching:
 
 ```sh
-sudo systemctl start cybersentinel
+sudo systemctl start cybersentinel-ips
 ```
 
 ### What gets installed
@@ -58,7 +58,7 @@ sudo systemctl start cybersentinel
 | `/usr/bin/cybersentinel` | the sensor |
 | `/etc/cybersentinel/config.yaml` | configuration (survives upgrades) |
 | `/etc/cybersentinel/rules/cybersentinel.rules` | the default ruleset (survives upgrades) |
-| `/usr/lib/systemd/system/cybersentinel.service` | the service unit |
+| `/usr/lib/systemd/system/cybersentinel-ips.service` | the service unit |
 | `/etc/logrotate.d/cybersentinel` | log rotation — event logs are personal data |
 | `/usr/share/doc/cybersentinel/verify-install.sh` | privilege-model checks |
 | `/var/lib/cybersentinel` | sensor id and the file-integrity baseline |
@@ -233,7 +233,7 @@ One JSON object per line, one schema for host and network alike.
 
 ```sh
 sudo tail -f /var/log/cybersentinel/events.json | jq -c 'select(.event_type=="alert")'
-sudo journalctl -u cybersentinel -f      # diagnostics, separate from events
+sudo journalctl -u cybersentinel-ips -f      # diagnostics, separate from events
 ```
 
 Event types: `alert`, `anomaly`, `flow`, `fim`, `auth`, `process`, `incident`,
@@ -254,7 +254,7 @@ files, and the first baseline has to hash all of them.
 ```sh
 sudo mkdir -p /opt/cs-test && echo 'root:x:0:0' | sudo tee /opt/cs-test/passwd
 # set hids.fim.paths to [/opt/cs-test], then:
-sudo systemctl restart cybersentinel
+sudo systemctl restart cybersentinel-ips
 ```
 
 **Wait for the baseline before changing anything** — the first scan establishes
@@ -274,9 +274,9 @@ sudo tail -f /var/log/cybersentinel/events.json | grep --line-buffered '"fim"'
 To reset between tests:
 
 ```sh
-sudo systemctl stop cybersentinel
+sudo systemctl stop cybersentinel-ips
 sudo rm -rf /var/lib/cybersentinel/* /var/log/cybersentinel/*
-sudo systemctl start cybersentinel
+sudo systemctl start cybersentinel-ips
 ```
 
 ---
@@ -284,7 +284,7 @@ sudo systemctl start cybersentinel
 ## Uninstall
 
 ```sh
-sudo systemctl stop cybersentinel
+sudo systemctl stop cybersentinel-ips
 sudo apt-get remove cybersentinel      # keeps /etc/cybersentinel
 sudo apt-get purge  cybersentinel      # removes configuration too
 sudo dnf remove cybersentinel

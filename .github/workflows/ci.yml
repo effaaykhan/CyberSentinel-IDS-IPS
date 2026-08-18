@@ -423,7 +423,7 @@ jobs:
               || { echo "missing from the package: $path"; exit 1; }
           done
 
-          grep -q "cybersentinel.service" deb-contents.txt \
+          grep -q "cybersentinel-ips.service" deb-contents.txt \
             || { echo "the systemd unit is missing from the package"; exit 1; }
 
           # Live capture is a runtime dependency, not an optional extra: a
@@ -453,7 +453,7 @@ jobs:
             /usr/bin/cybersentinel \
             /etc/cybersentinel/config.yaml \
             /etc/cybersentinel/rules/cybersentinel.rules \
-            /usr/lib/systemd/system/cybersentinel.service \
+            /usr/lib/systemd/system/cybersentinel-ips.service \
             /etc/logrotate.d/cybersentinel
           do
             grep -qx "$path" rpm-files.txt \
@@ -520,18 +520,18 @@ jobs:
           PY
           sudo sed -n '/^capture:/,/^decode:/p' /etc/cybersentinel/config.yaml
 
-          sudo systemctl start cybersentinel
+          sudo systemctl start cybersentinel-ips
           # The first FIM baseline hashes /etc and /usr/bin; the shadow check
           # needs it finished.
           sleep 45
-          sudo systemctl status cybersentinel --no-pager -n 20 || true
+          sudo systemctl status cybersentinel-ips --no-pager -n 20 || true
           sudo sh /usr/share/doc/cybersentinel/verify-install.sh
 
       - name: Show the sensor's own view of itself
         if: always()
         run: |
           sudo tail -3 /var/log/cybersentinel/events.json || true
-          sudo journalctl -u cybersentinel --no-pager -n 40 || true
+          sudo journalctl -u cybersentinel-ips --no-pager -n 40 || true
 
       - name: Upload the packages
         uses: actions/upload-artifact@v4

@@ -1,0 +1,30 @@
+#!/bin/sh
+# Retire the pre-0.2.0 unit name before the new one is installed.
+#
+# The service was `cybersentinel.service` up to and including v0.1.1. Renaming
+# it to `cybersentinel-ips.service` without this leaves the old unit enabled
+# with a dangling symlink in multi-user.target.wants: dpkg removes the old unit
+# FILE (the new package no longer ships that path) but knows nothing about the
+# enable symlink systemd created. The result is a boot-time warning and, worse,
+# a host where `systemctl status cybersentinel` still names a unit that will
+# never start again — which reads like a sensor that died rather than one that
+# was renamed.
+#
+# Disabling with --now also stops the running sensor, so the upgrade does not
+# leave two units contending for the same capture handle and baseline.
+#
+# cargo-deb generates postinst and prerm for `systemd-units`; preinst is left
+# to us, which is why the migration lives here rather than there.
+set -e
+
+if [ -e /usr/lib/systemd/system/cybersentinel.service ] \
+   || [ -e /lib/systemd/system/cybersentinel.service ]; then
+    systemctl --no-reload disable --now cybersentinel.service >/dev/null 2>&1 || :
+fi
+
+# cargo-deb substitutes its generated systemd fragments in place of this
+# token, and refuses to build a maintainer script that lacks it. preinst gets
+# nothing generated today, but the token has to be here regardless.
+#DEBHELPER#
+
+exit 0

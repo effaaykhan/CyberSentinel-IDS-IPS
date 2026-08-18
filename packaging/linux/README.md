@@ -15,8 +15,8 @@ sh packaging/linux/build-packages.sh
 That produces both formats from one binary:
 
 ```
-target/debian/cybersentinel_0.1.1-1_amd64.deb
-target/x86_64-unknown-linux-gnu/generate-rpm/cybersentinel-0.1.1-1.x86_64.rpm
+target/debian/cybersentinel_0.2.0-1_amd64.deb
+target/x86_64-unknown-linux-gnu/generate-rpm/cybersentinel-0.2.0-1.x86_64.rpm
 ```
 
 Package metadata lives in `crates/cli/Cargo.toml`, under
@@ -75,14 +75,14 @@ resolves everywhere.
 | `/usr/bin/cybersentinel` | the built binary | the sensor |
 | `/etc/cybersentinel/config.yaml` | `packaging/linux/config.yaml` | conffile — survives upgrades |
 | `/etc/cybersentinel/rules/cybersentinel.rules` | `rules/cybersentinel.rules` | conffile |
-| `/usr/lib/systemd/system/cybersentinel.service` | `cybersentinel.service` | registered by the generated maintainer scripts |
+| `/usr/lib/systemd/system/cybersentinel-ips.service` | `cybersentinel-ips.service` | registered by the generated maintainer scripts |
 | `/etc/logrotate.d/cybersentinel` | `logrotate` | event logs are PII; rotate and expire them |
 | `/usr/share/doc/cybersentinel/verify-install.sh` | `verify-install.sh` | the §8 checks, runnable on your own machine |
 | `/var/lib/cybersentinel` | — | systemd `StateDirectory`; holds the sensor id and the FIM baseline |
 | `/var/log/cybersentinel` | — | systemd `LogsDirectory` |
 
 The unit is **enabled but not started**: review
-`/etc/cybersentinel/config.yaml`, then `systemctl start cybersentinel`. A
+`/etc/cybersentinel/config.yaml`, then `systemctl start cybersentinel-ips`. A
 sensor should begin watching because an operator decided it should, not because
 a package manager did.
 
@@ -137,7 +137,7 @@ why the check tests for a hash rather than for the file's presence.
 
 ## Service design
 
-`cybersentinel.service` uses `DynamicUser=yes`, so systemd allocates and owns
+`cybersentinel-ips.service` uses `DynamicUser=yes`, so systemd allocates and owns
 the service account: no `useradd` in a maintainer script, no orphaned account
 after removal.
 

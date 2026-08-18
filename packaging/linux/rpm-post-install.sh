@@ -6,4 +6,4 @@
 # package manager decided for them. `capture.enabled` ships false for the same
 # reason.
 systemctl daemon-reload >/dev/null 2>&1 || :
-systemctl enable cybersentinel.service >/dev/null 2>&1 || :
+systemctl enable cybersentinel-ips.service >/dev/null 2>&1 || :

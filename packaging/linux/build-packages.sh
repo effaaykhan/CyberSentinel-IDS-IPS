@@ -65,6 +65,19 @@ objdump -p "$BINARY" | grep -q 'NEEDED.*libpcap' || {
 }
 echo "    links libpcap: live capture available"
 
+# Clear previously built packages before producing new ones.
+#
+# Neither cargo-deb nor cargo-generate-rpm removes the output of an earlier
+# version, and CI caches `target/`, so a version bump leaves the OLD package
+# sitting beside the new one. The release upload globs this directory, which is
+# how a stale 0.1.0 RPM ended up attached to the v0.1.1 artifact — a release
+# where "the RPM" could have been the wrong package entirely.
+#
+# Removing only our own package files, not the directories, so nothing else in
+# target/ is disturbed.
+find target -name 'cybersentinel*.deb' -o -name 'cybersentinel*.rpm' \
+    | while read -r stale; do rm -f "$stale"; done
+
 echo "==> .deb"
 cargo deb -p cybersentinel --no-build --target "$TARGET"
 
@@ -74,3 +87,15 @@ cargo generate-rpm -p crates/cli --target "$TARGET"
 echo
 echo "Built:"
 find target -name 'cybersentinel*.deb' -o -name 'cybersentinel*.rpm' | sed 's/^/  /'
+
+# Every package here must be the version just built. If a stale one survives,
+# say so loudly rather than letting a release ship it.
+VERSION=$(cargo metadata --no-deps --format-version 1 \
+    | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "cybersentinel"))')
+UNEXPECTED=$(find target -name 'cybersentinel*.deb' -o -name 'cybersentinel*.rpm' \
+    | grep -v -- "-\?_\?${VERSION}" || true)
+if [ -n "$UNEXPECTED" ]; then
+    echo "a package from another version survived the build:" >&2
+    echo "$UNEXPECTED" | sed 's/^/  /' >&2
+    exit 1
+fi

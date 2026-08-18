@@ -25,7 +25,7 @@
 
 set -eu
 
-UNIT=cybersentinel.service
+UNIT=cybersentinel-ips.service
 CONFIG=/etc/cybersentinel/config.yaml
 STATE=/var/lib/cybersentinel
 BASELINE="$STATE/fim-baseline.db"
