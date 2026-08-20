@@ -283,20 +283,64 @@ sudo systemctl start cybersentinel-ips
 
 ## Uninstall
 
-```sh
-sudo systemctl stop cybersentinel-ips
-sudo apt-get remove cybersentinel      # keeps /etc/cybersentinel
-sudo apt-get purge  cybersentinel      # removes configuration too
-sudo dnf remove cybersentinel
-```
+### Remove everything
 
-**Event logs under `/var/log/cybersentinel` are deliberately left in place.**
-They are evidence, and removing a package should not destroy an audit trail.
-Delete them by hand when you're satisfied you no longer need them:
+The packages ship an uninstall script that removes the service, the package,
+the binary, the configuration, the ruleset, the sensor identity, the FIM
+baseline, the log rotation policy, and the event log:
 
 ```sh
-sudo rm -rf /var/log/cybersentinel /var/lib/cybersentinel
+sudo sh /usr/share/doc/cybersentinel/uninstall.sh
 ```
+
+It shows what it found and asks before deleting the event log, because that log
+is a record of what the host saw. Options:
+
+| | |
+|---|---|
+| `--keep-logs` | remove everything except `/var/log/cybersentinel` |
+| `--yes` / `-y` | no prompts, for automation |
+
+It also cleans up the pre-0.2.0 `cybersentinel` service, so a host that was
+never upgraded ends up as clean as one that was, and it is safe to run twice —
+a second run reports that nothing is installed.
+
+If the package is already gone and you only need the leftovers removed, fetch
+the script on its own:
+
+```sh
+curl -LO https://raw.githubusercontent.com/effaaykhan/CyberSentinel-IDS-IPS/main/packaging/linux/uninstall.sh
+sudo sh uninstall.sh
+```
+
+### If you armed inline prevention, check your firewall
+
+The uninstall script does **not** remove nftables rules, and it warns you if it
+finds one feeding a verdict queue. The sensor never installed those rules, and
+guessing which of your firewall rules belong to it would be a worse mistake
+than telling you they are there.
+
+This matters more than it sounds. With the sensor gone, nothing is listening on
+that queue — and a rule **without** `bypass` fails closed, so the kernel drops
+every packet it matches. On a forwarding host that is an outage.
+
+```sh
+sudo nft list ruleset | grep 'queue num'    # then remove the rule, or add `bypass`
+```
+
+### Removing it by hand
+
+```sh
+sudo systemctl disable --now cybersentinel-ips
+sudo apt-get purge cybersentinel            # Debian, Ubuntu
+sudo dnf remove cybersentinel               # RHEL, Fedora, SUSE
+sudo rm -rf /etc/cybersentinel /var/lib/cybersentinel /var/log/cybersentinel
+```
+
+Note that `apt-get remove` keeps `/etc/cybersentinel`, and **neither package
+manager deletes `/var/log/cybersentinel`** — event logs are evidence, and
+removing a package should not destroy an audit trail. That is why deleting them
+is an explicit step here, and a prompt in the script.
 
 ---
 

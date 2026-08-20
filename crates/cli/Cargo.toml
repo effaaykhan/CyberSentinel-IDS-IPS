@@ -90,6 +90,10 @@ assets = [
     # the tools beside the sensor is what makes that advice actionable.
     ["../../packaging/linux/measure-prevention.sh", "usr/share/doc/cybersentinel/measure-prevention.sh", "755"],
     ["../../packaging/linux/soak-prevention.sh", "usr/share/doc/cybersentinel/soak-prevention.sh", "755"],
+    # Shipped so a host can be cleaned up without fetching anything. It
+    # re-execs from a copy first, because the package removal below would
+    # otherwise delete it mid-run.
+    ["../../packaging/linux/uninstall.sh", "usr/share/doc/cybersentinel/uninstall.sh", "755"],
 ]
 conf-files = ["/etc/cybersentinel/config.yaml", "/etc/cybersentinel/rules/cybersentinel.rules"]
 # cargo-deb generates the maintainer scripts that register the unit. The service
@@ -123,6 +127,7 @@ assets = [
     { source = "target/release/cybersentinel", dest = "/usr/bin/cybersentinel", mode = "755" },
     { source = "packaging/linux/config.yaml", dest = "/etc/cybersentinel/config.yaml", mode = "644", config = true },
     { source = "rules/cybersentinel.rules", dest = "/etc/cybersentinel/rules/cybersentinel.rules", mode = "644", config = true },
+    { source = "packaging/linux/uninstall.sh", dest = "/usr/share/doc/cybersentinel/uninstall.sh", mode = "755" },
     { source = "packaging/linux/cybersentinel-ips.service", dest = "/usr/lib/systemd/system/cybersentinel-ips.service", mode = "644" },
     { source = "packaging/linux/logrotate", dest = "/etc/logrotate.d/cybersentinel", mode = "644", config = true },
     { source = "README.md", dest = "/usr/share/doc/cybersentinel/README.md", mode = "644", doc = true },
