@@ -15,8 +15,8 @@ sh packaging/linux/build-packages.sh
 That produces both formats from one binary:
 
 ```
-target/debian/cybersentinel_0.2.0-1_amd64.deb
-target/x86_64-unknown-linux-gnu/generate-rpm/cybersentinel-0.2.0-1.x86_64.rpm
+target/debian/cybersentinel_0.2.1-1_amd64.deb
+target/x86_64-unknown-linux-gnu/generate-rpm/cybersentinel-0.2.1-1.x86_64.rpm
 ```
 
 Package metadata lives in `crates/cli/Cargo.toml`, under

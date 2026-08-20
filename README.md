@@ -38,8 +38,8 @@ Debian 10+, Ubuntu 20.04+, SLES 15 SP2+.
 ## Install
 
 ```sh
-sudo dpkg --install cybersentinel_0.2.0-1_amd64.deb     # Debian, Ubuntu
-sudo dnf install cybersentinel-0.2.0-1.x86_64.rpm       # RHEL, Fedora, SUSE
+sudo dpkg --install cybersentinel_0.2.1-1_amd64.deb     # Debian, Ubuntu
+sudo dnf install cybersentinel-0.2.1-1.x86_64.rpm       # RHEL, Fedora, SUSE
 ```
 
 Both packages pull in **libpcap** as a dependency; live capture needs it.
