@@ -196,6 +196,24 @@ impl FimWorker {
     /// Deliberately does **no** scanning: the first [`Self::tick`] does that,
     /// on whatever thread the worker is running on.
     pub fn start(settings: &FimSettings) -> Result<Self, HostError> {
+        // Resolve the roots ONCE, and use the result for both the baseline and
+        // the watcher. They must agree about what is being monitored: the
+        // walker will not follow a symlinked root and `notify` will, and that
+        // disagreement makes every file under such a root flip between
+        // `created` and `deleted` for ever. See `fim::resolve_roots`.
+        let (paths, collapsed) = fim::resolve_roots(&settings.paths);
+        for (asked, kept) in &collapsed {
+            tracing::info!(
+                configured = %asked.display(),
+                monitored = %kept.display(),
+                "two configured paths name the same directory; monitoring it once"
+            );
+        }
+        let settings = &FimSettings {
+            paths,
+            ..settings.clone()
+        };
+
         let baseline = fim::Baseline::open(settings.baseline_path.as_deref())?;
         let mut worker = Self {
             monitor: fim::Monitor::new(settings.clone(), baseline),

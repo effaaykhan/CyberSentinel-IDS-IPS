@@ -370,6 +370,50 @@ impl WalkLimits {
 ///
 /// Returns paths in sorted order so a rescan is deterministic and so tests can
 /// assert on it. Symlinks are counted and skipped rather than followed —
+/// Resolve the configured roots, collapsing any that name the same directory.
+///
+/// The walker refuses to follow a symlink — including one used as a *root* —
+/// because following them would let a symlink planted in a watched tree pull
+/// the filesystem into scope. `notify` has no such rule: a watch on `/bin`
+/// resolves to `/usr/bin` and reports events back under the `/bin/` prefix.
+///
+/// Left alone, those two disagree and the disagreement is not quiet. The
+/// rescan never walks `/bin`, so every `/bin/*` row in the baseline looks like
+/// a file that has vanished and is reported `deleted` and removed; the
+/// real-time watcher then sees the next event under `/bin/`, finds no row, and
+/// reports `created` and reinserts it. The pair repeats once per rescan for
+/// every file in the tree. Measured on a stock Ubuntu install — where `/bin`
+/// and `/sbin` are usrmerge symlinks and the shipped config named all four
+/// paths — that was 12,332 alerts about system binaries nobody had touched.
+///
+/// Alerts that are always wrong get ignored exactly as thoroughly as alerts
+/// that never fire, so this is a detection failure, not a tidiness one.
+///
+/// Canonicalising both roots makes `/bin` and `/usr/bin` the same entry, which
+/// the deduplication then collapses — leaving one watch and one baseline row
+/// per real file. A path that cannot be canonicalised (it does not exist yet,
+/// or is unreadable) is kept verbatim so it still reaches the watcher and
+/// still produces the "could not watch path" warning it should.
+///
+/// Returns the resolved roots and the collapses, so the caller can say what it
+/// did rather than silently monitoring something other than what was asked for.
+#[must_use]
+pub fn resolve_roots(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
+    let mut resolved: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    let mut collapsed = Vec::new();
+
+    for path in paths {
+        let target = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if let Some(existing) = resolved.iter().find(|kept| *kept == &target) {
+            collapsed.push((path.clone(), existing.clone()));
+            continue;
+        }
+        resolved.push(target);
+    }
+
+    (resolved, collapsed)
+}
+
 /// following them would let a symlink planted inside a watched directory pull
 /// the whole filesystem into the monitored set.
 #[must_use]
@@ -1027,6 +1071,38 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// A directory and a symlink to it must resolve to one monitored root.
+    ///
+    /// Configuring both is not exotic — it is what every Debian and Ubuntu
+    /// install looks like, where `/bin` is a symlink to `/usr/bin`, and what
+    /// the shipped config asked for. Left unresolved, the walker skips the
+    /// symlinked root while `notify` follows it, and every file underneath
+    /// flip-flops between `created` and `deleted` once per rescan.
+    #[test]
+    fn a_path_and_a_symlink_to_it_resolve_to_one_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        write(&real.join("passwd"), "root:x:0:0");
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink("real", &alias).expect("symlink");
+
+        let (resolved, collapsed) = resolve_roots(&[real.clone(), alias.clone()]);
+
+        assert_eq!(resolved.len(), 1, "both names are the same directory");
+        assert_eq!(collapsed.len(), 1, "the collapse must be reportable");
+        assert_eq!(collapsed[0].0, alias);
+
+        // And the surviving root is one the walker will actually descend into,
+        // which is the half that was broken: a symlinked root walks nothing.
+        let settings = FimSettings {
+            paths: resolved.clone(),
+            ..FimSettings::default()
+        };
+        let (found, _) = walk(&resolved, &settings);
+        assert_eq!(found.len(), 1, "the resolved root must be walkable");
+    }
+
     #[test]
     fn a_symlink_is_not_followed_out_of_the_watched_set() {
         let dir = tempfile::tempdir().expect("tempdir");
