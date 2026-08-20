@@ -975,6 +975,16 @@ mod tests {
         // overflowed and the kernel dropped the notification.
         write(&target, "root:x:0:0\nbackdoor:x:0:0");
 
+        // Watch roots are canonicalised so the baseline and the watcher cannot
+        // disagree about what is being monitored, so events carry the resolved
+        // path. It differs from the configured one wherever a root crosses a
+        // symlink — /bin on Debian and Ubuntu, and /var on macOS, which is why
+        // comparing against the tempdir path passed on Linux and failed there.
+        let expected_path = std::fs::canonicalize(&target)
+            .unwrap_or_else(|_| target.clone())
+            .to_string_lossy()
+            .into_owned();
+
         let overflow = notify::Event::new(EventKind::Other).set_flag(Flag::Rescan);
         let (events, forced) = worker.handle_notification(Ok(overflow));
         assert!(events.is_empty(), "the overflow itself carries no paths");
@@ -996,8 +1006,7 @@ mod tests {
             update
                 .events
                 .iter()
-                .any(|event| event.change == FileChange::Modified
-                    && event.path == target.to_string_lossy()),
+                .any(|event| event.change == FileChange::Modified && event.path == expected_path),
             "the change the overflow hid must still surface"
         );
     }

@@ -1070,7 +1070,6 @@ mod tests {
         assert_eq!(reopened.len().expect("len"), 1);
     }
 
-    #[cfg(unix)]
     /// A directory and a symlink to it must resolve to one monitored root.
     ///
     /// Configuring both is not exotic — it is what every Debian and Ubuntu
@@ -1078,6 +1077,7 @@ mod tests {
     /// the shipped config asked for. Left unresolved, the walker skips the
     /// symlinked root while `notify` follows it, and every file underneath
     /// flip-flops between `created` and `deleted` once per rescan.
+    #[cfg(unix)]
     #[test]
     fn a_path_and_a_symlink_to_it_resolve_to_one_root() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1103,6 +1103,7 @@ mod tests {
         assert_eq!(found.len(), 1, "the resolved root must be walkable");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_is_not_followed_out_of_the_watched_set() {
         let dir = tempfile::tempdir().expect("tempdir");
